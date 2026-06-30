@@ -207,6 +207,20 @@ def parse_args():
                         help="AOI suffix in phenology filenames "
                              "(phenology_<var>_<suffix>.parquet). Defaults to --aoi.")
 
+    # ── cross-validation scheme ──
+    parser.add_argument("--cv_scheme", type=str, choices=["year", "cell"], default="year",
+                        help="Hold-out unit per LOO fold. 'year' (default): "
+                             "leave-one-year-out (temporal forecasting — trains on all "
+                             "other years). 'cell': leave-one-climate-cell-out — holds "
+                             "out every county sharing a coarse climate grid cell, "
+                             "across all years, to remove spatial-autocorrelation "
+                             "leakage between neighbouring counties. 'cell' requires "
+                             "--cell_lookup.")
+    parser.add_argument("--cell_lookup", type=str, default=None,
+                        help="Path to a county→climate-cell parquet (columns "
+                             "adm2_id, climate_cell_id) from R/county-climate-cell.R. "
+                             "Required for --cv_scheme cell.")
+
     # ── PatchTST hyperparameters (only used when --model_type tst) ──
     tst = parser.add_argument_group("PatchTST options (--model_type tst)")
     tst.add_argument("--patch_length", type=int,   default=16,
@@ -233,12 +247,17 @@ def parse_args():
     return parser.parse_args()
 
 
-def _finalize_fold(meta_te, y_true, y_pred, all_years, test_year, model_type,
-                   fold_dir, n_train, extra_meta=None):
+def _finalize_fold(meta_te, y_true, y_pred, all_years, fold_label, model_type,
+                   fold_dir, n_train, train_years, test_years,
+                   cv_scheme="year", fold_value=None, extra_meta=None):
     """Build the per-fold error table + metadata, write outputs, and log a summary.
 
     Shared by the tabular and PatchTST fold runners so both emit identical
     adm2_errors.csv / adm1_rmse.csv / run_meta.json (plot_results.py compatible).
+
+    A "fold" holds out one CV unit: a year ('year' scheme) or a climate cell
+    ('cell' scheme). train_years / test_years are the actual years present on
+    each side of the split (for the cell scheme both span the full study range).
 
     Parameters
     ----------
@@ -284,9 +303,16 @@ def _finalize_fold(meta_te, y_true, y_pred, all_years, test_year, model_type,
     adm1_rmse.to_csv(os.path.join(fold_dir, "adm1_rmse.csv"), index=False)
 
     fold_meta = {
-        "run_id":      f"fold_{test_year}",
-        "test_year":   test_year,
-        "train_years": [y for y in all_years if y != test_year],
+        "run_id":      f"fold_{fold_label}",
+        "fold_label":  fold_label,
+        "cv_scheme":   cv_scheme,
+        "fold_value":  fold_value,
+        # test_year kept for plot_results.py compatibility: the single held-out
+        # year under the 'year' scheme, else None (cell folds span all years).
+        "test_year":   (test_years[0] if cv_scheme == "year" and len(test_years) == 1
+                        else None),
+        "test_years":  list(test_years),
+        "train_years": list(train_years),
         "study_start": all_years[0],
         "study_end":   all_years[-1],
         "model_type":  model_type,
@@ -305,19 +331,23 @@ def _finalize_fold(meta_te, y_true, y_pred, all_years, test_year, model_type,
 
     skill_str = f"err%={pct_error:+.1f}%" if pct_error is not None else f"R²={r2:.3f}"
     print(
-        f"  fold {test_year}: RMSE={rmse:>10,.0f}  {skill_str}"
+        f"  fold {fold_label}: RMSE={rmse:>10,.0f}  {skill_str}"
         f"  n_train={n_train}  n_test={len(y_true)}"
     )
     return fold_meta, errors
 
 
-def run_fold(adm2_df, feature_cols, all_years, test_year, model_type, fold_dir):
-    """Train a tabular model on all years except test_year; evaluate on test_year."""
-    train_years = [y for y in all_years if y != test_year]
+def run_fold(adm2_df, feature_cols, all_years, fold_col, fold_value, fold_label,
+             model_type, fold_dir, cv_scheme="year"):
+    """Train a tabular model leaving out one fold (a year or a climate cell).
+
+    The held-out fold is the rows where adm2_df[fold_col] == fold_value; the
+    model trains on every other row.
+    """
     meta_cols   = ["adm2_id", "adm2", "adm1", "hindcast_start"]
 
-    train_mask = adm2_df["hindcast_start"].isin(train_years)
-    test_mask  = adm2_df["hindcast_start"] == test_year
+    train_mask = adm2_df[fold_col] != fold_value
+    test_mask  = adm2_df[fold_col] == fold_value
 
     X_tr    = adm2_df.loc[train_mask, feature_cols]
     y_tr    = adm2_df.loc[train_mask, "yield"]
@@ -326,7 +356,7 @@ def run_fold(adm2_df, feature_cols, all_years, test_year, model_type, fold_dir):
     meta_te = adm2_df.loc[test_mask,  meta_cols].copy()
 
     if len(X_te) == 0:
-        print(f"  fold {test_year}: no test data — skipping")
+        print(f"  fold {fold_label}: no test data — skipping")
         return None
 
     model = YieldModel(model_type)
@@ -339,22 +369,30 @@ def run_fold(adm2_df, feature_cols, all_years, test_year, model_type, fold_dir):
             if model.feature_importances_ is not None else None
         ),
     }
+    train_years = sorted(adm2_df.loc[train_mask, "hindcast_start"].unique().tolist())
+    test_years  = sorted(adm2_df.loc[test_mask,  "hindcast_start"].unique().tolist())
     return _finalize_fold(
-        meta_te, y_te.values, y_pred, all_years, test_year, model_type,
-        fold_dir, n_train=len(X_tr), extra_meta=extra_meta,
+        meta_te, y_te.values, y_pred, all_years, fold_label, model_type,
+        fold_dir, n_train=len(X_tr), train_years=train_years, test_years=test_years,
+        cv_scheme=cv_scheme, fold_value=fold_value, extra_meta=extra_meta,
     )
 
 
-def run_fold_tst(sequences, targets, sample_meta, all_years, test_year, fold_dir, args):
-    """Train PatchTST on all years except test_year; evaluate on test_year."""
+def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_value,
+                 fold_label, fold_dir, args, cv_scheme="year"):
+    """Train PatchTST leaving out one fold (a year or a climate cell).
+
+    The held-out fold is the samples where sample_meta[fold_col] == fold_value;
+    the model trains on every other sample.
+    """
     _, _, train_predict_patchtst = _import_tst()
     meta_cols  = ["adm2_id", "adm2", "adm1", "hindcast_start"]
-    years      = sample_meta["hindcast_start"].values
-    train_mask = years != test_year
-    test_mask  = years == test_year
+    fold_vals  = sample_meta[fold_col].values
+    train_mask = fold_vals != fold_value
+    test_mask  = fold_vals == fold_value
 
     if test_mask.sum() == 0:
-        print(f"  fold {test_year}: no test data — skipping")
+        print(f"  fold {fold_label}: no test data — skipping")
         return None
 
     train_seqs, train_tgts = sequences[train_mask], targets[train_mask]
@@ -391,9 +429,13 @@ def run_fold_tst(sequences, targets, sample_meta, all_years, test_year, fold_dir
         "batch_size":   args.batch_size,
         "lr":           args.lr,
     }
+    train_years = sorted(sample_meta.loc[train_mask, "hindcast_start"].unique().tolist())
+    test_years  = sorted(sample_meta.loc[test_mask,  "hindcast_start"].unique().tolist())
     return _finalize_fold(
-        meta_te, val_tgts.squeeze(), y_pred, all_years, test_year, "tst",
-        fold_dir, n_train=int(train_mask.sum()), extra_meta=extra_meta,
+        meta_te, val_tgts.squeeze(), y_pred, all_years, fold_label, "tst",
+        fold_dir, n_train=int(train_mask.sum()), train_years=train_years,
+        test_years=test_years, cv_scheme=cv_scheme, fold_value=fold_value,
+        extra_meta=extra_meta,
     )
 
 
@@ -435,6 +477,42 @@ def _select_counties(county_meta, args):
     return selected, region
 
 
+def _attach_climate_cell(meta_df, lookup_path):
+    """Add a climate_cell_id column to a per-sample frame by adm2_id.
+
+    Uses a dict map (not a merge) so row order/index is preserved — the tst path
+    relies on sample_meta staying positionally aligned with its sequence/target
+    arrays. Errors if any present county is missing from the lookup.
+    """
+    if not os.path.exists(lookup_path):
+        raise FileNotFoundError(f"--cell_lookup not found: {lookup_path!r}")
+    lookup = pd.read_parquet(lookup_path)
+    required = {"adm2_id", "climate_cell_id"}
+    if not required.issubset(lookup.columns):
+        raise ValueError(
+            f"Cell lookup {lookup_path!r} must contain columns {required}; "
+            f"got {list(lookup.columns)}."
+        )
+    cell_map = dict(zip(lookup["adm2_id"].astype(str), lookup["climate_cell_id"]))
+
+    out = meta_df.copy()
+    ids = out["adm2_id"].astype(str)
+    out["climate_cell_id"] = ids.map(cell_map)
+    missing = sorted(ids[out["climate_cell_id"].isna()].unique().tolist())
+    if missing:
+        raise ValueError(
+            f"{len(missing)} selected county(ies) absent from --cell_lookup "
+            f"(e.g. {missing[:5]}). Regenerate the lookup (R/county-climate-cell.R) "
+            "or restrict --region/--sample_counties to covered counties."
+        )
+    out["climate_cell_id"] = out["climate_cell_id"].astype(int)
+    n_cells   = out["climate_cell_id"].nunique()
+    n_county  = out["adm2_id"].nunique()
+    print(f"Climate cells   : {n_cells} cells over {n_county} counties "
+          f"(avg {n_county / max(n_cells, 1):.1f} counties/cell)")
+    return out
+
+
 def main():
     args = parse_args()
     study_start, study_end = args.study_years
@@ -456,10 +534,16 @@ def main():
             "--use_phenology is only supported by --model_type tst "
             f"(got {args.model_type!r})."
         )
+    if args.cv_scheme == "cell" and not args.cell_lookup:
+        raise ValueError(
+            "--cv_scheme cell requires --cell_lookup (county→climate-cell parquet "
+            "from R/county-climate-cell.R)."
+        )
 
     pheno_tag = ("_pheno-" + "-".join(args.use_phenology)) if args.use_phenology else ""
+    cv_tag    = "" if args.cv_scheme == "year" else f"_cv-{args.cv_scheme}"
     exp_id  = (
-        f"loo_{args.crop}_{args.model_type}_{args.feature_mode}_{args.target}{pheno_tag}"
+        f"loo_{args.crop}_{args.model_type}_{args.feature_mode}_{args.target}{pheno_tag}{cv_tag}"
         f"_{study_start}_{study_end}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     )
     exp_dir = os.path.join(args.results_dir, exp_id)
@@ -471,6 +555,8 @@ def main():
     print(f"Model           : {args.model_type}")
     print(f"Feature mode    : {args.feature_mode}")
     print(f"Target          : {args.target}")
+    print(f"CV scheme       : {args.cv_scheme}"
+          + (f"  (lookup: {args.cell_lookup})" if args.cv_scheme == "cell" else ""))
     if args.model_type == "tst":
         print(f"Phenology       : {','.join(args.use_phenology) if args.use_phenology else 'none (climate only)'}")
     print(f"Results dir     : {exp_dir}")
@@ -526,23 +612,44 @@ def main():
         print(f"Counties        : {adm2_df['adm2_id'].nunique()}  "
               f"({len(adm2_df)} county-year rows)")
 
+    # Attach climate-cell ids for the spatial CV scheme. Done after county
+    # subsetting so only the counties actually in play need lookup coverage.
+    if args.cv_scheme == "cell":
+        if use_tst:
+            sample_meta = _attach_climate_cell(sample_meta, args.cell_lookup)
+        else:
+            adm2_df = _attach_climate_cell(adm2_df, args.cell_lookup)
+
     missing = [y for y in all_years if y not in available]
     if missing:
         print(f"WARNING: no parquet data found for years: {missing}")
 
+    # Build the fold plan from the chosen CV scheme. Each fold is
+    # (fold_value, fold_label, dir_name): hold out rows where fold_col == fold_value.
+    if args.cv_scheme == "cell":
+        fold_col   = "climate_cell_id"
+        meta_src   = sample_meta if use_tst else adm2_df
+        cell_ids   = sorted(meta_src[fold_col].unique().tolist())
+        folds      = [(c, f"cell_{c}", f"fold_cell_{c}") for c in cell_ids]
+    else:
+        fold_col   = "hindcast_start"
+        folds      = [(y, str(y), f"fold_{y}") for y in all_years]
+
     # LOO loop
-    print(f"\nRunning {len(all_years)} LOO folds...\n")
+    print(f"\nRunning {len(folds)} LOO folds ({args.cv_scheme})...\n")
     all_errors_list = []
     fold_metas      = []
 
-    for test_year in all_years:
-        fold_dir = os.path.join(exp_dir, f"fold_{test_year}")
+    for fold_value, fold_label, dir_name in folds:
+        fold_dir = os.path.join(exp_dir, dir_name)
         if use_tst:
             result = run_fold_tst(sequences, targets, sample_meta, all_years,
-                                  test_year, fold_dir, args)
+                                  fold_col, fold_value, fold_label, fold_dir, args,
+                                  cv_scheme=args.cv_scheme)
         else:
-            result = run_fold(adm2_df, feature_cols, all_years, test_year,
-                              args.model_type, fold_dir)
+            result = run_fold(adm2_df, feature_cols, all_years,
+                              fold_col, fold_value, fold_label,
+                              args.model_type, fold_dir, cv_scheme=args.cv_scheme)
         if result is None:
             continue
         fold_meta, errors = result
@@ -587,6 +694,8 @@ def main():
         "study_end":          study_end,
         "model_type":         args.model_type,
         "feature_mode":       args.feature_mode,
+        "cv_scheme":          args.cv_scheme,
+        "cell_lookup":        args.cell_lookup,
         "use_phenology":      args.use_phenology,
         "n_folds":            len(fold_metas),
         "overall_rmse":       overall_rmse,
@@ -602,19 +711,19 @@ def main():
     print(f"{'='*60}")
     single_sample_folds = any(fm["pct_error"] is not None for fm in fold_metas)
     skill_hdr = "err%  " if single_sample_folds else "R²    "
-    print(f"{'Year':>6}  {'RMSE':>10}  {skill_hdr:>6}  {'n_test':>7}")
+    print(f"{'Fold':>10}  {'RMSE':>10}  {skill_hdr:>6}  {'n_test':>7}")
     for fm in fold_metas:
         if fm["pct_error"] is not None:
             skill_val = f"{fm['pct_error']:>+6.1f}%"
         else:
             skill_val = f"{fm['r2_overall']:>6.3f} "
         print(
-            f"{fm['test_year']:>6}  {fm['rmse_overall']:>10,.0f}"
+            f"{fm['fold_label']:>10}  {fm['rmse_overall']:>10,.0f}"
             f"  {skill_val}  {fm['n_test']:>7}"
         )
-    print(f"{'':>6}  {'─'*10}  {'─'*6}")
-    print(f"{'Overall':>6}  {overall_rmse:>10,.0f}  {'':>6}  (LOO RMSE across all folds)")
-    print(f"{'':>6}  {overall_mae:>10,.0f}  {'':>6}  (LOO MAE  across all folds)")
+    print(f"{'':>10}  {'─'*10}  {'─'*6}")
+    print(f"{'Overall':>10}  {overall_rmse:>10,.0f}  {'':>6}  (LOO RMSE across all folds)")
+    print(f"{'':>10}  {overall_mae:>10,.0f}  {'':>6}  (LOO MAE  across all folds)")
     print(f"\nCounty RMSE saved to: {exp_dir}/loo_county_rmse.csv")
     print(f"All errors saved to:  {exp_dir}/loo_all_errors.csv")
     print(

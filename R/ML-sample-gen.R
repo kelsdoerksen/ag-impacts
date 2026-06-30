@@ -44,6 +44,10 @@ COUNTRY_CONFIG <- list(
   )
 )
 
+# "CONUS" is an alias for the usa config: the data dir, crop AOI tag, and output
+# filenames all use the CONUS label, so accept it as a country key too.
+COUNTRY_CONFIG$CONUS <- COUNTRY_CONFIG$usa
+
 if (!country %in% names(COUNTRY_CONFIG)) {
   stop("Unknown country '", country, "'. Options: ", paste(names(COUNTRY_CONFIG), collapse = ", "))
 }
