@@ -11,6 +11,7 @@ Saves per run:
 
 Example:
     python train_eval.py \
+        --crop corn \
         --test_year 2005 \
         --study_years 2000 2010 \
         --data_dir /path/to/processed_data \
@@ -21,7 +22,6 @@ Example:
 """
 
 import os
-import glob
 import json
 import argparse
 from datetime import datetime
@@ -30,13 +30,16 @@ import pandas as pd
 from sklearn.metrics import root_mean_squared_error
 
 from models import YieldModel, SUPPORTED_MODELS
-
-DATA_PATTERN = "ml_timeseries_EC-Earth3_*_preseason60_postharvest14.parquet"
+from data_loader import load_and_prepare, FEATURE_MODES, TARGET_OPTIONS, SUPPORTED_CROPS
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Train/evaluate a yield model with leave-one-out temporal split."
+    )
+    parser.add_argument(
+        "--crop", type=str, choices=SUPPORTED_CROPS, default="corn",
+        help=f"Crop to model. Choices: {SUPPORTED_CROPS}. Default: corn.",
     )
     parser.add_argument(
         "--test_year", type=int, required=True,
@@ -61,22 +64,40 @@ def parse_args():
         "--model_type", type=str, choices=SUPPORTED_MODELS, default="rf",
         help=f"Model type. Choices: {SUPPORTED_MODELS}. Default: rf.",
     )
+    parser.add_argument(
+        "--feature_mode", type=str, choices=FEATURE_MODES, default="aggregated",
+        help=(
+            "'aggregated': mean/std/sum per variable over the seasonal window. "
+            "'timeseries': full daily values (Nov 1 – Nov 1) as individual features. "
+            "Default: aggregated."
+        ),
+    )
+    parser.add_argument(
+        "--preseason_buffer", type=int, default=60,
+        help="Days before plant_start_doy to include (aggregated mode only, default: 60).",
+    )
+    parser.add_argument(
+        "--postharvest_buffer", type=int, default=14,
+        help="Days after harvest_end_doy to include (aggregated mode only, default: 14).",
+    )
+    parser.add_argument(
+        "--target", type=str, choices=TARGET_OPTIONS, default="yield",
+        help=(
+            "'yield': predict absolute yield. "
+            "'yield_pct_change': predict percent change vs. prior year. "
+            "Default: yield."
+        ),
+    )
     return parser.parse_args()
 
 
-def load_and_aggregate(data_dir):
-    files = sorted(glob.glob(os.path.join(data_dir, DATA_PATTERN)))
-    if not files:
-        raise FileNotFoundError(
-            f"No parquet files found in {data_dir} matching {DATA_PATTERN}"
-        )
-    print(f"Loading {len(files)} parquet file(s)...")
-    df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
-    print(
-        f"Total rows: {len(df):,}  "
-        f"hindcast_start years: {sorted(df['hindcast_start'].unique())}"
-    )
+def aggregate_daily(daily_df: pd.DataFrame):
+    """Aggregate a daily county×day DataFrame to one row per (adm2_id, hindcast_start).
 
+    Returns (adm2_df, weather_cols) where weather_cols is the list of raw weather
+    column names used to build mean/std features.
+    """
+    df = daily_df.copy()
     df["temp_range_C"] = df["tasmax_C"] - df["tasmin_C"]
     weather_cols = ["tasmax_C", "tasmin_C", "hursmin", "pr_mm", "temp_range_C"]
 
@@ -100,6 +121,7 @@ def load_and_aggregate(data_dir):
     )
     print(f"(adm2, year) pairs with yield data: {len(adm2_df)}")
     return adm2_df, weather_cols
+
 
 
 def build_features(adm2_df, weather_cols):
@@ -133,13 +155,22 @@ def main():
 
     print(f"Run ID       : {run_id}")
     print(f"Run dir      : {run_dir}")
+    print(f"Crop         : {args.crop}")
     print(f"Study years  : {study_start}–{study_end}")
     print(f"Train years  : {train_years}")
     print(f"Test year    : {test_year}")
     print(f"Model type   : {args.model_type}")
+    print(f"Feature mode : {args.feature_mode}")
+    print(f"Target       : {args.target}")
 
-    adm2_df, weather_cols = load_and_aggregate(args.data_dir)
-    adm2_df, feature_cols = build_features(adm2_df, weather_cols)
+    adm2_df, feature_cols = load_and_prepare(
+        crop=args.crop,
+        data_dir=args.data_dir,
+        feature_mode=args.feature_mode,
+        preseason_buffer=args.preseason_buffer,
+        postharvest_buffer=args.postharvest_buffer,
+        target=args.target,
+    )
 
     train_mask = adm2_df["hindcast_start"].isin(train_years)
     test_mask  = adm2_df["hindcast_start"] == test_year
@@ -212,6 +243,10 @@ def main():
 
     run_meta = {
         "run_id":               run_id,
+        "crop":                 args.crop,
+        "target":               args.target,
+        "preseason_buffer":     args.preseason_buffer,
+        "postharvest_buffer":   args.postharvest_buffer,
         "test_year":            test_year,
         "train_years":          train_years,
         "study_start":          study_start,

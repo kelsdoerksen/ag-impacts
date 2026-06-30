@@ -1,481 +1,384 @@
-# ML Sample Generation
+# ML Sample Generation — batch over hindcast years (climate data only)
 
 # ===== LOAD PACKAGES =====
 library(terra)
 library(sf)
-library(haven)
 library(dplyr)
 library(tidyr)
-library(ggplot2)
-if (!requireNamespace("tigris", quietly = TRUE)) install.packages("tigris")
-library(tigris)
-if (!requireNamespace("arrow", quietly = TRUE)) install.packages("arrow")
+if (!requireNamespace("arrow",  quietly = TRUE)) install.packages("arrow")
 library(arrow)
 
 
 # ===== MAIN VARIABLES TO UPDATE ACCORDINGLY =====
 
-# Crop name aliases — calendar files use "Maize", yield files use "corn"
-CROP_CAL_NAME   <- c(maize = "Maize", corn = "Maize")
-CROP_YIELD_NAME <- c(maize = "corn",  corn = "corn")
+country            <- "CONUS"     # which country to generate samples for: see COUNTRY_CONFIG below
+climate_model      <- "EC-Earth3"
+member             <- "r1i4p1f1"
+hindcast_start_yrs <- 1980:2023     # generates output for yield years defined
 
-climate_model  <- "EC-Earth3"  # Climate model name as it appears in filenames
-hindcast_start <- 2005         # Initialization year of the climate model
-                         # (e.g. "s2005" in hindcast_s2005-r1i4p1f1)
-# Target crop yield year: always hindcast_start + 1
-# (e.g. hindcast_start = 2005 → file 20051101-20061031.nc → 2006 crop yield)
-year_of_interest <- hindcast_start + 1
-crop_name <- "Maize"
+# Server mount (smb://137.158.30.70/CRL_storage mounted at /Volumes/CRL_storage)
+day_data_dir <- "/Volumes/CRL_storage/all_datasets/dcpp_daily/EC-Earth3/r1i4p1f1/day"
+nc_version   <- "v20210910"
 
+harv_tif   <- "/Users/kdoerkse/Documents/UCT/AgImpacts/CroplandPastureArea2000_Geotiff/cropland2000_area.tif"
+county_shp <- "/Users/kdoerkse/Documents/UCT/AgImpacts/us_county_2020_shapefile/cb_2020_us_county_20m.shp"
+nuts_gpkg  <- "/Users/kdoerkse/Documents/UCT/AgImpacts/NUTS_RG_60M_2024_3035.gpkg"
+out_dir    <- "/Users/kdoerkse/Documents/UCT/AgImpacts/CONUS_processed_data"
 
-data_dir  <- "/Users/kdoerkse/Documents/UCT/AgImpacts/dcpp_data"
-cal_dir   <- "/Users/kdoerkse/Documents/UCT/AgImpacts/ALL_CROPS_netCDF_0.5deg_unfilled"
-harv_tif  <- "/Users/kdoerkse/Documents/UCT/AgImpacts/CroplandPastureArea2000_Geotiff/cropland2000_area.tif"
-yield_dta <- file.path("/Users/kdoerkse/Documents/UCT/AgImpacts/historical_yields",
-                       sprintf("%s_gmfd_v1_ready.dta", CROP_YIELD_NAME[tolower(crop_name)]))
+# ===== COUNTRY CONFIG =====
+# Each country defines:
+#   lon_range / lat_range : climate-data subset window, in the NetCDF's 0-360 lon space
+#   load_boundaries       : zero-arg function returning list(sf, vect) of admin units,
+#                           reprojected to EPSG:4326, with standardized columns
+#                           adm2 (finest unit name), adm2_id (unique id), adm1 (parent unit)
+COUNTRY_CONFIG <- list(
+  usa = list(
+    lon_range       = c(233, 298),   # CONUS in 0-360 lon space
+    lat_range       = c(23, 52),
+    load_boundaries = function() load_us_boundaries(county_shp)
+  ),
+  germany = list(
+    lon_range       = c(5, 16),      # Germany ~6-15 deg E
+    lat_range       = c(46, 56),     # Germany ~47-55 deg N
+    load_boundaries = function() load_nuts_boundaries(nuts_gpkg, cntr_code = "DE", level = 3)
+  )
+)
+
+if (!country %in% names(COUNTRY_CONFIG)) {
+  stop("Unknown country '", country, "'. Options: ", paste(names(COUNTRY_CONFIG), collapse = ", "))
+}
+cfg       <- COUNTRY_CONFIG[[country]]
+lon_range <- cfg$lon_range
+lat_range <- cfg$lat_range
 
 
 # ===== FUNCTIONS =====
 
-# Load CONUS county boundaries, excluding non-contiguous territories.
-# Returns list(sf, vect).
-load_conus_boundaries <- function(boundary_year = 2020) {
-  us_counties <- counties(cb = TRUE, resolution = "20m", year = boundary_year) %>%
-    filter(!STUSPS %in% c("AK", "HI", "PR", "GU", "VI", "MP", "AS")) %>%
-    st_transform(crs = 4326)
-  list(sf = us_counties, vect = vect(us_counties))
+# Build the path to a dcppA hindcast NetCDF file.
+nc_path <- function(var, hstart) {
+  file.path(day_data_dir, var, "gr", nc_version, sprintf(
+    "%s_day_%s_dcppA-hindcast_s%d-%s_gr_%d1101-%d1031.nc",
+    var, climate_model, hstart, member, hstart, hstart + 1))
 }
 
+# Read a NetCDF file on the SMB mount via a subprocess.
+#
+# terra::rast() and ncdf4::nc_close() both segfault when the HDF5 library tries
+# to clean up file handles on this SMB share (invalid-permissions crash at 0x5b0).
+# The fix: run ncdf4 in a child Rscript, have it saveRDS() the CONUS array slice
+# BEFORE any cleanup runs, then read the RDS back in the parent session.
+# The child process may crash on exit but the data is already on disk.
+#
+# Subsets a lon/lat window given in the NetCDF's 0-360 lon space. The window
+# is taken from the globally-selected country (lon_range / lat_range from cfg).
+read_nc_region <- function(f, varname, lon_range = get("lon_range", envir = globalenv()),
+                           lat_range = get("lat_range", envir = globalenv())) {
+  tmp_rds <- tempfile(fileext = ".rds")
+  tmp_r   <- tempfile(fileext = ".R")
 
-# Load daily tasmax and tasmin for a target crop yield year.
-# Loads only the single dcppA hindcast file spanning hindcast_start_year Nov 1
-# through crop_yield_year Oct 31 (e.g. s2005 → 20051101-20061031.nc for 2006
-# crop yield), rotates longitude to -180/180, and crops to region_vect.
-# Returns list(tasmax, tasmin).
-load_temperature_data <- function(data_dir, hindcast_start_year, region_vect,
-                                   climate_model, member = "r1i4p1f1") {
-  yr0 <- hindcast_start_year        # e.g. 2005  (the "s2005" initialisation year)
-  yr1 <- yr0 + 1                    # e.g. 2006  (the target crop yield year)
+  script <- c(
+    "library(ncdf4)",
+    paste0("nc      <- nc_open(", deparse(f), ")"),
+    "lon     <- ncvar_get(nc, 'lon')",
+    "lat     <- ncvar_get(nc, 'lat')",
+    sprintf("li      <- which(lon >= %s & lon <= %s)", lon_range[1], lon_range[2]),
+    sprintf("ki      <- which(lat >= %s & lat <= %s)", lat_range[1], lat_range[2]),
+    paste0("vals    <- ncvar_get(nc, ", deparse(varname),
+           ", start = c(li[1], ki[1], 1L), count = c(length(li), length(ki), -1L))"),
+    "t_raw   <- ncvar_get(nc, 'time')",
+    "t_units <- ncatt_get(nc, 'time', 'units')$value",
+    paste0("saveRDS(list(vals = vals, lon = lon[li], lat = lat[ki],",
+           " t_raw = t_raw, t_units = t_units), ", deparse(tmp_rds), ")")
+  )
+  writeLines(script, tmp_r)
 
-  nc_file <- function(var) {
-    file.path(data_dir, sprintf(
-      "%s_day_%s_dcppA-hindcast_s%d-%s_gr_%d1101-%d1031.nc",
-      var, climate_model, yr0, member, yr0, yr1))
+  system(paste("Rscript", shQuote(tmp_r)), ignore.stdout = TRUE, ignore.stderr = TRUE)
+  file.remove(tmp_r)
+
+  if (!file.exists(tmp_rds)) stop("Failed to read: ", basename(f))
+  d <- readRDS(tmp_rds)
+  file.remove(tmp_rds)
+  d
+}
+
+# Convert the list returned by read_nc_region() into an in-memory SpatRaster.
+# ncdf4 returns arrays as [lon, lat, time]; terra expects cells in row-major
+# order (lon varies fastest) with the northernmost row first.
+arrays_to_rast <- function(d) {
+  # shift 0-360 → -180-180, but only for lons in the western hemisphere
+  # (>180). Eastern-hemisphere lons (e.g. Germany, 5-16°E) are unchanged.
+  lons <- ifelse(d$lon > 180, d$lon - 360, d$lon)
+  lats <- d$lat
+  dx   <- abs(diff(d$lon)[1])
+  dy   <- abs(diff(d$lat)[1])
+  nlyr <- length(d$t_raw)
+
+  r <- rast(nrows = length(lats), ncols = length(lons), nlyrs = nlyr,
+            xmin  = min(lons) - dx / 2,  xmax = max(lons) + dx / 2,
+            ymin  = min(lats) - dy / 2,  ymax = max(lats) + dy / 2,
+            crs   = "EPSG:4326")
+
+  vals <- d$vals
+  # Flip lat to north-to-south if stored south-to-north
+  if (lats[1] < lats[length(lats)]) {
+    vals <- vals[, length(lats):1L, , drop = FALSE]
+  }
+  # Reshape [lon, lat, time] → [ncell, nlyr] (lon varies fastest = terra convention)
+  dim(vals) <- c(length(lons) * length(lats), nlyr)
+  values(r) <- vals
+
+  t_origin <- as.Date(sub(".*since\\s+", "", d$t_units))
+  time(r)  <- t_origin + as.integer(d$t_raw)
+  r
+}
+
+# Load forecast year 1 only: s{hstart} file covering {hstart}1101–{hstart+1}1031.
+load_temperature_data <- function(day_data_dir, hindcast_start_year, region_vect,
+                                   climate_model, member = "r1i4p1f1",
+                                   nc_version = "v20210910") {
+  load_one <- function(var) {
+    arrays_to_rast(read_nc_region(nc_path(var, hindcast_start_year), var))
   }
 
-  load_var <- function(var) {
-    crop(rotate(rast(nc_file(var))), region_vect)
-  }
-
-  tasmax <- load_var("tasmax")
-  tasmin <- load_var("tasmin")
+  tasmax <- load_one("tasmax")
+  tasmin <- load_one("tasmin")
 
   cat("=== TASMAX ===\n")
-  cat("Resolution (deg):", res(tasmax), "\n")
-  cat("Daily layers:", nlyr(tasmax), "\n")
-  cat("Time range:", format(range(time(tasmax))), "\n")
-  cat("Units:", units(tasmax)[1], "\n")
-
-  cat("\n=== TASMIN ===\n")
-  cat("Resolution (deg):", res(tasmin), "\n")
-  cat("Daily layers:", nlyr(tasmin), "\n")
-  cat("Time range:", format(range(time(tasmin))), "\n")
-  cat("Units:", units(tasmin)[1], "\n")
+  cat("  Daily layers:", nlyr(tasmax), "  Time range:", format(range(time(tasmax))), "\n")
+  cat("=== TASMIN ===\n")
+  cat("  Daily layers:", nlyr(tasmin), "  Time range:", format(range(time(tasmin))), "\n")
 
   list(tasmax = tasmax, tasmin = tasmin)
 }
 
+load_precip_data_daily <- function(day_data_dir, hindcast_start_year, region_vect,
+                                    climate_model, member = "r1i4p1f1",
+                                    nc_version = "v20210910") {
+  pr <- arrays_to_rast(read_nc_region(nc_path("pr", hindcast_start_year), "pr"))
 
-# Load monthly precipitation (pr) for a target crop yield year.
-# Loads the single dcppA hindcast Amon file spanning hindcast_start_year Nov
-# through crop_yield_year Oct (e.g. s2005 → 200511-200610.nc for 2006 crop
-# yield), rotates longitude to -180/180, and crops to region_vect.
-# Returns the monthly pr SpatRaster (one layer per month, units kg m-2 s-1).
-load_precip_data <- function(data_dir, hindcast_start_year, region_vect,
-                              climate_model, member = "r1i4p1f1") {
-  yr0 <- hindcast_start_year        # e.g. 2005  (the "s2005" initialisation year)
-  yr1 <- yr0 + 1                    # e.g. 2006  (the target crop yield year)
-
-  f <- file.path(data_dir, sprintf(
-    "pr_Amon_%s_dcppA-hindcast_s%d-%s_gr_%d11-%d10.nc",
-    climate_model, yr0, member, yr0, yr1))
-
-  pr <- crop(rotate(rast(f)), region_vect)
-
-  cat("\n=== PR ===\n")
-  cat("Resolution (deg):", res(pr), "\n")
-  cat("Monthly layers:", nlyr(pr), "\n")
-  cat("Time range:", format(range(time(pr))), "\n")
-  cat("Units:", units(pr)[1], "\n")
-
+  cat("\n=== PR daily ===\n")
+  cat("  Daily layers:", nlyr(pr), "  Time range:", format(range(time(pr))), "\n")
   pr
 }
 
+load_hursmin_data <- function(day_data_dir, hindcast_start_year, region_vect,
+                               climate_model, member = "r1i4p1f1",
+                               nc_version = "v20210910") {
+  f <- nc_path("hursmin", hindcast_start_year)
+  hursmin <- arrays_to_rast(read_nc_region(f, "hursmin"))
 
-# Load the crop calendar NetCDF for crop_name (e.g. "Maize"), resample all
-# DOY layers to the temperature grid, and compute the preseason start
-# (plant.start minus preseason_days, floored at DOY 1).
-# year sets the reference calendar year used in the printed summary.
-# Returns a named list of DOY SpatRasters plus cal_df (summary data frame).
-load_crop_calendar <- function(cal_dir, crop_name, region_vect, target_rast,
-                                year, preseason_days = 90) {
-  cal_path <- file.path(cal_dir, paste0(CROP_CAL_NAME[tolower(crop_name)], ".crop.calendar.nc"))
-  crop_cal     <- rast(cal_path)
-  crop_cal_reg <- crop(crop_cal, ext(region_vect))
-
-  resamp <- function(layer) {
-    resample(crop(crop_cal_reg[[layer]], region_vect), target_rast, method = "near")
-  }
-
-  plant_doy_r       <- resamp("plant")
-  harvest_doy_r     <- resamp("harvest")
-  plant_start_doy_r <- resamp("plant.start")
-  harvest_end_doy_r <- resamp("harvest.end")
-  preseason_start_r <- max(plant_start_doy_r - preseason_days, 1)
-
-  cat("\nResolution after resampling:\n")
-  cat("  Crop calendar (resampled):", res(plant_doy_r), "\n")
-  cat("  Temperature:              ", res(target_rast), "\n")
-
-  # Summary data frame (0.5-deg grid, useful for QA)
-  origin_date <- as.Date(paste0(year, "-01-01"))
-  cal_df <- as.data.frame(crop_cal_reg[["plant"]], xy = TRUE, na.rm = TRUE) %>%
-    rename(plant_doy = plant) %>%
-    left_join(
-      as.data.frame(crop_cal_reg[["harvest"]], xy = TRUE, na.rm = TRUE) %>%
-        rename(harvest_doy = harvest), by = c("x", "y")) %>%
-    left_join(
-      as.data.frame(crop_cal_reg[["tot.days"]], xy = TRUE, na.rm = TRUE) %>%
-        rename(season_length = tot.days), by = c("x", "y")) %>%
-    mutate(
-      plant_date   = format(as.Date(plant_doy   - 1, origin = origin_date), "%b %d"),
-      harvest_date = format(as.Date(harvest_doy - 1, origin = origin_date), "%b %d")
-    )
-
-  cat("\n===", crop_name, "Crop Calendar — CONUS (", year, "reference) ===\n")
-  cat("Grid cells with data:", nrow(cal_df), "\n\n")
-  cat("Mean Planting (day of year):\n");    print(summary(cal_df$plant_doy))
-  cat("\nMean Harvest (day of year):\n");   print(summary(cal_df$harvest_doy))
-  cat("\nGrowing season length (days):\n"); print(summary(cal_df$season_length))
-  cat("\nMost common planting window: ~",
-      format(as.Date(round(median(cal_df$plant_doy)) - 1,          origin = origin_date), "%B %d"),
-      "to",
-      format(as.Date(round(quantile(cal_df$plant_doy, 0.75)) - 1,  origin = origin_date), "%B %d"), "\n")
-  cat("Most common harvest window: ~",
-      format(as.Date(round(median(cal_df$harvest_doy)) - 1,         origin = origin_date), "%B %d"),
-      "to",
-      format(as.Date(round(quantile(cal_df$harvest_doy, 0.75)) - 1, origin = origin_date), "%B %d"), "\n")
-
-  list(
-    plant_doy_r       = plant_doy_r,
-    harvest_doy_r     = harvest_doy_r,
-    plant_start_doy_r = plant_start_doy_r,
-    harvest_end_doy_r = harvest_end_doy_r,
-    preseason_start_r = preseason_start_r,
-    cal_df            = cal_df
-  )
+  cat("\n=== HURSMIN ===\n")
+  cat("  Daily layers:", nlyr(hursmin), "\n")
+  cat("  Time range:", format(range(time(hursmin))), "\n")
+  hursmin
 }
 
+# Admin-boundary loaders. Each returns list(sf, vect) reprojected to EPSG:4326
+# with standardized columns: adm2 (finest unit name), adm2_id (unique id),
+# adm1 (parent unit name). Downstream code only ever reads these three columns.
 
-# Load the cropland area raster (absolute area per pixel), resample to the
-# temperature grid, and apply a binary mask to all supplied climate rasters so
-# that zero-cropland pixels are NA before any further processing.
-# pr_conus is optional; include it to mask precipitation alongside temperature.
-# Returns list(harv_frac_r, tasmax, tasmin, pr) where harv_frac_r retains the
-# cropland area values used as weights during extraction.
-load_harvested_area <- function(tif_path, region_vect, target_rast,
-                                 tasmax_conus, tasmin_conus, pr_conus = NULL) {
+# Load CONUS county boundaries from a local shapefile, excluding non-contiguous territories.
+load_us_boundaries <- function(shp_path) {
+  us_counties <- st_read(shp_path, quiet = TRUE) %>%
+    filter(!STUSPS %in% c("AK", "HI", "PR", "GU", "VI", "MP", "AS")) %>%
+    st_transform(crs = 4326) %>%
+    mutate(adm2 = NAME, adm2_id = GEOID, adm1 = STATE_NAME)
+  list(sf = us_counties, vect = vect(us_counties))
+}
+
+# Load admin units from the Eurostat NUTS geopackage for one country.
+# level 3 = NUTS-3 (e.g. German Kreise) as the finest (adm2) unit; the parent
+# NUTS-1 region (e.g. Bundesland) is matched on the first 3 chars of NUTS_ID
+# and used as adm1.
+load_nuts_boundaries <- function(gpkg_path, cntr_code, level = 3) {
+  nuts <- st_read(gpkg_path, quiet = TRUE)
+
+  nuts1 <- nuts %>%
+    st_drop_geometry() %>%
+    filter(LEVL_CODE == 1) %>%
+    select(adm1_id = NUTS_ID, adm1 = NUTS_NAME)
+
+  regions <- nuts %>%
+    filter(CNTR_CODE == cntr_code, LEVL_CODE == level) %>%
+    mutate(adm2 = NUTS_NAME, adm2_id = NUTS_ID, adm1_id = substr(NUTS_ID, 1, 3)) %>%
+    left_join(nuts1, by = "adm1_id") %>%
+    st_transform(crs = 4326)
+
+  list(sf = regions, vect = vect(regions))
+}
+
+# Load the cropland area raster and resample it to the target grid.
+load_harvested_area_raster <- function(tif_path, region_vect, target_rast) {
   harv_frac_r <- resample(
     crop(rast(tif_path), region_vect),
     target_rast,
     method = "bilinear"
   )
-
-  harv_mask <- ifel(harv_frac_r > 0, 1, NA)
-
-  cat("\nCropland area mask applied:\n")
-  cat("  Pixels retained (cropland area > 0):",
-      sum(values(harv_mask) == 1, na.rm = TRUE), "\n")
-  cat("  Pixels excluded (cropland area = 0 or NA):",
-      sum(is.na(values(harv_mask))), "\n")
-
-  result <- list(
-    harv_frac_r = harv_frac_r,
-    tasmax      = tasmax_conus * harv_mask,
-    tasmin      = tasmin_conus * harv_mask
-  )
-  if (!is.null(pr_conus)) result$pr <- pr_conus * harv_mask
-  result
+  cat("\nHarvested area raster loaded.\n")
+  cat("  Pixels with cropland > 0:", sum(values(harv_frac_r) > 0, na.rm = TRUE), "\n")
+  cat("  Pixels with no cropland: ",
+      sum(is.na(values(harv_frac_r)) | values(harv_frac_r) == 0), "\n")
+  harv_frac_r
 }
 
-
-# Load crop yield data from a .dta file, filter to iso_code, and optionally
-# subset to years covered by the climate data so the table matches the
-# crop calendar period of interest.
-load_yield_data <- function(dta_path, iso_code, year_range = NULL) {
-  yield <- read_dta(dta_path) %>%
-    filter(iso == iso_code)
-
-  if (!is.null(year_range)) {
-    yield <- yield %>% filter(year >= year_range[1], year <= year_range[2])
-  }
-
-  cat("\nCrop yield (", iso_code, "):", nrow(yield), "rows\n")
-  cat("Years:", paste(range(yield$year), collapse = " - "), "\n")
-  yield
-}
-
-
-# Apply the crop season DOY window to a daily raster, setting out-of-season
-# pixels to NA.  Works for both temperature and precipitation.
-apply_season_mask <- function(daily_raster, preseason_start_r, harvest_end_r, var_name) {
-  dates <- time(daily_raster)
-  doys  <- as.integer(format(dates, "%j"))
-
-  cat("Masking", var_name, "—", nlyr(daily_raster), "daily layers\n")
-
-  masked <- lapply(seq_along(dates), function(i) {
-    doy  <- doys[i]
-    mask <- ifel(doy >= preseason_start_r & doy <= harvest_end_r, 1, NA)
-    daily_raster[[i]] * mask
-  })
-
-  result <- rast(masked)
-  time(result) <- dates
-  names(result) <- paste0(var_name, "_", format(dates, "%Y%m%d"))
-  result
-}
-
-
-# Extract season-masked monthly precipitation per county, weighted by cropland
-# area fraction.  Input pr_masked has one layer per month (kg m-2 s-1 mean
-# rate); convert to mm/month by multiplying by seconds in each month.
-# Returns a long data frame with one row per county-month (adm2_id, year_month, pr_mm).
-extract_monthly_precip_by_county <- function(pr_masked, counties_vect, us_counties,
-                                              harv_frac_r) {
-  dates <- time(pr_masked)
-
-  # Extract weights once
-  harv_vals <- terra::extract(harv_frac_r, counties_vect)
-  names(harv_vals)[2] <- "weight"
-
-  cat("Extracting precipitation —", nlyr(pr_masked), "monthly layers\n")
-
-  monthly_list <- lapply(seq_len(nlyr(pr_masked)), function(i) {
-    # kg m-2 s-1 → mm/month: multiply by seconds in the month
-    month_start  <- as.Date(format(dates[i], "%Y-%m-01"))
-    next_month   <- as.Date(format(month_start + 32, "%Y-%m-01"))
-    seconds_in_mo <- as.numeric(difftime(next_month, month_start, units = "secs"))
-
-    vals_raw <- terra::extract(pr_masked[[i]] * seconds_in_mo, counties_vect)
-    names(vals_raw)[2] <- "value"
-
-    county_wmeans <- tapply(seq_len(nrow(vals_raw)), vals_raw$ID, function(idx) {
-      v    <- vals_raw$value[idx]
-      w    <- harv_vals$weight[idx]
-      keep <- !is.na(v) & !is.na(w) & w > 0
-      if (sum(keep) == 0) return(NA_real_)
-      weighted.mean(v[keep], w[keep])
-    })
-
-    data.frame(
-      adm2_id    = us_counties$GEOID,
-      year_month = format(dates[i], "%Y-%m"),
-      pr_mm      = as.numeric(county_wmeans)
-    )
-  })
-
-  bind_rows(monthly_list)
-}
-
-
-# Extract daily values by county using harvested-area-fraction weighted mean.
+# Extract daily cropland-area-weighted county means for all layers in a SpatRaster.
+# harv_extracted must be the data frame produced in the static loading block via
+#   terra::extract(harv_frac_r, region$vect, weights=TRUE, exact=TRUE, cells=TRUE)
+# with a combined_weight column = cropland_frac * cell_overlap_fraction.
+# scale_factor and unit_offset:
+#   temperature:   scale_factor = 1,     unit_offset = -273.15, col_suffix = "_C"
+#   hursmin:       scale_factor = 1,     unit_offset = 0,       col_suffix = ""
+#   precipitation: scale_factor = 86400, unit_offset = 0,       col_suffix = "_mm"
 # Returns a long data frame with one row per county-date.
-extract_daily_by_county <- function(masked_raster, var_name, counties_vect, us_counties, harv_frac_r) {
+extract_daily_by_county <- function(masked_raster, var_name, regions,
+                                    harv_extracted, unit_offset = -273.15, col_suffix = "_C",
+                                    scale_factor = 1) {
   dates <- time(masked_raster)
   doys  <- as.integer(format(dates, "%j"))
-
-  # Extract harvested area fraction weights once — same geometry for every day
-  harv_vals <- terra::extract(harv_frac_r, counties_vect)
-  names(harv_vals)[2] <- "weight"
 
   cat("Extracting", var_name, "—", length(dates), "daily layers\n")
 
   daily_list <- lapply(seq_along(dates), function(i) {
-    vals_raw <- terra::extract(masked_raster[[i]], counties_vect)
-    names(vals_raw)[2] <- "value"
+    # Extract by pre-computed cell numbers: avoids re-running polygon intersection
+    # geometry each day. Same grid as harv_frac_r so cell indices are valid.
+    cell_vals <- terra::extract(masked_raster[[i]], harv_extracted$cell)[, 1]
 
-    county_wmeans <- tapply(seq_len(nrow(vals_raw)), vals_raw$ID, function(idx) {
-      v    <- vals_raw$value[idx]
-      w    <- harv_vals$weight[idx]
+    county_wmeans <- tapply(seq_len(length(cell_vals)), harv_extracted$ID, function(idx) {
+      v    <- cell_vals[idx]
+      w    <- harv_extracted$combined_weight[idx]
       keep <- !is.na(v) & !is.na(w) & w > 0
-      if (sum(keep) == 0) return(NA_real_)
+      if (!any(keep)) return(NA_real_)
       weighted.mean(v[keep], w[keep])
     })
 
     data.frame(
-      adm2    = us_counties$NAME,
-      adm2_id = us_counties$GEOID,
-      adm1    = us_counties$STATE_NAME,
+      adm2    = regions$adm2,
+      adm2_id = regions$adm2_id,
+      adm1    = regions$adm1,
       date    = dates[i],
       doy     = doys[i],
-      value_C = as.numeric(county_wmeans) - 273.15
+      value   = as.numeric(county_wmeans) * scale_factor + unit_offset
     )
   })
 
   result <- bind_rows(daily_list)
-  names(result)[names(result) == "value_C"] <- paste0(var_name, "_C")
+  names(result)[names(result) == "value"] <- paste0(var_name, col_suffix)
   result
 }
 
 
-# ----- Load data -----
+# ===== MAIN =====
+# Wrapped in a function so the file can be sourced to reuse its functions
+# (e.g. for testing) without triggering the static load + batch loop. Run as a
+# script (Rscript ML-sample-gen.R) it executes via the guard at the bottom.
+main <- function() {
 
-conus <- load_conus_boundaries()
+# ----- LOAD STATIC DATA (once, before the batch loop) -----
 
-temp  <- load_temperature_data(data_dir, hindcast_start, conus$vect, climate_model)
-pr    <- load_precip_data(data_dir, hindcast_start, conus$vect, climate_model)
+cat("\nGenerating samples for country:", country, "\n")
+region <- cfg$load_boundaries()
+cat("  Admin units (adm2):", nrow(region$sf), "\n")
 
-cal <- load_crop_calendar(
-  cal_dir, crop_name, conus$vect,
-  target_rast    = temp$tasmax[[1]],
-  year           = year_of_interest,
-  preseason_days = 60
-)
+# Reference temperature load for grid alignment (harvested area resampling)
+cat("\nLoading reference temperature grid for year", hindcast_start_yrs[1], "...\n")
+ref_rast    <- arrays_to_rast(read_nc_region(
+  nc_path("tasmax", hindcast_start_yrs[1]), "tasmax"))[[1]]
+harv_frac_r <- load_harvested_area_raster(harv_tif, region$vect, ref_rast)
 
-harv <- load_harvested_area(
-  harv_tif, conus$vect, temp$tasmax[[1]],
-  tasmax_conus = temp$tasmax,
-  tasmin_conus = temp$tasmin,
-  pr_conus     = pr
-)
+# Compute pixel-to-county mapping with exact cell overlap fractions once.
+# Column order from terra: ID, cropland_frac, weight (overlap fraction), cell.
+harv_extracted           <- terra::extract(harv_frac_r, region$vect,
+                                            weights = TRUE, exact = TRUE, cells = TRUE)
+names(harv_extracted)[2] <- "cropland_frac"
+harv_extracted$combined_weight <- harv_extracted$cropland_frac * harv_extracted$weight
 
-yield <- load_yield_data(yield_dta, "USA", year_range = c(year_of_interest, year_of_interest))
+harv_mask   <- ifel(harv_frac_r > 0, 1, NA)
 
+rm(ref_rast)
+gc()
 
-# ----- Filter all climate to year_of_interest -----
-
-in_year <- function(r) which(format(time(r), "%Y") == as.character(year_of_interest))
-
-tasmax_yr <- harv$tasmax[[in_year(harv$tasmax)]]
-tasmin_yr <- harv$tasmin[[in_year(harv$tasmin)]]
-pr_yr     <- harv$pr[[in_year(harv$pr)]]
-
-
-# ----- Apply season mask -----
-# Temperature: preseason start through mean harvest DOY
-# Precipitation: preseason start through harvest end DOY (full window for monthly totals)
-
-tasmax_masked <- apply_season_mask(tasmax_yr, cal$preseason_start_r, cal$harvest_doy_r,     "tasmax")
-tasmin_masked <- apply_season_mask(tasmin_yr, cal$preseason_start_r, cal$harvest_doy_r,     "tasmin")
-pr_masked     <- apply_season_mask(pr_yr,     cal$preseason_start_r, cal$harvest_end_doy_r, "pr")
-
-cat("\nSeason-masked layers (", year_of_interest, "):\n")
-cat("  tasmax:", sum(!is.nan(global(tasmax_masked, "mean", na.rm = TRUE)[[1]])), "days\n")
-cat("  tasmin:", sum(!is.nan(global(tasmin_masked, "mean", na.rm = TRUE)[[1]])), "days\n")
-cat("  pr:    ", sum(!is.nan(global(pr_masked,     "mean", na.rm = TRUE)[[1]])), "days\n")
+cat("\nStatic data loaded. Starting batch loop over hindcast years.\n")
 
 
-# ----- Extract and aggregate by county -----
+# ----- BATCH LOOP -----
 
-tasmax_daily <- extract_daily_by_county(tasmax_masked, "tasmax", conus$vect, conus$sf, harv$harv_frac_r)
-tasmin_daily <- extract_daily_by_county(tasmin_masked, "tasmin", conus$vect, conus$sf, harv$harv_frac_r)
-pr_monthly   <- extract_monthly_precip_by_county(pr_masked, conus$vect, conus$sf, harv$harv_frac_r)
+for (hindcast_start in hindcast_start_yrs) {
+  year_of_interest <- hindcast_start + 1
+
+  cat("\n\n========================================\n")
+  cat("hindcast_start =", hindcast_start, "  yield year =", year_of_interest, "\n")
+  cat("========================================\n\n")
+
+  out_file <- file.path(out_dir, sprintf(
+    "climate_%s_%s_s%d.parquet",
+    country, climate_model, hindcast_start))
+
+  if (file.exists(out_file)) {
+    cat("Output already exists, skipping:", basename(out_file), "\n")
+    next
+  }
+
+  # ----- Load climate data for this hindcast year -----
+
+  temp     <- load_temperature_data(day_data_dir, hindcast_start, region$vect,
+                                     climate_model, member, nc_version)
+  pr_raw   <- load_precip_data_daily(day_data_dir, hindcast_start, region$vect,
+                                      climate_model, member, nc_version)
+  hurs_raw <- load_hursmin_data(day_data_dir, hindcast_start, region$vect,
+                                 climate_model, member, nc_version)
+
+  # ----- Apply cropland mask -----
+
+  tasmax_full  <- temp$tasmax  * harv_mask
+  tasmin_full  <- temp$tasmin  * harv_mask
+  pr_full      <- pr_raw       * harv_mask
+  hursmin_full <- hurs_raw     * harv_mask
+
+  rm(temp, pr_raw, hurs_raw)
+  gc()
+
+  # ----- Extract by county (cropland-area-weighted mean) -----
+
+  tasmax_daily  <- extract_daily_by_county(tasmax_full,  "tasmax",  region$sf, harv_extracted)
+  tasmin_daily  <- extract_daily_by_county(tasmin_full,  "tasmin",  region$sf, harv_extracted)
+  hursmin_daily <- extract_daily_by_county(hursmin_full, "hursmin", region$sf, harv_extracted,
+                                            unit_offset = 0, col_suffix = "")
+  pr_daily      <- extract_daily_by_county(pr_full, "pr", region$sf, harv_extracted,
+                                            unit_offset = 0, col_suffix = "_mm", scale_factor = 86400)
+
+  rm(tasmax_full, tasmin_full, pr_full, hursmin_full)
+  gc()
+
+  # ----- Build full hindcast timeseries (no crop-season filter) -----
+
+  hstart <- hindcast_start
+
+  ts_data <- tasmax_daily %>%
+    left_join(tasmin_daily  %>% select(adm2_id, date, tasmin_C), by = c("adm2_id", "date")) %>%
+    left_join(hursmin_daily %>% select(adm2_id, date, hursmin),  by = c("adm2_id", "date")) %>%
+    left_join(pr_daily      %>% select(adm2_id, date, pr_mm),    by = c("adm2_id", "date")) %>%
+    mutate(year_month = format(date, "%Y-%m"), hindcast_start = hstart) %>%
+    select(adm2_id, adm2, adm1, hindcast_start,
+           date, doy, year_month, tasmax_C, tasmin_C, hursmin, pr_mm)
+
+  cat("\nFull hindcast climate dataset — hindcast_start:", hindcast_start, "\n")
+  cat("  Rows (county × day):", nrow(ts_data), "\n")
+  cat("  Unique counties:    ", n_distinct(ts_data$adm2_id), "\n")
+  cat("  Date range:         ", format(range(ts_data$date)), "\n")
+
+  write_parquet(ts_data, out_file)
+  cat("\nWritten:", out_file, "\n")
+
+  rm(tasmax_daily, tasmin_daily, hursmin_daily, pr_daily, ts_data)
+  gc()
+}
+
+cat("\n\nAll years processed.\n")
+
+}  # end main()
 
 
-# ----- Build long-format timeseries -----
-
-# Join daily temperature streams on county + date
-temp_daily <- tasmax_daily %>%
-  left_join(tasmin_daily %>% select(adm2_id, date, tasmin_C),
-            by = c("adm2_id", "date")) %>%
-  mutate(year_month = format(date, "%Y-%m"))
-
-# Join monthly precip — repeated for every day within the same month
-ts_data <- temp_daily %>%
-  left_join(pr_monthly, by = c("adm2_id", "year_month"))
-
-# Map yield to adm2_id via county name matching
-county_meta <- ts_data %>%
-  select(adm2, adm2_id, adm1) %>%
-  distinct() %>%
-  mutate(adm2_lower = tolower(adm2),
-         adm1_lower = tolower(adm1))
-
-yield_mapped <- yield %>%
-  select(-any_of("adm2_id")) %>%           # drop if already present to avoid join conflict
-  mutate(adm2_lower = tolower(adm2),
-         adm1_lower = tolower(adm1)) %>%
-  left_join(county_meta %>% select(adm2_id, adm2_lower, adm1_lower),
-            by = c("adm2_lower", "adm1_lower")) %>%
-  select(adm2_id, yield)
-
-ts_data <- ts_data %>%
-  left_join(yield_mapped, by = "adm2_id") %>%
-  mutate(hindcast_start = hindcast_start) %>%
-  select(adm2_id, adm2, adm1, hindcast_start,
-         date, doy, year_month, tasmax_C, tasmin_C, pr_mm, yield)
-
-cat("\nFinal timeseries dataset — year:", year_of_interest, "\n")
-cat("  Rows (county × day):       ", nrow(ts_data), "\n")
-cat("  Unique counties:           ", n_distinct(ts_data$adm2_id), "\n")
-cat("  Date range:                ", format(range(ts_data$date)), "\n")
-cat("  Counties with yield:       ", sum(!is.na(ts_data$yield)) > 0, "\n")
-head(ts_data)
-
-
-# ----- Export -----
-
-out_file <- sprintf("/Users/kdoerkse/Documents/UCT//AgImpacts/processed_data/ml_timeseries_%s_s%d_%d.parquet",
-                    climate_model, hindcast_start, year_of_interest)
-write_parquet(ts_data, out_file)
-cat("\nWritten:", out_file, "\n")
-
-
-# ===== PLOT: Temperature time series for a random county =====
-
-set.seed(250)
-random_county_id <- sample(unique(tasmax_daily$adm2_id), 1)
-county_label <- paste0(
-  conus$sf$NAME[conus$sf$GEOID == random_county_id], ", ",
-  conus$sf$STATE_NAME[conus$sf$GEOID == random_county_id]
-)
-
-county_ts <- tasmax_daily %>%
-  filter(adm2_id == random_county_id) %>%
-  select(date, tasmax_C) %>%
-  left_join(tasmin_daily %>% filter(adm2_id == random_county_id) %>% select(date, tasmin_C),
-            by = "date")
-
-county_idx <- which(conus$sf$GEOID == random_county_id)
-cal_extracted <- terra::extract(
-  c(cal$plant_start_doy_r, cal$harvest_end_doy_r, cal$preseason_start_r),
-  conus$vect[county_idx]
-)
-plant_start_val   <- round(mean(cal_extracted[[2]], na.rm = TRUE))
-harvest_end_val   <- round(mean(cal_extracted[[3]], na.rm = TRUE))
-preseason_doy_val <- round(mean(cal_extracted[[4]], na.rm = TRUE))
-
-origin_yr <- paste0(year_of_interest, "-01-01")
-vlines <- data.frame(
-  date  = as.Date(c(preseason_doy_val, plant_start_val, harvest_end_val) - 1,
-                  origin = origin_yr),
-  event = c("plant - 90 days", "Plant start", "Harvest end")
-)
-
-ggplot(county_ts, aes(x = date)) +
-  geom_vline(data = vlines, aes(xintercept = date, colour = event),
-             linetype = "dashed", linewidth = 0.5) +
-  geom_line(aes(y = tasmax_C, colour = "tasmax"), linewidth = 0.6) +
-  geom_line(aes(y = tasmin_C, colour = "tasmin"),  linewidth = 0.6) +
-  scale_colour_manual(
-    values = c(tasmax = "#d73027", tasmin = "#4575b4",
-               `Plant start` = "#1a9641", `Harvest end` = "#f97b2a",
-               `plant - 90 days` = "#984ea3"),
-    labels = c(tasmax = "Max temp", tasmin = "Min temp",
-               `Plant start` = "Plant start (DOY)", `Harvest end` = "Harvest end (DOY)",
-               `plant - 90 days` = "Plant start − 90 days")
-  ) +
-  labs(title = paste0("Daily Temperature — ", county_label, " (", year_of_interest, ")"),
-       x = "Date", y = "Temperature (°C)", colour = NULL) +
-  theme_minimal()
+# Run only when executed as a script (not when sourced for its functions).
+if (sys.nframe() == 0L) {
+  main()
+}
