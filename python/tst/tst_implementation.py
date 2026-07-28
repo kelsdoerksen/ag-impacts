@@ -55,11 +55,13 @@ import argparse
 import glob
 import json
 import os
+import sys
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 from transformers import (
@@ -68,6 +70,17 @@ from transformers import (
     Trainer,
     TrainingArguments,
     set_seed,
+)
+from transformers.models.patchtst.modeling_patchtst import PatchTSTForRegressionOutput
+
+# Reuse the tabular pipeline's prior-yield history builders so the TST branch
+# and the tabular lag features are derived identically. data_loader lives one
+# directory up (python/) and pulls only pandas/numpy — no heavy deps.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from data_loader import (
+    PHENOLOGY_CHANNELS,
+    build_yield_history_matrix,
+    load_county_yield_series,
 )
 
 set_seed(42)
@@ -87,11 +100,7 @@ CLIMATE_CHANNELS = ["tasmax_C", "tasmin_C", "hursmin", "pr_mm"]
 # moisture 2003+) and a native non-daily cadence; build_sequence_array forward/
 # back-fills each channel onto the daily grid and drops county-years that have no
 # observations at all (so enabling phenology restricts the sample set).
-PHENOLOGY_CHANNELS = {
-    "ndvi":          {"stem": "ndvi",         "cols": ["ndvi"]},
-    "fpar":          {"stem": "fpar",         "cols": ["fpar"]},
-    "soil_moisture": {"stem": "soilmoisture", "cols": ["ssm", "rsm"]},
-}
+# PHENOLOGY_CHANNELS is imported from data_loader (shared with the tabular path).
 
 
 def phenology_channel_cols(use_phenology) -> list[str]:
@@ -147,15 +156,35 @@ DEFAULT_TRAIN_CFG = dict(
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _find_climate_file(
-    data_dir: str, climate_model: str, year: int, ens_member: str
+    data_dir: str, climate_model: str, year: int, ens_member: str,
+    forecast_year: int = 1, aoi: str = "CONUS",
 ) -> str:
     """Locate the climate parquet for one hindcast year, tolerating AOI naming.
 
+    Forecast year 1 (standard) files live under {data_dir}/{climate_model}/:
     CONUS files are named climate_{climate_model}_s{year}-{ens_member}.parquet;
     other AOIs (e.g. Germany) use climate_{aoi}_{climate_model}_s{year}.parquet
     with no ensemble suffix. Try the exact CONUS name first, then fall back to
     any parquet in the climate_model dir whose name carries the year token.
+
+    Forecast year >1 products live in their own {data_dir}/FY{n}/ folder and
+    are named climate_{aoi}_{climate_model}_fy{n}_s{year}.parquet.
     """
+    if forecast_year != 1:
+        fdir  = os.path.join(data_dir, f"FY{forecast_year}")
+        exact = os.path.join(
+            fdir, f"climate_{aoi}_{climate_model}_fy{forecast_year}_s{year}.parquet")
+        if os.path.exists(exact):
+            return exact
+        matches = sorted(glob.glob(os.path.join(fdir, f"*fy{forecast_year}_s{year}*.parquet")))
+        if matches:
+            return matches[0]
+        raise FileNotFoundError(
+            f"No FY{forecast_year} climate parquet for year {year} in {fdir!r} "
+            f"(tried {os.path.basename(exact)!r}). "
+            "Check --data_dir, --climate_model, --aoi, and year range."
+        )
+
     cdir  = os.path.join(data_dir, climate_model)
     exact = os.path.join(cdir, f"climate_{climate_model}_s{year}-{ens_member}.parquet")
     if os.path.exists(exact):
@@ -176,6 +205,7 @@ def _merge_phenology(
     use_phenology: list[str] | None,
     suffix: str,
     phenology_dir: str | None = None,
+    lag_years: int = 1,
 ) -> pd.DataFrame:
     """Left-merge native-cadence CY-Bench phenology onto the daily climate frame.
 
@@ -183,6 +213,13 @@ def _merge_phenology(
     no observation become NaN; build_sequence_array fills each channel onto the
     daily grid (ffill/bfill) and skips county-years with no data at all. No-op
     when use_phenology is falsy.
+
+    lag_years > 0 shifts every phenology observation forward by that many years
+    before the join, so the target season is fed the PREVIOUS season's
+    phenology. This is the forecast-safe default (lag_years=1): satellite
+    signals like NDVI cannot be observed for the year being predicted, so we use
+    last year's curve, aligned onto this season's day-offset grid. lag_years=0
+    reverts to same-year (nowcast/leaky) behaviour.
     """
     if not use_phenology:
         return merged
@@ -197,9 +234,14 @@ def _merge_phenology(
             )
         ph = pd.read_parquet(path, columns=["adm2_id", "date"] + cfg["cols"])
         ph["date"] = pd.to_datetime(ph["date"])
+        if lag_years:
+            # Shift last season's observations onto this season's timeline so the
+            # merge attaches year (Y-lag_years) phenology to the year-Y climate day.
+            ph["date"] = ph["date"] + pd.DateOffset(years=lag_years)
         merged = merged.merge(ph, on=["adm2_id", "date"], how="left")
+        lag_note = f"lagged {lag_years}yr" if lag_years else "same-year"
         print(
-            f"[data] Phenology '{var}': merged {cfg['cols']}  "
+            f"[data] Phenology '{var}' ({lag_note}): merged {cfg['cols']}  "
             f"({ph['adm2_id'].nunique()} counties, {len(ph):,} obs)"
         )
     return merged
@@ -214,6 +256,8 @@ def load_climate_crop_data(
     aoi: str = "CONUS",
     use_phenology: list[str] | None = None,
     phenology_suffix: str | None = None,
+    phenology_lag_years: int = 1,
+    forecast_year: int = 1,
 ) -> pd.DataFrame:
     """Load one or more hindcast years of climate data and merge with crop yield.
 
@@ -229,8 +273,12 @@ def load_climate_crop_data(
     data_dir : str
         Root directory of processed data.
     hindcast_years : list[int]
-        One or more forecast start years (e.g. [1983] or list(range(1980, 2010))).
-        Target yield for each year = hindcast_year + 1.
+        One or more forecast start (s-) years (e.g. [1983] or list(range(1980, 2010))).
+        Target yield for each year = hindcast_year + forecast_year.
+    forecast_year : int
+        Hindcast lead-year product to load. 1 (default) reads the standard files
+        under {data_dir}/{climate_model}/; 2 reads the FY2 product under
+        {data_dir}/FY2/ (initialised ~2 years before its target year).
     crop : str
         Crop name matching crop_{crop}_CONUS.parquet (e.g. 'soy', 'corn').
     climate_model : str
@@ -254,12 +302,18 @@ def load_climate_crop_data(
     # ── climate ──────────────────────────────────────────────────────────────
     climate_frames = []
     for year in sorted(hindcast_years):
-        path = _find_climate_file(data_dir, climate_model, year, ens_member)
+        path = _find_climate_file(data_dir, climate_model, year, ens_member,
+                                  forecast_year=forecast_year, aoi=aoi)
         climate_frames.append(pd.read_parquet(path, engine="fastparquet"))
 
-    print(f"[data] Loaded {len(climate_frames)} climate parquet(s) for years {sorted(hindcast_years)}")
+    print(f"[data] Loaded {len(climate_frames)} climate parquet(s) (FY{forecast_year}) "
+          f"for s-years {sorted(hindcast_years)}")
     climate_df = pd.concat(climate_frames, ignore_index=True)
     climate_df["date"] = pd.to_datetime(climate_df["date"])
+    # fastparquet returns integer id columns as float; normalise, then derive the
+    # forecast target year (hindcast_start + forecast_year) used to match yields.
+    climate_df["hindcast_start"] = climate_df["hindcast_start"].astype(int)
+    climate_df["target_year"]    = climate_df["hindcast_start"] + forecast_year
     print(
         f"         {len(climate_df):,} total rows  |  "
         f"{climate_df['adm2_id'].nunique()} unique counties"
@@ -274,22 +328,30 @@ def load_climate_crop_data(
 
     print(f"[data] Crop    : {crop_path}")
     crop_df = pd.read_parquet(crop_path, engine="fastparquet")
+    # Crop yield is keyed by hindcast_start under the FY1 convention (yield for
+    # calendar year hindcast_start + 1); express it as target_year so it can be
+    # matched to any forecast-year climate product.
+    crop_df["hindcast_start"] = crop_df["hindcast_start"].astype(int)
+    crop_df["target_year"]    = crop_df["hindcast_start"] + 1
+    target_years = {y + forecast_year for y in hindcast_years}
     crop_subset = (
-        crop_df[crop_df["hindcast_start"].isin(hindcast_years)][
-            ["adm2_id", "hindcast_start", "yield"]
+        crop_df[crop_df["target_year"].isin(target_years)][
+            ["adm2_id", "target_year", "yield"]
         ]
         .dropna(subset=["yield"])
         .reset_index(drop=True)
     )
     if crop_subset.empty:
         raise ValueError(
-            f"No yield data found for years {sorted(hindcast_years)} in {crop_path!r}."
+            f"No yield data found for target years {sorted(target_years)} in {crop_path!r}."
         )
     print(f"         {len(crop_subset)} county-year yield pairs across {len(hindcast_years)} year(s)")
 
     # ── merge ─────────────────────────────────────────────────────────────────
-    # Join on both adm2_id and hindcast_start so each county-year is matched correctly.
-    merged = climate_df.merge(crop_subset, on=["adm2_id", "hindcast_start"], how="inner")
+    # Join on adm2_id + target_year: under FY1 this equals matching hindcast_start,
+    # but under FY2 the climate's hindcast_start is 2 years before its target, so
+    # target_year keeps each county's weather paired with the right yield.
+    merged = climate_df.merge(crop_subset, on=["adm2_id", "target_year"], how="inner")
     merged = merged.reset_index(drop=True)
     print(
         f"[data] Merged  : {len(merged):,} rows  |  "
@@ -300,6 +362,7 @@ def load_climate_crop_data(
     merged = _merge_phenology(
         merged, data_dir, use_phenology,
         suffix=(phenology_suffix or aoi),
+        lag_years=phenology_lag_years,
     )
     return merged
 
@@ -339,16 +402,25 @@ def build_sequence_array(
     df = daily_df.copy()
     df["date"] = pd.to_datetime(df["date"])
 
-    # Day offset from Nov 1 of the hindcast start year (1-indexed so d1 = Nov 1)
-    season_start = pd.to_datetime(df["hindcast_start"].astype(str) + "-11-01")
+    # Day offset from Nov 1 of the year before the target/yield year (1-indexed so
+    # d1 = Nov 1). This is the hindcast_start year for FY1, but later forecast
+    # years start their window further out, so anchor on target_year when present.
+    anchor_year = (df["target_year"] - 1) if "target_year" in df.columns \
+        else df["hindcast_start"]
+    season_start = pd.to_datetime(anchor_year.astype(str) + "-11-01")
     df["day_offset"] = (df["date"] - season_start).dt.days + 1
 
     # Clip to the expected window; any date outside [1, seq_len] is noise
     df = df[(df["day_offset"] >= 1) & (df["day_offset"] <= seq_len)]
 
-    # Per-(county, year) constants — extract before the reshape loop
+    # Per-(county, year) constants — extract before the reshape loop. Carry
+    # target_year (the predicted calendar year) so downstream features such as
+    # the prior-yield history can be built without re-deriving the FY offset.
+    const_cols = ["adm2", "adm1", "yield"]
+    if "target_year" in df.columns:
+        const_cols = const_cols + ["target_year"]
     meta_map = (
-        df.groupby(["adm2_id", "hindcast_start"])[["adm2", "adm1", "yield"]]
+        df.groupby(["adm2_id", "hindcast_start"])[const_cols]
         .first()
     )
 
@@ -391,6 +463,8 @@ def build_sequence_array(
             "adm2":           row["adm2"],
             "adm1":           row["adm1"],
             "hindcast_start": hindcast_start,
+            "target_year":    int(row["target_year"]) if "target_year" in row
+                              else int(hindcast_start) + 1,
         })
 
     if n_skipped:
@@ -404,6 +478,34 @@ def build_sequence_array(
         np.array(targets,   dtype=np.float32),            # (N, 1)
         pd.DataFrame(meta_rows).reset_index(drop=True),  # (N, 3)
     )
+
+
+def build_yield_history_arrays(
+    sample_meta: pd.DataFrame,
+    data_dir: str,
+    crop: str,
+    aoi: str = "CONUS",
+    base_year: int | None = None,
+    max_len: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """Prior-yield history for the PatchTST second branch, aligned to sample_meta.
+
+    Each sample (county, target_year) gets a recency-ordered vector of that
+    county's own observed yields for years before target_year, plus a validity
+    mask. Row order matches sample_meta / the sequence array exactly.
+
+    Returns (history (N, L), mask (N, L), base_year, L). Uses the same builder
+    as the tabular lag features so both model paths see identical history.
+    """
+    yseries = load_county_yield_series(data_dir, crop, aoi)
+    hist, mask, base_year, L = build_yield_history_matrix(
+        sample_meta[["adm2_id", "target_year"]], yseries,
+        base_year=base_year, max_len=max_len)
+    print(
+        f"[data] Yield history: {L} prior years/sample (back to {base_year}); "
+        f"avg valid {mask.sum(axis=1).mean():.1f}"
+    )
+    return hist, mask, base_year, L
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -425,27 +527,42 @@ class YieldSequenceDataset(Dataset):
     which the HuggingFace Trainer uses for the backward pass.
     """
 
-    def __init__(self, sequences: np.ndarray, targets: np.ndarray, log_target: bool = False):
+    def __init__(self, sequences: np.ndarray, targets: np.ndarray, log_target: bool = False,
+                 yield_history: np.ndarray | None = None,
+                 yield_mask: np.ndarray | None = None):
         """
         Parameters
         ----------
         sequences  : np.ndarray, shape (N, T, C) — normalised climate data
         targets    : np.ndarray, shape (N, 1)    — raw yield values (not normalised)
         log_target : bool — if True, model learns to predict log(yield)
+        yield_history : np.ndarray, shape (N, L), optional — normalised prior-yield
+            series (recency-ordered). When given, each item also yields
+            `yield_history`/`yield_mask` for the PatchTSTWithYieldHistory branch.
+        yield_mask : np.ndarray, shape (N, L), optional — 1 where the matching
+            yield_history entry is a real observation, 0 where padded.
         """
         self.log_target = log_target
         self.sequences  = torch.tensor(sequences, dtype=torch.float32)
         t = torch.tensor(targets, dtype=torch.float32)
         self.targets = torch.log(t) if log_target else t
+        self.yield_history = (torch.tensor(yield_history, dtype=torch.float32)
+                              if yield_history is not None else None)
+        self.yield_mask    = (torch.tensor(yield_mask, dtype=torch.float32)
+                              if yield_mask is not None else None)
 
     def __len__(self) -> int:
         return len(self.sequences)
 
     def __getitem__(self, idx: int) -> dict:
-        return {
+        item = {
             "past_values":   self.sequences[idx],  # (T, C)
             "target_values": self.targets[idx],    # (1,)
         }
+        if self.yield_history is not None:
+            item["yield_history"] = self.yield_history[idx]  # (L,)
+            item["yield_mask"]    = self.yield_mask[idx]     # (L,)
+        return item
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -489,6 +606,31 @@ def apply_normalizer(
     return ((sequences - ch_mean) / ch_std).astype(np.float32)
 
 
+def fit_history_normalizer(
+    history: np.ndarray, mask: np.ndarray
+) -> tuple[float, float]:
+    """Z-score stats for prior-yield history, over observed entries only.
+
+    Padded slots (mask == 0) are excluded so they don't bias the statistics.
+    Fit on training data only, then apply to train and validation alike.
+    """
+    valid = history[mask > 0]
+    if valid.size == 0:
+        return 0.0, 1.0
+    mean = float(valid.mean())
+    std  = float(valid.std())
+    return mean, (std if std > 0 else 1.0)
+
+
+def apply_history_normalizer(
+    history: np.ndarray, mask: np.ndarray, mean: float, std: float
+) -> np.ndarray:
+    """Z-score the history, keeping padded slots at exactly 0 (mask disambiguates)."""
+    out = ((history - mean) / std).astype(np.float32)
+    out[mask == 0] = 0.0
+    return out
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Model
 # ──────────────────────────────────────────────────────────────────────────────
@@ -504,6 +646,8 @@ def build_patchtst_model(
     ffn_dim: int = 256,
     attention_dropout: float = 0.1,
     head_dropout: float = 0.1,
+    yield_history_len: int | None = None,
+    history_hidden: int = 64,
 ) -> PatchTSTForRegression:
     """Construct a PatchTSTForRegression model for scalar yield prediction.
 
@@ -583,7 +727,95 @@ def build_patchtst_model(
         scaling=None,           # we normalise inputs ourselves; skip internal scaling
         loss="mse",
     )
+    if yield_history_len:
+        print(f"[model] + prior-yield history branch: L={yield_history_len} "
+              f"→ MLP({history_hidden}) concatenated before the regression head")
+        return PatchTSTWithYieldHistory(
+            config, history_len=yield_history_len, history_hidden=history_hidden)
     return PatchTSTForRegression(config)
+
+
+class PatchTSTWithYieldHistory(PatchTSTForRegression):
+    """PatchTST regressor with a second input branch for prior-yield history.
+
+    The daily climate sequence is encoded by the standard PatchTST backbone and
+    mean-pooled to (bs, num_channels * d_model), exactly as PatchTSTRegressionHead
+    does. In parallel, the county's recency-ordered prior-yield series (plus its
+    validity mask) is encoded by a small MLP. The two representations are
+    concatenated and mapped to the scalar yield by a combined linear head, so the
+    model can condition its prediction on the AOI's own yield trajectory.
+
+    Extra forward kwargs (both optional, supplied by YieldSequenceDataset):
+        yield_history : FloatTensor (bs, L) — normalised prior yields
+        yield_mask    : FloatTensor (bs, L) — 1 = observed, 0 = padded
+    """
+
+    def __init__(self, config: PatchTSTConfig, history_len: int,
+                 history_hidden: int = 64):
+        super().__init__(config)
+        self.history_len = history_len
+        # Input is [history || mask] so the encoder can down-weight padded slots.
+        self.yield_encoder = nn.Sequential(
+            nn.Linear(2 * history_len, history_hidden),
+            nn.ReLU(),
+            nn.Dropout(config.head_dropout),
+            nn.Linear(history_hidden, history_hidden),
+            nn.ReLU(),
+        )
+        pooled_dim = config.num_input_channels * config.d_model
+        self.head_dropout = (nn.Dropout(config.head_dropout)
+                             if config.head_dropout > 0 else nn.Identity())
+        self.combined_projection = nn.Linear(pooled_dim + history_hidden,
+                                             config.num_targets)
+        self.post_init()
+
+    def forward(
+        self,
+        past_values: torch.Tensor,
+        target_values: torch.Tensor | None = None,
+        yield_history: torch.Tensor | None = None,
+        yield_mask: torch.Tensor | None = None,
+        past_observed_mask: torch.Tensor | None = None,
+        output_hidden_states: bool | None = None,
+        output_attentions: bool | None = None,
+        return_dict: bool | None = None,
+    ):
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        model_output = self.model(
+            past_values=past_values,
+            past_observed_mask=past_observed_mask,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            return_dict=True,
+        )
+        # Mean-pool patch embeddings, matching PatchTSTRegressionHead(pooling="mean").
+        # last_hidden_state: (bs, num_channels, num_patches, d_model)
+        pooled = model_output.last_hidden_state.mean(dim=2)   # (bs, C, d_model)
+        pooled = torch.flatten(pooled, start_dim=1)           # (bs, C*d_model)
+
+        bs = past_values.shape[0]
+        if yield_history is None:
+            yield_history = past_values.new_zeros((bs, self.history_len))
+        if yield_mask is None:
+            yield_mask = past_values.new_zeros((bs, self.history_len))
+        hist_feat = self.yield_encoder(torch.cat([yield_history, yield_mask], dim=1))
+
+        combined = torch.cat([self.head_dropout(pooled), hist_feat], dim=1)
+        y_hat = self.combined_projection(combined)            # (bs, num_targets)
+
+        loss = None
+        if target_values is not None:
+            loss = nn.MSELoss(reduction="mean")(y_hat, target_values)
+
+        if not return_dict:
+            return (loss, y_hat) if loss is not None else (y_hat,)
+        return PatchTSTForRegressionOutput(
+            loss=loss,
+            regression_outputs=y_hat,
+            hidden_states=model_output.hidden_states,
+            attentions=model_output.attentions,
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -633,6 +865,11 @@ def train_predict_patchtst(
     hparams: dict | None = None,
     train_cfg: dict | None = None,
     log_target: bool = False,
+    train_hist: np.ndarray | None = None,
+    train_hist_mask: np.ndarray | None = None,
+    val_hist: np.ndarray | None = None,
+    val_hist_mask: np.ndarray | None = None,
+    history_hidden: int = 64,
 ) -> np.ndarray:
     """Train a PatchTST model on one train/val split and return val predictions.
 
@@ -674,8 +911,23 @@ def train_predict_patchtst(
     train_seqs_n = apply_normalizer(train_seqs, ch_mean, ch_std)
     val_seqs_n   = apply_normalizer(val_seqs,   ch_mean, ch_std)
 
-    train_dataset = YieldSequenceDataset(train_seqs_n, train_tgts, log_target=log_target)
-    val_dataset   = YieldSequenceDataset(val_seqs_n,   val_tgts,   log_target=log_target)
+    # ── Prior-yield history branch (optional; fit stats on train only) ──
+    use_history = train_hist is not None
+    train_hist_n = val_hist_n = None
+    history_len = None
+    if use_history:
+        h_mean, h_std = fit_history_normalizer(train_hist, train_hist_mask)
+        print(f"[norm]  Yield-history mean/std: {h_mean:.1f} / {h_std:.1f}")
+        train_hist_n = apply_history_normalizer(train_hist, train_hist_mask, h_mean, h_std)
+        val_hist_n   = apply_history_normalizer(val_hist,   val_hist_mask,   h_mean, h_std)
+        history_len  = train_hist.shape[1]
+
+    train_dataset = YieldSequenceDataset(
+        train_seqs_n, train_tgts, log_target=log_target,
+        yield_history=train_hist_n, yield_mask=train_hist_mask)
+    val_dataset   = YieldSequenceDataset(
+        val_seqs_n, val_tgts, log_target=log_target,
+        yield_history=val_hist_n, yield_mask=val_hist_mask)
 
     # ── Build model ──
     # Derive channel count from the data so optional phenology channels flow
@@ -691,6 +943,8 @@ def train_predict_patchtst(
         ffn_dim=hp["ffn_dim"],
         attention_dropout=hp["attention_dropout"],
         head_dropout=hp["head_dropout"],
+        yield_history_len=history_len,
+        history_hidden=history_hidden,
     )
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[model] Actual trainable parameters: {n_params:,}\n")
@@ -747,6 +1001,11 @@ def parse_args() -> argparse.Namespace:
                    help="Crop name matching crop_<name>_CONUS.parquet.")
     p.add_argument("--climate_model", type=str, default="EC-Earth3")
     p.add_argument("--ens_member",    type=str, default="r1i4p1f1")
+    p.add_argument("--forecast_year", type=int, default=1, choices=[1, 2],
+                   help="Hindcast lead-year climate product. 1 (default): standard "
+                        "product in {data_dir}/{climate_model}/ forecasting s+1. "
+                        "2: the FY2 product in {data_dir}/FY2/ forecasting s+2. "
+                        "Year args stay in hindcast_start (s-year) terms.")
     p.add_argument("--aoi",           type=str, default="CONUS",
                    help="Area-of-interest tag in the crop filename "
                         "(crop_<crop>_<aoi>.parquet). E.g. 'CONUS' or 'germany'.")
@@ -760,6 +1019,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--phenology_suffix", type=str, default=None,
                    help="AOI suffix in phenology filenames "
                         "(phenology_<var>_<suffix>.parquet). Defaults to --aoi.")
+    p.add_argument("--phenology_lag_years", type=int, default=1,
+                   help="Shift phenology (e.g. NDVI) back this many years so the "
+                        "target season sees the PREVIOUS season's signal. Default 1 "
+                        "(forecast-safe: you can't observe the predicted year's NDVI). "
+                        "0 = same-year (nowcast/leaky).")
 
     # ── year selection (two mutually exclusive modes) ──
     year_group = p.add_mutually_exclusive_group(required=True)
@@ -781,6 +1045,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--val_frac",      type=float, default=0.2,
                    help="Val fraction for county split (single --hindcast_year mode only).")
+    p.add_argument("--yield_history", action="store_true",
+                   help="Add each county's own prior observed yields as a second "
+                        "time-series input branch (recency-ordered annual series "
+                        "back to --yield_history_base). Default off.")
+    p.add_argument("--yield_history_base", type=int, default=None,
+                   help="Oldest calendar year of yield history to include "
+                        "(default: earliest year in the crop data).")
     p.add_argument("--target",        type=str,   default="yield",
                    choices=["yield", "log_yield"],
                    help="Target variable: 'yield' for raw values, 'log_yield' to predict log(yield)."
@@ -849,11 +1120,13 @@ def main():
     print(f"  Run ID : {run_id}")
     print(f"  Crop   : {args.crop}  |  mode: {mode}")
     print(f"  Inputs : climate{(' + phenology ' + ','.join(args.use_phenology)) if args.use_phenology else ' only'}")
+    fy = args.forecast_year
+    print(f"  Forecast yr: FY{fy}  (yield year = s + {fy})")
     if mode == "temporal":
         print(f"  Train years: {train_years[0]}–{train_years[-1]} (excl. {test_year})")
-        print(f"  Test year  : {test_year}  (yield year {test_year + 1})")
+        print(f"  Test year  : {test_year}  (yield year {test_year + fy})")
     else:
-        print(f"  Hindcast year: {all_years[0]}  (yield year {all_years[0] + 1})")
+        print(f"  Hindcast year: {all_years[0]}  (yield year {all_years[0] + fy})")
     print(f"  Output : {run_dir}")
     print(f"{'='*60}\n")
 
@@ -867,12 +1140,20 @@ def main():
         aoi=args.aoi,
         use_phenology=args.use_phenology,
         phenology_suffix=args.phenology_suffix,
+        phenology_lag_years=args.phenology_lag_years,
+        forecast_year=args.forecast_year,
     )
 
     # ── 2. Build per-(county, year) sequence arrays ───────────────────────────
     # sample_meta: DataFrame(adm2_id, adm1, hindcast_start) — one row per sample
     channels = CLIMATE_CHANNELS + phenology_channel_cols(args.use_phenology)
     sequences, targets, sample_meta = build_sequence_array(daily_df, channels=channels)
+
+    yield_hist = yield_mask = None
+    if args.yield_history:
+        yield_hist, yield_mask, _, _ = build_yield_history_arrays(
+            sample_meta, args.data_dir, args.crop, args.aoi,
+            base_year=args.yield_history_base)
 
     hindcast_years_arr = sample_meta["hindcast_start"].values
 
@@ -901,6 +1182,13 @@ def main():
     train_seqs, train_tgts = sequences[train_mask], targets[train_mask]
     val_seqs,   val_tgts   = sequences[val_mask],   targets[val_mask]
 
+    hist_kwargs = {}
+    if yield_hist is not None:
+        hist_kwargs = dict(
+            train_hist=yield_hist[train_mask], train_hist_mask=yield_mask[train_mask],
+            val_hist=yield_hist[val_mask],     val_hist_mask=yield_mask[val_mask],
+        )
+
     # ── 4–7. Normalise, build, train, and run inference ──────────────────────
     # Yield targets are kept in original units — no target normalisation.
     log_target = args.target == "log_yield"
@@ -922,6 +1210,7 @@ def main():
         ),
         train_cfg=dict(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr),
         log_target=log_target,
+        **hist_kwargs,
     )
     targets = val_tgts.squeeze()  # always original yield units
 
@@ -965,6 +1254,11 @@ def main():
         "n_train":            int(train_mask.sum()),
         "n_test":             int(val_mask.sum()),
         "target":              args.target,
+        "forecast_year":       args.forecast_year,
+        "yield_history":       args.yield_history,
+        "yield_history_base":  args.yield_history_base,
+        "use_phenology":       args.use_phenology,
+        "phenology_lag_years": args.phenology_lag_years,
         "feature_importances": None,  # PatchTST has no feature importances
         # hyperparameters for reproducibility
         "patch_length":       args.patch_length,
@@ -981,9 +1275,9 @@ def main():
         json.dump(run_meta, f, indent=2)
 
     year_label = (
-        f"test year {test_year} → yield year {test_year + 1}"
+        f"test year {test_year} → yield year {test_year + args.forecast_year}"
         if mode == "temporal"
-        else f"hindcast {all_years[0]} → yield year {all_years[0] + 1}"
+        else f"hindcast {all_years[0]} → yield year {all_years[0] + args.forecast_year}"
     )
     print(f"\n{'='*60}")
     print(f"  RESULTS — {args.crop.upper()}  {year_label}")

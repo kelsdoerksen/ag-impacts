@@ -191,21 +191,44 @@ def parse_args():
                         help="Climate model subdir/file prefix. Default: EC-Earth3.")
     parser.add_argument("--ens_member", type=str, default="r1i4p1f1",
                         help="Ensemble member tag in climate filenames. Default: r1i4p1f1.")
+    parser.add_argument("--forecast_year", type=int, default=1, choices=[1, 2],
+                        help="Which hindcast lead-year climate product to use. "
+                             "1 (default): standard product in {data_dir}/{climate_model}/ "
+                             "forecasting hindcast_start+1. 2: the FY2 product in "
+                             "{data_dir}/FY2/ forecasting hindcast_start+2 (initialised "
+                             "~2 years ahead). --study_years is always in hindcast_start "
+                             "(s-year) terms; the target/yield year is s + forecast_year.")
+    parser.add_argument("--yield_history", action="store_true",
+                        help="Add each county's own prior observed yields as an extra "
+                             "input: recency-ordered annual series back to "
+                             "--yield_history_base (default off). Tabular models get "
+                             "lag feature columns; the tst model gets a second "
+                             "time-series branch.")
+    parser.add_argument("--yield_history_base", type=int, default=None,
+                        help="Oldest calendar year of yield history to include "
+                             "(default: earliest year in the crop data).")
     parser.add_argument("--aoi", type=str, default="CONUS",
                         help="Area-of-interest tag in the crop filename "
                              "(crop_<crop>_<aoi>.parquet). E.g. 'CONUS' or 'germany'. "
                              "tst path only. Default: CONUS.")
     parser.add_argument("--use_phenology", type=_parse_phenology_arg, default=None,
                         metavar="VARS",
-                        help="tst path only. Comma-separated CY-Bench phenology "
-                             "channels to append to the climate sequence (off by "
-                             f"default). Choices: {','.join(PHENOLOGY_VARS)}. E.g. "
+                        help="Comma-separated CY-Bench phenology variables to add "
+                             "(off by default). tst appends them as daily channels; "
+                             "tabular appends prior-season summary stats. Lagged by "
+                             "--phenology_lag_years (default 1, forecast-safe). "
+                             f"Choices: {','.join(PHENOLOGY_VARS)}. E.g. "
                              "--use_phenology ndvi,fpar. Restricts samples to "
                              "county-years with that data (NDVI/FPAR 2001+, soil "
                              "moisture 2003+).")
     parser.add_argument("--phenology_suffix", type=str, default=None,
                         help="AOI suffix in phenology filenames "
                              "(phenology_<var>_<suffix>.parquet). Defaults to --aoi.")
+    parser.add_argument("--phenology_lag_years", type=int, default=1,
+                        help="Shift phenology (e.g. NDVI) back this many years so the "
+                             "target season uses the PREVIOUS season's signal. Default 1 "
+                             "(forecast-safe). 0 = same-year (nowcast/leaky). Applies to "
+                             "both tst channels and tabular aggregate features.")
 
     # ── cross-validation scheme ──
     parser.add_argument("--cv_scheme", type=str, choices=["year", "cell"], default="year",
@@ -379,11 +402,13 @@ def run_fold(adm2_df, feature_cols, all_years, fold_col, fold_value, fold_label,
 
 
 def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_value,
-                 fold_label, fold_dir, args, cv_scheme="year"):
+                 fold_label, fold_dir, args, cv_scheme="year",
+                 yield_hist=None, yield_mask=None):
     """Train PatchTST leaving out one fold (a year or a climate cell).
 
     The held-out fold is the samples where sample_meta[fold_col] == fold_value;
-    the model trains on every other sample.
+    the model trains on every other sample. When yield_hist/yield_mask are given
+    (row-aligned to sequences), the prior-yield branch is trained too.
     """
     _, _, train_predict_patchtst = _import_tst()
     meta_cols  = ["adm2_id", "adm2", "adm1", "hindcast_start"]
@@ -398,6 +423,13 @@ def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_valu
     train_seqs, train_tgts = sequences[train_mask], targets[train_mask]
     val_seqs,   val_tgts   = sequences[test_mask],  targets[test_mask]
     meta_te = sample_meta.loc[test_mask, meta_cols].copy()
+
+    hist_kwargs = {}
+    if yield_hist is not None:
+        hist_kwargs = dict(
+            train_hist=yield_hist[train_mask], train_hist_mask=yield_mask[train_mask],
+            val_hist=yield_hist[test_mask],    val_hist_mask=yield_mask[test_mask],
+        )
 
     log_target = args.target == "log_yield"
     y_pred = train_predict_patchtst(
@@ -415,6 +447,7 @@ def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_valu
         ),
         train_cfg=dict(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr),
         log_target=log_target,
+        **hist_kwargs,
     )
 
     extra_meta = {
@@ -529,11 +562,6 @@ def main():
             f"--target {args.target!r} is not valid for tabular model "
             f"{args.model_type!r}. Choose from {TABULAR_TARGETS}."
         )
-    if args.use_phenology and args.model_type != "tst":
-        raise ValueError(
-            "--use_phenology is only supported by --model_type tst "
-            f"(got {args.model_type!r})."
-        )
     if args.cv_scheme == "cell" and not args.cell_lookup:
         raise ValueError(
             "--cv_scheme cell requires --cell_lookup (county→climate-cell parquet "
@@ -551,14 +579,17 @@ def main():
 
     print(f"Experiment      : {exp_id}")
     print(f"Crop            : {args.crop}")
-    print(f"Study years     : {study_start}–{study_end}  ({len(all_years)} folds)")
+    print(f"Study years     : {study_start}–{study_end}  ({len(all_years)} folds, s-year)")
+    print(f"Forecast year   : FY{args.forecast_year}  "
+          f"(target year = s + {args.forecast_year})")
     print(f"Model           : {args.model_type}")
     print(f"Feature mode    : {args.feature_mode}")
     print(f"Target          : {args.target}")
     print(f"CV scheme       : {args.cv_scheme}"
           + (f"  (lookup: {args.cell_lookup})" if args.cv_scheme == "cell" else ""))
-    if args.model_type == "tst":
-        print(f"Phenology       : {','.join(args.use_phenology) if args.use_phenology else 'none (climate only)'}")
+    if args.use_phenology:
+        print(f"Phenology       : {','.join(args.use_phenology)} "
+              f"(lag {args.phenology_lag_years}yr)")
     print(f"Results dir     : {exp_dir}")
 
     # Load data once — reused across all folds. The PatchTST ("tst") path uses
@@ -579,9 +610,18 @@ def main():
             aoi=args.aoi,
             use_phenology=args.use_phenology,
             phenology_suffix=args.phenology_suffix,
+            phenology_lag_years=args.phenology_lag_years,
+            forecast_year=args.forecast_year,
         )
         channels = CLIMATE_CHANNELS + phenology_channel_cols(args.use_phenology)
         sequences, targets, sample_meta = build_sequence_array(daily_df, channels=channels)
+        # Prior-yield history branch (row-aligned to sequences/sample_meta).
+        yield_hist = yield_mask = None
+        if args.yield_history:
+            from tst_implementation import build_yield_history_arrays
+            yield_hist, yield_mask, _, _ = build_yield_history_arrays(
+                sample_meta, args.data_dir, args.crop, args.aoi,
+                base_year=args.yield_history_base)
         county_meta = sample_meta[["adm2_id", "adm2", "adm1"]].drop_duplicates("adm2_id")
     else:
         adm2_df, feature_cols = load_and_prepare(
@@ -593,6 +633,13 @@ def main():
             preseason_buffer=args.preseason_buffer,
             postharvest_buffer=args.postharvest_buffer,
             target=args.target,
+            forecast_year=args.forecast_year,
+            aoi=args.aoi,
+            yield_history=args.yield_history,
+            yield_history_base=args.yield_history_base,
+            use_phenology=args.use_phenology,
+            phenology_lag_years=args.phenology_lag_years,
+            phenology_suffix=args.phenology_suffix,
         )
         county_meta = adm2_df[["adm2_id", "adm2", "adm1"]].drop_duplicates("adm2_id")
 
@@ -602,6 +649,9 @@ def main():
         keep        = sample_meta["adm2_id"].isin(selected).values
         sequences   = sequences[keep]
         targets     = targets[keep]
+        if yield_hist is not None:
+            yield_hist = yield_hist[keep]
+            yield_mask = yield_mask[keep]
         sample_meta = sample_meta[keep].reset_index(drop=True)
         available   = set(sample_meta["hindcast_start"].unique())
         print(f"Counties        : {sample_meta['adm2_id'].nunique()}  "
@@ -645,7 +695,8 @@ def main():
         if use_tst:
             result = run_fold_tst(sequences, targets, sample_meta, all_years,
                                   fold_col, fold_value, fold_label, fold_dir, args,
-                                  cv_scheme=args.cv_scheme)
+                                  cv_scheme=args.cv_scheme,
+                                  yield_hist=yield_hist, yield_mask=yield_mask)
         else:
             result = run_fold(adm2_df, feature_cols, all_years,
                               fold_col, fold_value, fold_label,
@@ -688,6 +739,11 @@ def main():
         "region":             region,
         "sample_counties":    args.sample_counties,
         "sample_seed":        args.sample_seed,
+        "forecast_year":      args.forecast_year,
+        "yield_history":      args.yield_history,
+        "yield_history_base": args.yield_history_base,
+        "use_phenology":      args.use_phenology,
+        "phenology_lag_years": args.phenology_lag_years,
         "preseason_buffer":   args.preseason_buffer,
         "postharvest_buffer": args.postharvest_buffer,
         "study_start":        study_start,
