@@ -45,33 +45,37 @@ def parse_args():
     return p.parse_args()
 
 
-def main():
-    args = parse_args()
+def plot_loo_county_map(exp_dir, counties_gdf, metric="rmse",
+                        clip_pct=99.0, cmap=None):
+    """Draw the across-folds per-county metric map for one experiment.
 
-    csv_path = os.path.join(args.exp_dir, "loo_county_rmse.csv")
+    Reads {exp_dir}/loo_county_rmse.csv, joins it to a pre-loaded county
+    GeoDataFrame (so a batch caller loads the shapefile once), and writes
+    loo_county_{metric}_map.png into exp_dir. Returns the output path.
+    """
+    csv_path = os.path.join(exp_dir, "loo_county_rmse.csv")
     if not os.path.exists(csv_path):
         raise FileNotFoundError(
-            f"loo_county_rmse.csv not found in {args.exp_dir!r}. "
-            "Point --exp_dir at a completed run_loo_experiment.py output folder."
+            f"loo_county_rmse.csv not found in {exp_dir!r}. "
+            "Point exp_dir at a completed run_loo_experiment.py output folder."
         )
     county_rmse = pd.read_csv(csv_path)
-    if args.metric not in county_rmse.columns:
+    if metric not in county_rmse.columns:
         raise ValueError(
-            f"Column {args.metric!r} not in loo_county_rmse.csv "
+            f"Column {metric!r} not in loo_county_rmse.csv "
             f"(has {list(county_rmse.columns)})."
         )
     # adm2_id must be a zero-padded 5-char FIPS string to match GEOID.
     county_rmse["adm2_id"] = county_rmse["adm2_id"].astype(str).str.zfill(5)
 
-    counties = load_counties_geo(args.county_shp)
-    merged = counties.merge(
-        county_rmse[["adm2_id", args.metric]],
+    merged = counties_gdf.merge(
+        county_rmse[["adm2_id", metric]],
         left_on="GEOID", right_on="adm2_id", how="left",
     )
 
-    n_mapped = int(merged[args.metric].notna().sum())
-    print(f"Counties in shapefile (CONUS): {len(counties)}")
-    print(f"Counties with a {args.metric} value: {n_mapped}")
+    n_mapped = int(merged[metric].notna().sum())
+    print(f"Counties in shapefile (CONUS): {len(counties_gdf)}")
+    print(f"Counties with a {metric} value: {n_mapped}")
     if n_mapped == 0:
         raise RuntimeError(
             "No counties matched between loo_county_rmse.csv and the shapefile. "
@@ -79,26 +83,34 @@ def main():
         )
 
     # Colour-scale ceiling: clip at a percentile to keep the map readable.
-    vals = merged[args.metric].dropna()
-    vmax = None if args.clip_pct >= 100 else float(vals.quantile(args.clip_pct / 100))
-    cmap = args.cmap or ("viridis" if args.metric == "n_obs" else "YlOrRd")
+    vals = merged[metric].dropna()
+    vmax = None if clip_pct >= 100 else float(vals.quantile(clip_pct / 100))
+    cmap = cmap or ("viridis" if metric == "n_obs" else "YlOrRd")
     label = {"rmse": "RMSE (kg/ha)", "mae": "MAE (kg/ha)",
-             "n_obs": "n folds"}[args.metric]
+             "n_obs": "n folds"}[metric]
 
     fig, ax = plt.subplots(figsize=(12, 7))
-    _choropleth(ax, counties, merged, args.metric, cmap, label,
+    _choropleth(ax, counties_gdf, merged, metric, cmap, label,
                 county_level=True, vmax=vmax)
 
-    exp_name = os.path.basename(os.path.normpath(args.exp_dir))
-    overall = f"median {args.metric}={vals.median():,.0f}" if args.metric != "n_obs" else ""
-    ax.set_title(f"LOO per-county {args.metric.upper()} — {exp_name}\n"
+    exp_name = os.path.basename(os.path.normpath(exp_dir))
+    overall = f"median {metric}={vals.median():,.0f}" if metric != "n_obs" else ""
+    ax.set_title(f"LOO per-county {metric.upper()} — {exp_name}\n"
                  f"{n_mapped} counties  {overall}", fontsize=10)
     ax.axis("off")
     fig.tight_layout()
 
-    out_path = os.path.join(args.exp_dir, f"loo_county_{args.metric}_map.png")
+    out_path = os.path.join(exp_dir, f"loo_county_{metric}_map.png")
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Saved: {out_path}")
+    return out_path
+
+
+def main():
+    args = parse_args()
+    counties_gdf = load_counties_geo(args.county_shp)
+    plot_loo_county_map(args.exp_dir, counties_gdf, metric=args.metric,
+                        clip_pct=args.clip_pct, cmap=args.cmap)
 
 
 if __name__ == "__main__":

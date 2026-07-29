@@ -500,30 +500,31 @@ def plot_yield_density(errors: pd.DataFrame, save_dir: str) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    args = parse_args()
+def plot_fold(save_dir, states_gdf, counties_gdf=None, n_bins=10):
+    """Generate the full plot suite for one fold/run into save_dir.
 
-    meta, adm1_rmse, errors = load_run(args.save_dir)
+    Takes pre-loaded shapefiles so a batch caller (plot_loo_all.py) can load
+    them once and reuse across many folds.
+
+    Parameters
+    ----------
+    save_dir : str
+        A directory with run_meta.json, adm1_rmse.csv, adm2_errors.csv.
+    states_gdf : GeoDataFrame
+        Base state geometries from load_states_geo (WITHOUT adm1 names attached;
+        names are attached per-fold from that fold's errors).
+    counties_gdf : GeoDataFrame or None
+        County geometries from load_counties_geo, or None to skip admin2 maps.
+    n_bins : int
+        Observed-yield bins for the bin analysis.
+    """
+    meta, adm1_rmse, errors = load_run(save_dir)
 
     # Drop Hawaii (state FIPS 15) from all outputs
     errors    = errors[errors["adm2_id"].str[:2] != "15"].copy()
     adm1_rmse = adm1_rmse[adm1_rmse["adm1"] != "Hawaii"].copy()
 
-    print(f"Loading global shapefile: {args.shp_path}")
-    states_gdf = load_states_geo(args.shp_path, args.country)
-    states_gdf = attach_state_names(states_gdf, errors)
-    print(f"States loaded: {len(states_gdf)}")
-
-    counties_gdf = None
-    if args.county_shp:
-        print(f"Loading county shapefile: {args.county_shp}")
-        counties_gdf = load_counties_geo(args.county_shp)
-        print(f"Counties loaded: {len(counties_gdf)}")
-    else:
-        print(
-            "No --county_shp provided. "
-            "Admin2 yield maps will be skipped; using state-level fallback."
-        )
+    states_named = attach_state_names(states_gdf, errors)
 
     print(
         f"\nGenerating plots for {meta['model_type'].upper()} "
@@ -531,49 +532,80 @@ def main():
     )
 
     # Non-geographic
-    plot_scatter(meta, errors, args.save_dir)
-    plot_feature_importance(meta, args.save_dir)
+    plot_scatter(meta, errors, save_dir)
+    plot_feature_importance(meta, save_dir)
 
     # State-level (always available)
-    plot_adm1_rmse(meta, adm1_rmse, states_gdf, args.save_dir)
-    plot_adm1_mae(meta, errors, states_gdf, args.save_dir)
+    plot_adm1_rmse(meta, adm1_rmse, states_named, save_dir)
+    plot_adm1_mae(meta, errors, states_named, save_dir)
 
-    # County-level (requires --county_shp)
+    # County-level (requires counties_gdf)
     if counties_gdf is not None:
         # Shared colorbar limits so observed and predicted are directly comparable
         yield_vmin = min(errors["y_true"].min(), errors["y_pred"].min())
         yield_vmax = max(errors["y_true"].max(), errors["y_pred"].max())
 
         plot_adm2_yield(
-            meta, errors, counties_gdf, states_gdf,
+            meta, errors, counties_gdf, states_named,
             value_col="y_true", title_prefix="Observed maize yield",
             cmap="YlGn", fname="observed_yield_adm2.png",
-            save_dir=args.save_dir, vmin=yield_vmin, vmax=yield_vmax,
+            save_dir=save_dir, vmin=yield_vmin, vmax=yield_vmax,
         )
         plot_adm2_yield(
-            meta, errors, counties_gdf, states_gdf,
+            meta, errors, counties_gdf, states_named,
             value_col="y_pred", title_prefix="Predicted maize yield",
             cmap="YlGn", fname="predicted_yield_adm2.png",
-            save_dir=args.save_dir, vmin=yield_vmin, vmax=yield_vmax,
+            save_dir=save_dir, vmin=yield_vmin, vmax=yield_vmax,
         )
-        plot_adm2_mae(meta, errors, counties_gdf, states_gdf, args.save_dir)
+        plot_adm2_mae(meta, errors, counties_gdf, states_named, save_dir)
     else:
-        plot_adm1_observed_yield(meta, errors, states_gdf, args.save_dir)
+        plot_adm1_observed_yield(meta, errors, states_named, save_dir)
 
     # Bin analysis
     bin_errors = errors.dropna(subset=["y_true", "y_pred"]).copy()
-    bin_stats  = compute_bin_stats(bin_errors, args.n_bins)
-    print(f"\nBin stats (n_bins={args.n_bins}, n_total={len(bin_errors):,}):")
+    bin_stats  = compute_bin_stats(bin_errors, n_bins)
+    print(f"\nBin stats (n_bins={n_bins}, n_total={len(bin_errors):,}):")
     print(
         bin_stats[["bin", "n", "mean_yield", "rmse", "mae", "bias"]]
         .to_string(index=False, float_format="{:,.1f}".format)
     )
-    bin_stats.to_csv(os.path.join(args.save_dir, "bin_stats.csv"), index=False)
+    bin_stats.to_csv(os.path.join(save_dir, "bin_stats.csv"), index=False)
     print("  bin_stats.csv")
-    plot_rmse_by_bin(bin_stats, args.save_dir, args.n_bins)
-    plot_yield_density(bin_errors, args.save_dir)
+    plot_rmse_by_bin(bin_stats, save_dir, n_bins)
+    plot_yield_density(bin_errors, save_dir)
 
-    print(f"\nAll plots saved to {args.save_dir}/")
+    print(f"\nAll plots saved to {save_dir}/")
+
+
+def load_plot_geometries(shp_path, country, county_shp):
+    """Load the state (required) and optional county shapefiles for plotting.
+
+    Returns (states_gdf, counties_gdf); counties_gdf is None when county_shp is
+    falsy. Shared by the single-fold CLI and the batch runner so both load the
+    shapefiles the same way — and, for the batch runner, exactly once.
+    """
+    print(f"Loading global shapefile: {shp_path}")
+    states_gdf = load_states_geo(shp_path, country)
+    print(f"States loaded: {len(states_gdf)}")
+
+    counties_gdf = None
+    if county_shp:
+        print(f"Loading county shapefile: {county_shp}")
+        counties_gdf = load_counties_geo(county_shp)
+        print(f"Counties loaded: {len(counties_gdf)}")
+    else:
+        print(
+            "No --county_shp provided. "
+            "Admin2 yield maps will be skipped; using state-level fallback."
+        )
+    return states_gdf, counties_gdf
+
+
+def main():
+    args = parse_args()
+    states_gdf, counties_gdf = load_plot_geometries(
+        args.shp_path, args.country, args.county_shp)
+    plot_fold(args.save_dir, states_gdf, counties_gdf, n_bins=args.n_bins)
 
 
 if __name__ == "__main__":
