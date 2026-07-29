@@ -524,22 +524,26 @@ def plot_fold(save_dir, states_gdf, counties_gdf=None, n_bins=10):
     errors    = errors[errors["adm2_id"].str[:2] != "15"].copy()
     adm1_rmse = adm1_rmse[adm1_rmse["adm1"] != "Hawaii"].copy()
 
-    states_named = attach_state_names(states_gdf, errors)
+    # State geometries are optional: skip admin1 maps / state borders when the
+    # global shapefile isn't available (e.g. county-only CONUS runs on an HPC).
+    states_named = (attach_state_names(states_gdf, errors)
+                    if states_gdf is not None else None)
 
     print(
         f"\nGenerating plots for {meta['model_type'].upper()} "
         f"test_year={meta['test_year']}:"
     )
 
-    # Non-geographic
+    # Non-geographic (always)
     plot_scatter(meta, errors, save_dir)
     plot_feature_importance(meta, save_dir)
 
-    # State-level (always available)
-    plot_adm1_rmse(meta, adm1_rmse, states_named, save_dir)
-    plot_adm1_mae(meta, errors, states_named, save_dir)
+    # State-level (only when the global shapefile was loaded)
+    if states_named is not None:
+        plot_adm1_rmse(meta, adm1_rmse, states_named, save_dir)
+        plot_adm1_mae(meta, errors, states_named, save_dir)
 
-    # County-level (requires counties_gdf)
+    # County-level (requires counties_gdf; state borders are an optional overlay)
     if counties_gdf is not None:
         # Shared colorbar limits so observed and predicted are directly comparable
         yield_vmin = min(errors["y_true"].min(), errors["y_pred"].min())
@@ -558,7 +562,7 @@ def plot_fold(save_dir, states_gdf, counties_gdf=None, n_bins=10):
             save_dir=save_dir, vmin=yield_vmin, vmax=yield_vmax,
         )
         plot_adm2_mae(meta, errors, counties_gdf, states_named, save_dir)
-    else:
+    elif states_named is not None:
         plot_adm1_observed_yield(meta, errors, states_named, save_dir)
 
     # Bin analysis
@@ -580,13 +584,21 @@ def plot_fold(save_dir, states_gdf, counties_gdf=None, n_bins=10):
 def load_plot_geometries(shp_path, country, county_shp):
     """Load the state (required) and optional county shapefiles for plotting.
 
-    Returns (states_gdf, counties_gdf); counties_gdf is None when county_shp is
-    falsy. Shared by the single-fold CLI and the batch runner so both load the
-    shapefiles the same way — and, for the batch runner, exactly once.
+    Returns (states_gdf, counties_gdf); either may be None. The state shapefile
+    is optional — if shp_path is missing or doesn't exist, state-level (admin1)
+    maps are skipped rather than raising (e.g. county-only CONUS runs on an HPC
+    that doesn't have the global shapefile). Shared by the single-fold CLI and
+    the batch runner so both load the shapefiles the same way — and, for the
+    batch runner, exactly once.
     """
-    print(f"Loading global shapefile: {shp_path}")
-    states_gdf = load_states_geo(shp_path, country)
-    print(f"States loaded: {len(states_gdf)}")
+    states_gdf = None
+    if shp_path and os.path.exists(shp_path):
+        print(f"Loading global shapefile: {shp_path}")
+        states_gdf = load_states_geo(shp_path, country)
+        print(f"States loaded: {len(states_gdf)}")
+    else:
+        print(f"State shapefile not found ({shp_path!r}); "
+              "skipping state-level (admin1) maps. Pass --shp_path to enable them.")
 
     counties_gdf = None
     if county_shp:
@@ -594,10 +606,7 @@ def load_plot_geometries(shp_path, country, county_shp):
         counties_gdf = load_counties_geo(county_shp)
         print(f"Counties loaded: {len(counties_gdf)}")
     else:
-        print(
-            "No --county_shp provided. "
-            "Admin2 yield maps will be skipped; using state-level fallback."
-        )
+        print("No --county_shp provided; skipping county (admin2) maps.")
     return states_gdf, counties_gdf
 
 
