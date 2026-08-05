@@ -26,32 +26,45 @@ library(arrow)
 # ===== MAIN VARIABLES TO UPDATE ACCORDINGLY =====
 
 country   <- "usa"                              # see COUNTRY_CONFIG below
-aoi       <- "CONUS"                            # filename suffix (matches crop/climate parquets)
-crop      <- "maize"                            # CY-Bench crop subfolder
 variables <- c("ndvi", "fpar", "soil_moisture") # phenology variables to generate
 
-cybench_dir <- "/Users/kdoerkse/Documents/UCT/AgImpacts/cy-bench/cybench-data"
-county_shp  <- "/Users/kdoerkse/Documents/UCT/AgImpacts/us_county_2020_shapefile/cb_2020_us_county_20m.shp"
-out_dir     <- "/Users/kdoerkse/Documents/UCT/AgImpacts/CONUS_processed_data"
-pheno_dir   <- file.path(out_dir, "phenology")  # phenology parquets live here, separate from climate
+proc_root    <- "/Users/kdoerkse/Documents/UCT/AgImpacts"
+cybench_dir  <- file.path(proc_root, "cy-bench", "cybench-data")
+cybench_poly <- file.path(proc_root, "cy-bench", "polygons")
+county_shp   <- file.path(proc_root, "us_county_2020_shapefile", "cb_2020_us_county_20m.shp")
 
 
 # ===== COUNTRY CONFIG =====
 # Each country defines:
 #   cy_country      : CY-Bench country subfolder code
-#   load_boundaries : zero-arg fn returning a data frame keyed by GEOID adm2_id
-#                     with county/state names (adm2, adm1), matching the climate set
+#   crop            : CY-Bench crop subfolder
+#   aoi             : filename suffix, must match that country's crop/climate parquets
+#   out_dir         : processed-data root; phenology lands in {out_dir}/phenology
+#   load_boundaries : zero-arg fn returning a data frame keyed by adm2_id with
+#                     adm2/adm1, matching the climate set
+#   adm_id_to_adm2  : fn(adm_id) -> adm2_id, mapping the CY-Bench id onto the
+#                     adm2_id convention this AOI's climate parquets use
 COUNTRY_CONFIG <- list(
   usa = list(
     cy_country      = "US",
-    load_boundaries = function() load_us_boundaries(county_shp)
+    crop            = "maize",
+    aoi             = "CONUS",
+    out_dir         = file.path(proc_root, "CONUS_processed_data"),
+    load_boundaries = function() load_us_boundaries(county_shp),
+    # "US-SS-CCC" -> 5-digit GEOID
+    adm_id_to_adm2  = function(adm_id) paste0(substr(adm_id, 4, 5), substr(adm_id, 7, 9))
+  ),
+  # cy-bench AOIs key the climate parquets on the raw adm_id, so the mapping is
+  # the identity and the boundary set comes from the cy-bench polygons.
+  BF = list(
+    cy_country      = "BF",
+    crop            = "maize",
+    aoi             = "BF",
+    out_dir         = file.path(proc_root, "BF_processed_data"),
+    load_boundaries = function() load_cybench_boundaries(file.path(cybench_poly, "BF", "BF.shp")),
+    adm_id_to_adm2  = function(adm_id) adm_id
   )
 )
-
-if (!country %in% names(COUNTRY_CONFIG)) {
-  stop("Unknown country '", country, "'. Options: ", paste(names(COUNTRY_CONFIG), collapse = ", "))
-}
-cfg <- COUNTRY_CONFIG[[country]]
 
 
 # ===== VARIABLE CONFIG =====
@@ -75,12 +88,29 @@ load_us_boundaries <- function(shp_path) {
     transmute(adm2_id = GEOID, adm2 = NAME, adm1 = STATE_NAME)
 }
 
+# Admin-2 units from the cy-bench polygons (BF, ET, MG, MW), keyed by the raw
+# adm_id — the same convention ML-sample-gen.R's load_cybench_boundaries() writes
+# into the climate parquets. cy-bench ships no unit names, so adm2 carries the id
+# itself and adm1 is the reconstructed parent code {CC}-A1-{AA}.
+load_cybench_boundaries <- function(shp_path) {
+  st_read(shp_path, quiet = TRUE) %>%
+    st_drop_geometry() %>%
+    transmute(
+      adm2_id = adm_id,
+      adm2    = adm_id,
+      adm1    = paste0(substr(adm_id, 1, 2), "-A1-",
+                       substr(sub("^[A-Z]{2}-A2-", "", adm_id), 1, 2))
+    )
+}
+
 # Read one CY-Bench phenology CSV and shape it into the standard phenology schema:
 #   adm2_id, adm2, adm1, hindcast_start, date, doy, year_month, <value_cols...>
-# - adm_id "US-SS-CCC" -> 5-digit GEOID adm2_id
+# - adm_id -> adm2_id via the AOI's `adm_id_to_adm2` (GEOID for the US, identity
+#   for the cy-bench AOIs)
 # - hindcast_start: Nov/Dec fall into the NEXT year's growing-season window
 # - drops rows with no value in any value_col, and counties outside `county_meta`
-load_phenology_csv <- function(cybench_dir, crop, cy_country, var, value_cols, county_meta) {
+load_phenology_csv <- function(cybench_dir, crop, cy_country, var, value_cols, county_meta,
+                               adm_id_to_adm2) {
   f <- file.path(cybench_dir, crop, cy_country,
                  sprintf("%s_%s_%s.csv", var, crop, cy_country))
   if (!file.exists(f)) stop("CY-Bench file not found: ", f)
@@ -89,7 +119,7 @@ load_phenology_csv <- function(cybench_dir, crop, cy_country, var, value_cols, c
 
   df <- raw %>%
     mutate(
-      adm2_id = paste0(substr(adm_id, 4, 5), substr(adm_id, 7, 9)),
+      adm2_id = adm_id_to_adm2(adm_id),
       date    = as.Date(as.character(date), format = "%Y%m%d")
     ) %>%
     filter(if_any(all_of(value_cols), ~ !is.na(.))) %>%
@@ -112,13 +142,21 @@ load_phenology_csv <- function(cybench_dir, crop, cy_country, var, value_cols, c
 
 # ===== MAIN =====
 # Wrapped so the file can be sourced for its functions without running the loop.
-main <- function() {
+main <- function(country = get("country", envir = globalenv())) {
+
+if (!country %in% names(COUNTRY_CONFIG)) {
+  stop("Unknown country '", country, "'. Options: ", paste(names(COUNTRY_CONFIG), collapse = ", "))
+}
+cfg       <- COUNTRY_CONFIG[[country]]
+crop      <- cfg$crop
+aoi       <- cfg$aoi
+pheno_dir <- file.path(cfg$out_dir, "phenology")  # separate from the climate parquets
 
 dir.create(pheno_dir, showWarnings = FALSE, recursive = TRUE)
 
-cat("\nGenerating phenology samples — country:", country, " crop:", crop, "\n")
+cat("\nGenerating phenology samples — country:", country, " crop:", crop, " aoi:", aoi, "\n")
 county_meta <- cfg$load_boundaries()
-cat("  CONUS counties (boundary set):", nrow(county_meta), "\n")
+cat("  Admin-2 units (boundary set):", nrow(county_meta), "\n")
 
 for (var in variables) {
   if (!var %in% names(VAR_CONFIG))
@@ -137,10 +175,10 @@ for (var in variables) {
   }
 
   df <- load_phenology_csv(cybench_dir, crop, cfg$cy_country, var,
-                           vcfg$value_cols, county_meta)
+                           vcfg$value_cols, county_meta, cfg$adm_id_to_adm2)
 
   cat("  Raw rows:", attr(df, "n_raw"), " -> kept:", nrow(df), "\n")
-  cat("  Unique counties:    ", n_distinct(df$adm2_id), "\n")
+  cat("  Unique admin-2 units:", n_distinct(df$adm2_id), "\n")
   cat("  hindcast_start range:", paste(range(df$hindcast_start), collapse = " – "),
       " (harvest years ", paste(range(df$hindcast_start) + 1, collapse = " – "), ")\n", sep = "")
   cat("  Date range:         ", format(range(df$date)), "\n")
@@ -161,6 +199,10 @@ cat("Parquets in:", pheno_dir, "\n")
 
 
 # Run only when executed as a script (not when sourced for its functions).
+# With no arguments, runs the single country configured at the top of the file.
+# With country codes as arguments (e.g. `Rscript phenology-sample-gen.R BF`),
+# runs each in turn.
 if (sys.nframe() == 0L) {
-  main()
+  args <- commandArgs(trailingOnly = TRUE)
+  if (length(args) == 0L) main() else for (cn in args) main(cn)
 }
