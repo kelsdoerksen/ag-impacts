@@ -81,6 +81,10 @@ from data_loader import (
     PHENOLOGY_CHANNELS,
     build_yield_history_matrix,
     load_county_yield_series,
+    parse_climate_vars,
+    phenology_lag_suffix,
+    phenology_lags,
+    resolve_climate_vars,
 )
 
 set_seed(42)
@@ -103,8 +107,15 @@ CLIMATE_CHANNELS = ["tasmax_C", "tasmin_C", "hursmin", "pr_mm"]
 # PHENOLOGY_CHANNELS is imported from data_loader (shared with the tabular path).
 
 
-def phenology_channel_cols(use_phenology) -> list[str]:
-    """Flatten requested phenology var tokens into ordered channel column names."""
+def phenology_channel_cols(
+    use_phenology, lag_years: int = 1, lookback_years: int = 1,
+) -> list[str]:
+    """Flatten requested phenology var tokens into ordered channel column names.
+
+    With a lookback of n, each variable contributes n channels — one per prior
+    season, suffixed _lag{k} — in the same var-major, lag-ascending order that
+    _merge_phenology creates them, so channel index order is well defined.
+    """
     cols: list[str] = []
     for var in (use_phenology or []):
         if var not in PHENOLOGY_CHANNELS:
@@ -112,7 +123,9 @@ def phenology_channel_cols(use_phenology) -> list[str]:
                 f"Unknown phenology variable {var!r}. "
                 f"Choices: {list(PHENOLOGY_CHANNELS)}"
             )
-        cols += PHENOLOGY_CHANNELS[var]["cols"]
+        for lag in phenology_lags(lag_years, lookback_years):
+            sfx = phenology_lag_suffix(lag, lookback_years)
+            cols += [f"{c}{sfx}" for c in PHENOLOGY_CHANNELS[var]["cols"]]
     return cols
 
 
@@ -206,6 +219,7 @@ def _merge_phenology(
     suffix: str,
     phenology_dir: str | None = None,
     lag_years: int = 1,
+    lookback_years: int = 1,
 ) -> pd.DataFrame:
     """Left-merge native-cadence CY-Bench phenology onto the daily climate frame.
 
@@ -220,10 +234,19 @@ def _merge_phenology(
     signals like NDVI cannot be observed for the year being predicted, so we use
     last year's curve, aligned onto this season's day-offset grid. lag_years=0
     reverts to same-year (nowcast/leaky) behaviour.
+
+    lookback_years > 1 repeats the shift-and-join for each of that many
+    consecutive seasons (lags lag_years … lag_years+n-1), producing one channel
+    per season suffixed _lag{k}. Because every season is projected onto the same
+    day-offset grid, day d of each channel is the same point in the season — the
+    model sees several years of the phenological curve side by side rather than
+    one snapshot. Requiring n seasons of coverage pushes the earliest usable
+    year later (NDVI starts 2001, so a 4-year lookback needs target year 2006+).
     """
     if not use_phenology:
         return merged
     phenology_dir = phenology_dir or os.path.join(data_dir, "phenology")
+    lags = phenology_lags(lag_years, lookback_years)
     for var in use_phenology:
         cfg  = PHENOLOGY_CHANNELS[var]
         path = os.path.join(phenology_dir, f"phenology_{cfg['stem']}_{suffix}.parquet")
@@ -234,14 +257,20 @@ def _merge_phenology(
             )
         ph = pd.read_parquet(path, columns=["adm2_id", "date"] + cfg["cols"])
         ph["date"] = pd.to_datetime(ph["date"])
-        if lag_years:
-            # Shift last season's observations onto this season's timeline so the
-            # merge attaches year (Y-lag_years) phenology to the year-Y climate day.
-            ph["date"] = ph["date"] + pd.DateOffset(years=lag_years)
-        merged = merged.merge(ph, on=["adm2_id", "date"], how="left")
-        lag_note = f"lagged {lag_years}yr" if lag_years else "same-year"
+        for lag in lags:
+            sfx    = phenology_lag_suffix(lag, lookback_years)
+            season = ph.rename(columns={c: f"{c}{sfx}" for c in cfg["cols"]})
+            if lag:
+                # Shift that season's observations onto this season's timeline so
+                # the merge attaches year (Y-lag) phenology to the year-Y climate day.
+                season = season.assign(
+                    date=season["date"] + pd.DateOffset(years=lag))
+            merged = merged.merge(season, on=["adm2_id", "date"], how="left")
+        lag_note = (f"lagged {lags[0]}yr" if lookback_years == 1
+                    else f"{lookback_years} seasons, lags {lags[0]}–{lags[-1]}yr")
         print(
-            f"[data] Phenology '{var}' ({lag_note}): merged {cfg['cols']}  "
+            f"[data] Phenology '{var}' ({lag_note}): merged "
+            f"{len(cfg['cols']) * len(lags)} channel(s)  "
             f"({ph['adm2_id'].nunique()} counties, {len(ph):,} obs)"
         )
     return merged
@@ -257,6 +286,7 @@ def load_climate_crop_data(
     use_phenology: list[str] | None = None,
     phenology_suffix: str | None = None,
     phenology_lag_years: int = 1,
+    phenology_lookback_years: int = 1,
     forecast_year: int = 1,
 ) -> pd.DataFrame:
     """Load one or more hindcast years of climate data and merge with crop yield.
@@ -363,6 +393,7 @@ def load_climate_crop_data(
         merged, data_dir, use_phenology,
         suffix=(phenology_suffix or aoi),
         lag_years=phenology_lag_years,
+        lookback_years=phenology_lookback_years,
     )
     return merged
 
@@ -1009,6 +1040,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--aoi",           type=str, default="CONUS",
                    help="Area-of-interest tag in the crop filename "
                         "(crop_<crop>_<aoi>.parquet). E.g. 'CONUS' or 'germany'.")
+    p.add_argument("--climate_vars", type=parse_climate_vars, default=None,
+                   metavar="VARS",
+                   help="Comma-separated climate channels to feed the model "
+                        f"(default: all of {CLIMATE_CHANNELS}). Short tokens "
+                        "tasmax,tasmin,hursmin,pr or full column names. E.g. "
+                        "--climate_vars tasmax,tasmin,pr for a temperature + "
+                        "precipitation feature space.")
     p.add_argument("--use_phenology", type=parse_phenology_arg, default=None,
                    metavar="VARS",
                    help="Comma-separated CY-Bench phenology channels to append to "
@@ -1024,6 +1062,14 @@ def parse_args() -> argparse.Namespace:
                         "target season sees the PREVIOUS season's signal. Default 1 "
                         "(forecast-safe: you can't observe the predicted year's NDVI). "
                         "0 = same-year (nowcast/leaky).")
+    p.add_argument("--phenology_lookback_years", type=int, default=1,
+                   help="Number of consecutive prior seasons to feed, starting at "
+                        "--phenology_lag_years (default 1 = last season only). "
+                        "E.g. 4 gives four NDVI channels (lags 1-4), one per "
+                        "season, all on the same day-of-season grid so the model "
+                        "sees multi-year phenology. Requires every county-year to "
+                        "have all n seasons covered, so the usable period shrinks "
+                        "(NDVI starts 2001 → lookback 4 needs target year 2006+).")
 
     # ── year selection (two mutually exclusive modes) ──
     year_group = p.add_mutually_exclusive_group(required=True)
@@ -1119,7 +1165,9 @@ def main():
     print(f"  PatchTST Yield Predictor")
     print(f"  Run ID : {run_id}")
     print(f"  Crop   : {args.crop}  |  mode: {mode}")
-    print(f"  Inputs : climate{(' + phenology ' + ','.join(args.use_phenology)) if args.use_phenology else ' only'}")
+    clim_desc = ','.join(resolve_climate_vars(args.climate_vars))
+    print(f"  Inputs : climate [{clim_desc}]"
+          f"{(' + phenology ' + ','.join(args.use_phenology)) if args.use_phenology else ''}")
     fy = args.forecast_year
     print(f"  Forecast yr: FY{fy}  (yield year = s + {fy})")
     if mode == "temporal":
@@ -1141,12 +1189,16 @@ def main():
         use_phenology=args.use_phenology,
         phenology_suffix=args.phenology_suffix,
         phenology_lag_years=args.phenology_lag_years,
+        phenology_lookback_years=args.phenology_lookback_years,
         forecast_year=args.forecast_year,
     )
 
     # ── 2. Build per-(county, year) sequence arrays ───────────────────────────
     # sample_meta: DataFrame(adm2_id, adm1, hindcast_start) — one row per sample
-    channels = CLIMATE_CHANNELS + phenology_channel_cols(args.use_phenology)
+    channels = (resolve_climate_vars(args.climate_vars)
+                + phenology_channel_cols(args.use_phenology,
+                                         args.phenology_lag_years,
+                                         args.phenology_lookback_years))
     sequences, targets, sample_meta = build_sequence_array(daily_df, channels=channels)
 
     yield_hist = yield_mask = None
@@ -1255,10 +1307,12 @@ def main():
         "n_test":             int(val_mask.sum()),
         "target":              args.target,
         "forecast_year":       args.forecast_year,
+        "climate_vars":        resolve_climate_vars(args.climate_vars),
         "yield_history":       args.yield_history,
         "yield_history_base":  args.yield_history_base,
         "use_phenology":       args.use_phenology,
         "phenology_lag_years": args.phenology_lag_years,
+        "phenology_lookback_years": args.phenology_lookback_years,
         "feature_importances": None,  # PatchTST has no feature importances
         # hyperparameters for reproducibility
         "patch_length":       args.patch_length,

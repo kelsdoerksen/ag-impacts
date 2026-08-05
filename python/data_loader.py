@@ -30,6 +30,8 @@ aggregate_daily(daily_df)  → (adm2_df, weather_cols)   seasonal aggregation
 build_features(adm2_df, …) → (adm2_df, feature_cols)   drop-NaN step
 build_timeseries_features  → (adm2_df, feature_cols)   pivoted daily features
 available_crops(data_dir)  → list[str]
+parse_climate_vars(str)    → list[str]                 --climate_vars parsing
+history_leak_mask(...)     → ndarray (N, L) bool       held-out labels in history
 """
 
 import glob
@@ -44,6 +46,19 @@ FEATURE_MODES   = ["aggregated", "timeseries"]
 TARGET_OPTIONS  = ["yield", "yield_pct_change"]
 SUPPORTED_CROPS = ["corn", "cassava", "rice", "sorghum", "soy", "wheat"]
 
+# Short CLI tokens for the daily climate variables, so a feature-space ablation
+# can select a subset (e.g. --climate_vars tasmax,tasmin,pr = temperature +
+# precipitation only, dropping relative humidity). Order of the resolved list
+# determines tabular feature order and TST channel index order.
+CLIMATE_VAR_ALIASES = {
+    "tasmax":   "tasmax_C",
+    "tasmin":   "tasmin_C",
+    "hursmin":  "hursmin",
+    "pr":       "pr_mm",
+    # full column names accepted too, so --climate_vars tasmax_C,pr_mm works
+    **{v: v for v in WEATHER_VARS},
+}
+
 # CY-Bench phenology variables: token -> parquet file stem + value column(s).
 # Files live at {data_dir}/phenology/phenology_{stem}_{suffix}.parquet. Canonical
 # here (pandas-only) so both the tabular pipeline and the TST path share one map.
@@ -52,6 +67,46 @@ PHENOLOGY_CHANNELS = {
     "fpar":          {"stem": "fpar",         "cols": ["fpar"]},
     "soil_moisture": {"stem": "soilmoisture", "cols": ["ssm", "rsm"]},
 }
+
+
+# ---------------------------------------------------------------------------
+# Climate variable selection
+# ---------------------------------------------------------------------------
+
+def parse_climate_vars(s: str) -> list[str]:
+    """Parse a comma-separated --climate_vars value into full column names.
+
+    Accepts short tokens ('tasmax,tasmin,pr') or full column names
+    ('tasmax_C,tasmin_C,pr_mm'). Duplicates are collapsed, order is preserved.
+    """
+    import argparse
+    out: list[str] = []
+    for tok in (t.strip() for t in s.split(",")):
+        if not tok:
+            continue
+        if tok not in CLIMATE_VAR_ALIASES:
+            raise argparse.ArgumentTypeError(
+                f"Unknown climate variable {tok!r}. "
+                f"Choices: {sorted(set(CLIMATE_VAR_ALIASES))}"
+            )
+        col = CLIMATE_VAR_ALIASES[tok]
+        if col not in out:
+            out.append(col)
+    if not out:
+        raise argparse.ArgumentTypeError("--climate_vars must name at least one variable.")
+    return out
+
+
+def resolve_climate_vars(climate_vars: list | None) -> list[str]:
+    """Return the climate columns to use, defaulting to all of WEATHER_VARS."""
+    if not climate_vars:
+        return list(WEATHER_VARS)
+    unknown = [v for v in climate_vars if v not in WEATHER_VARS]
+    if unknown:
+        raise ValueError(
+            f"Unknown climate variable(s) {unknown}. Choices: {WEATHER_VARS}"
+        )
+    return list(climate_vars)
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +267,64 @@ def build_yield_history_matrix(
     return hist, mask, base_year, max_len
 
 
+def history_leak_mask(
+    adm2_ids,
+    target_years,
+    hist_len: int,
+    blocked_labels,
+) -> np.ndarray:
+    """Flag prior-yield slots that would expose a held-out fold's labels.
+
+    Under leave-one-year-out CV the held-out year's yields are still visible to
+    the model through *other* samples' history: a training sample for
+    (county c, target year T+1) carries lag-1 = county c's yield in year T,
+    which is precisely the label of the held-out sample for (c, T). The model
+    therefore trains on the test targets. This finds those slots so the caller
+    can zero them (and their validity mask) before training.
+
+    Parameters
+    ----------
+    adm2_ids : array-like (N,)  — county id per sample (training rows).
+    target_years : array-like (N,) — calendar year predicted by each sample.
+    hist_len : int — history length L; slot j holds year target_year - 1 - j.
+    blocked_labels : iterable of (adm2_id, target_year)
+        The (county, year) labels held out by this fold.
+
+    Returns
+    -------
+    ndarray (N, L) bool — True where the slot must be suppressed.
+
+    This covers the *training* side only: held-out labels must never be model
+    inputs during fitting. Test samples keep their own history, which is the
+    intended behaviour — at real forecast time a county's past observed yields
+    are known. Under --cv_scheme cell the held-out unit is a set of counties and
+    history is county-own, so no training entry is ever flagged (a held-out
+    county's yields appear only in that county's own, held-out, samples).
+    """
+    n = len(adm2_ids)
+    out = np.zeros((n, hist_len), dtype=bool)
+    blocked = list(blocked_labels)
+    if n == 0 or hist_len == 0 or not blocked:
+        return out
+
+    # Encode (county, year) as a single integer key so membership is one
+    # vectorised np.isin over the (N, L) grid of history years.
+    codes, uniq = pd.factorize(np.asarray(adm2_ids))
+    code_of = {aid: i for i, aid in enumerate(uniq)}
+    YEAR_SPAN = 10_000
+    blocked_keys = np.array(
+        [code_of[aid] * YEAR_SPAN + int(yr)
+         for aid, yr in blocked if aid in code_of],
+        dtype=np.int64,
+    )
+    if blocked_keys.size == 0:
+        return out
+
+    years = np.asarray(target_years, dtype=np.int64)[:, None] - 1 - np.arange(hist_len)
+    keys  = codes.astype(np.int64)[:, None] * YEAR_SPAN + years
+    return np.isin(keys, blocked_keys)
+
+
 # ---------------------------------------------------------------------------
 # Prior-season phenology (optional NDVI/FPAR/soil-moisture summary features)
 # ---------------------------------------------------------------------------
@@ -222,8 +335,39 @@ def build_yield_history_matrix(
 # (county, season) into a handful of stats and, at feature time, attach the
 # season `phenology_lag_years` before the target year. Mirrors the TST path,
 # which feeds the same lagged signal as a daily channel.
+#
+# `phenology_lookback_years` widens that from one prior season to several
+# consecutive ones (lags L, L+1, … L+n-1), so the model sees how the county's
+# phenology has behaved over recent years rather than a single snapshot. Each
+# season becomes its own set of columns/channels; day-of-season alignment is
+# preserved, so lag-1 day d and lag-2 day d are the same point in the season.
 
 _PHENOLOGY_STATS = ["mean", "std", "min", "max", "amp"]
+
+
+def phenology_lags(lag_years: int, lookback_years: int = 1) -> list[int]:
+    """Season lags to include: lag_years, lag_years+1, … (lookback_years total).
+
+    lag_years is the most recent (smallest-lag) season — 1 by default, the
+    forecast-safe "last season". A lookback of 4 with the default lag therefore
+    covers the four seasons before the target year.
+    """
+    if lookback_years < 1:
+        raise ValueError(
+            f"phenology_lookback_years must be >= 1, got {lookback_years}."
+        )
+    if lag_years < 0:
+        raise ValueError(f"phenology_lag_years must be >= 0, got {lag_years}.")
+    return [lag_years + k for k in range(lookback_years)]
+
+
+def phenology_lag_suffix(lag: int, lookback_years: int = 1) -> str:
+    """Column/channel suffix identifying one season of a phenology lookback.
+
+    Empty for a single-season lookback, so the original names (`ndvi`,
+    `ndvi_prev_mean`, …) are unchanged when the option is not used.
+    """
+    return "" if lookback_years <= 1 else f"_lag{lag}"
 
 
 def load_phenology_aggregates(
@@ -272,30 +416,37 @@ def _append_phenology_features(
     forecast_year: int,
     lag_years: int,
     suffix: str | None,
+    lookback_years: int = 1,
 ) -> tuple[pd.DataFrame, list]:
     """Attach lagged prior-season phenology summary features to a featurised frame.
 
     For each sample (adm2_id, hindcast_start) the target year is
     hindcast_start + forecast_year; we join the phenology season
-    (target - lag_years). Samples with no matching phenology season are dropped
-    (their feature would be missing), which restricts the sample set to years
-    with phenology coverage (NDVI/FPAR 2001+, soil moisture 2003+).
+    (target - lag) for every lag in the lookback. Samples with no matching
+    phenology season are dropped (their features would be missing), which
+    restricts the sample set to years with phenology coverage (NDVI/FPAR 2001+,
+    soil moisture 2003+) — and, for a lookback of n, to years whose *oldest*
+    requested season is also covered.
     """
     df = adm2_df.copy()
-    df["_target_year"]  = df["hindcast_start"].astype(int) + forecast_year
-    df["_pheno_season"] = df["_target_year"] - lag_years
+    df["_target_year"] = df["hindcast_start"].astype(int) + forecast_year
+    lags = phenology_lags(lag_years, lookback_years)
 
     new_cols: list[str] = []
     for var in use_phenology:
         agg = load_phenology_aggregates(data_dir, var, aoi, suffix)
         stat_cols = [c for c in agg.columns if c not in ("adm2_id", "season_target")]
-        df = df.merge(
-            agg.rename(columns={"season_target": "_pheno_season"}),
-            on=["adm2_id", "_pheno_season"], how="left",
-        )
-        new_cols += stat_cols
-        print(f"Phenology '{var}'   : {len(stat_cols)} prior-season features "
-              f"(lag {lag_years}yr)")
+        for lag in lags:
+            sfx = phenology_lag_suffix(lag, lookback_years)
+            renamed = agg.rename(columns={
+                "season_target": "_pheno_season",
+                **{c: f"{c}{sfx}" for c in stat_cols},
+            })
+            df["_pheno_season"] = df["_target_year"] - lag
+            df = df.merge(renamed, on=["adm2_id", "_pheno_season"], how="left")
+            new_cols += [f"{c}{sfx}" for c in stat_cols]
+        print(f"Phenology '{var}'   : {len(stat_cols) * len(lags)} prior-season "
+              f"features ({len(lags)} season(s), lags {lags[0]}–{lags[-1]}yr)")
 
     before = len(df)
     df = df.dropna(subset=new_cols).reset_index(drop=True)
@@ -447,20 +598,28 @@ def load_crop_climate_data(
 # Aggregated features
 # ---------------------------------------------------------------------------
 
-def aggregate_daily(daily_df: pd.DataFrame):
+def aggregate_daily(daily_df: pd.DataFrame, weather_vars: list | None = None):
     """Aggregate daily county×day data to one row per (adm2_id, hindcast_start).
+
+    Only the requested weather_vars are summarised (default: all of
+    WEATHER_VARS). Derived columns follow their inputs: temp_range_C is built
+    only when both tasmax_C and tasmin_C are selected, and the pr_mm_sum total
+    only when pr_mm is selected.
 
     Returns (adm2_df, weather_cols).
     """
     df = daily_df.copy()
-    df["temp_range_C"] = df["tasmax_C"] - df["tasmin_C"]
-    weather_cols = ["tasmax_C", "tasmin_C", "hursmin", "pr_mm", "temp_range_C"]
+    weather_cols = resolve_climate_vars(weather_vars)
+    if "tasmax_C" in weather_cols and "tasmin_C" in weather_cols:
+        df["temp_range_C"] = df["tasmax_C"] - df["tasmin_C"]
+        weather_cols = weather_cols + ["temp_range_C"]
 
     agg = {}
     for col in weather_cols:
         agg[f"{col}_mean"] = (col, "mean")
         agg[f"{col}_std"]  = (col, "std")
-    agg["pr_mm_sum"]       = ("pr_mm",           "sum")
+    if "pr_mm" in weather_cols:
+        agg["pr_mm_sum"]   = ("pr_mm",           "sum")
     agg["plant_doy"]       = ("plant_doy",        "first")
     agg["harvest_doy"]     = ("harvest_doy",      "first")
     agg["harvest_end_doy"] = ("harvest_end_doy",  "first")
@@ -483,7 +642,8 @@ def build_features(adm2_df: pd.DataFrame, weather_cols: list):
     feature_cols = (
         [f"{c}_mean" for c in weather_cols]
         + [f"{c}_std"  for c in weather_cols]
-        + ["pr_mm_sum", "plant_doy", "harvest_doy", "harvest_end_doy"]
+        + (["pr_mm_sum"] if "pr_mm" in weather_cols else [])
+        + ["plant_doy", "harvest_doy", "harvest_end_doy"]
     )
     mask    = adm2_df[feature_cols].notna().all(axis=1)
     adm2_df = adm2_df[mask].copy()
@@ -583,6 +743,8 @@ def load_and_prepare(
     use_phenology: list | None = None,
     phenology_lag_years: int = 1,
     phenology_suffix: str | None = None,
+    phenology_lookback_years: int = 1,
+    climate_vars: list | None = None,
 ) -> tuple[pd.DataFrame, list]:
     """Full pipeline: load → merge → window → featurise.
 
@@ -599,8 +761,16 @@ def load_and_prepare(
     When use_phenology is a non-empty list (e.g. ["ndvi"]), prior-season
     summary stats for each variable are appended, taken from the season
     phenology_lag_years before the target year (default 1 = last season, which
-    is forecast-safe). Samples without that season's coverage are dropped.
+    is forecast-safe). phenology_lookback_years > 1 repeats those stats for that
+    many consecutive earlier seasons (suffixed _lag{n}). Samples without every
+    requested season's coverage are dropped.
+
+    climate_vars restricts which daily weather variables are featurised
+    (default: all of WEATHER_VARS), so feature-space ablations can run e.g.
+    temperature + precipitation only.
     """
+    climate_vars = resolve_climate_vars(climate_vars)
+
     daily_df = load_crop_climate_data(
         crop=crop,
         data_dir=data_dir,
@@ -616,10 +786,11 @@ def load_and_prepare(
     )
 
     if feature_mode == "aggregated":
-        adm2_df, weather_cols = aggregate_daily(daily_df)
+        adm2_df, weather_cols = aggregate_daily(daily_df, weather_vars=climate_vars)
         adm2_df, feature_cols = build_features(adm2_df, weather_cols)
     else:
-        adm2_df, feature_cols = build_timeseries_features(daily_df)
+        adm2_df, feature_cols = build_timeseries_features(
+            daily_df, weather_vars=climate_vars)
 
     if yield_history:
         adm2_df, hist_cols = _append_yield_history_features(
@@ -629,7 +800,8 @@ def load_and_prepare(
     if use_phenology:
         adm2_df, pheno_cols = _append_phenology_features(
             adm2_df, data_dir, use_phenology, aoi, forecast_year,
-            phenology_lag_years, phenology_suffix)
+            phenology_lag_years, phenology_suffix,
+            lookback_years=phenology_lookback_years)
         feature_cols = feature_cols + pheno_cols
 
     return adm2_df, feature_cols

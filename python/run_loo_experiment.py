@@ -23,6 +23,7 @@ Example:
 """
 
 import os
+import re
 import sys
 import json
 import argparse
@@ -32,7 +33,17 @@ from datetime import datetime
 from sklearn.metrics import root_mean_squared_error
 
 from models import YieldModel, SUPPORTED_MODELS
-from data_loader import load_and_prepare, FEATURE_MODES, TARGET_OPTIONS, SUPPORTED_CROPS
+from data_loader import (
+    FEATURE_MODES,
+    SUPPORTED_CROPS,
+    TARGET_OPTIONS,
+    WEATHER_VARS,
+    history_leak_mask,
+    load_and_prepare,
+    parse_climate_vars,
+    phenology_lags,
+    resolve_climate_vars,
+)
 
 # The PatchTST implementation lives in the tst/ subpackage; add it to the path
 # so its reusable helpers can be imported lazily (only when --model_type tst is
@@ -198,6 +209,16 @@ def parse_args():
                              "{data_dir}/FY2/ forecasting hindcast_start+2 (initialised "
                              "~2 years ahead). --study_years is always in hindcast_start "
                              "(s-year) terms; the target/yield year is s + forecast_year.")
+    parser.add_argument("--climate_vars", type=parse_climate_vars, default=None,
+                        metavar="VARS",
+                        help="Comma-separated daily climate variables to use "
+                             "(default: all four). Short tokens tasmax,tasmin,"
+                             "hursmin,pr or full column names. E.g. "
+                             "--climate_vars tasmax,tasmin,pr for a "
+                             "temperature + precipitation feature space. "
+                             "Applies to both paths: tabular models get only "
+                             "those aggregate/daily columns, tst gets only "
+                             "those input channels.")
     parser.add_argument("--yield_history", action="store_true",
                         help="Add each county's own prior observed yields as an extra "
                              "input: recency-ordered annual series back to "
@@ -229,6 +250,17 @@ def parse_args():
                              "target season uses the PREVIOUS season's signal. Default 1 "
                              "(forecast-safe). 0 = same-year (nowcast/leaky). Applies to "
                              "both tst channels and tabular aggregate features.")
+    parser.add_argument("--phenology_lookback_years", type=int, default=1,
+                        help="Number of consecutive prior seasons of phenology to "
+                             "feed, starting at --phenology_lag_years (default 1 = "
+                             "last season only). E.g. --phenology_lookback_years 4 "
+                             "gives the tst model four NDVI channels (lags 1-4), one "
+                             "per season on a shared day-of-season grid, so it can "
+                             "read multi-year phenology; tabular models get one set "
+                             "of summary stats per season (suffixed _lag{n}). Every "
+                             "county-year must have all n seasons covered, so the "
+                             "usable period shrinks (NDVI starts 2001, so a 4-year "
+                             "lookback needs target year 2006+, i.e. FY1 s2005+).")
 
     # ── cross-validation scheme ──
     parser.add_argument("--cv_scheme", type=str, choices=["year", "cell"], default="year",
@@ -243,6 +275,14 @@ def parse_args():
                         help="Path to a county→climate-cell parquet (columns "
                              "adm2_id, climate_cell_id) from R/county-climate-cell.R. "
                              "Required for --cv_scheme cell.")
+    parser.add_argument("--allow_history_leakage", action="store_true",
+                        help="Disable the --yield_history leak guard. By default "
+                             "each fold suppresses the prior-yield entries that "
+                             "would expose the held-out fold's own labels to "
+                             "training samples (under leave-one-year-out, year "
+                             "T's yields are lag features of year T+1 samples). "
+                             "Set this only to reproduce the older, leaky "
+                             "behaviour for comparison.")
 
     # ── PatchTST hyperparameters (only used when --model_type tst) ──
     tst = parser.add_argument_group("PatchTST options (--model_type tst)")
@@ -353,15 +393,71 @@ def _finalize_fold(meta_te, y_true, y_pred, all_years, fold_label, model_type,
         json.dump(fold_meta, f, indent=2)
 
     skill_str = f"err%={pct_error:+.1f}%" if pct_error is not None else f"R²={r2:.3f}"
+    n_masked  = fold_meta.get("history_entries_masked")
+    leak_note = f"  hist_masked={n_masked:,}" if n_masked else ""
     print(
         f"  fold {fold_label}: RMSE={rmse:>10,.0f}  {skill_str}"
-        f"  n_train={n_train}  n_test={len(y_true)}"
+        f"  n_train={n_train}  n_test={len(y_true)}{leak_note}"
     )
     return fold_meta, errors
 
 
+def _target_years(meta, forecast_year):
+    """Calendar year predicted by each row: target_year if present, else derived."""
+    if "target_year" in meta:
+        return np.asarray(meta["target_year"], dtype=int)
+    return np.asarray(meta["hindcast_start"], dtype=int) + forecast_year
+
+
+def _suppress_history_leak(hist, mask, meta_tr, meta_te, forecast_year):
+    """Blank the training prior-yield entries that hold the held-out fold's labels.
+
+    Returns (hist, mask, n_masked) with fresh arrays; inputs are not mutated.
+    See data_loader.history_leak_mask for why these entries are leakage.
+    """
+    hist = np.array(hist, copy=True)
+    mask = np.array(mask, copy=True)
+    blocked = zip(np.asarray(meta_te["adm2_id"]),
+                  _target_years(meta_te, forecast_year))
+    leak = history_leak_mask(
+        np.asarray(meta_tr["adm2_id"]),
+        _target_years(meta_tr, forecast_year),
+        hist.shape[1],
+        blocked,
+    )
+    # Only entries that were real observations count as suppressed; padded slots
+    # are already zero/masked and flipping them changes nothing.
+    leak &= mask > 0
+    hist[leak] = 0.0
+    mask[leak] = 0.0
+    return hist, mask, int(leak.sum())
+
+
+def _yield_lag_columns(feature_cols):
+    """Split the prior-yield lag/mask columns out of a tabular feature list.
+
+    Returns (lag_cols, mask_cols) ordered by lag number (lag 1 first), or
+    ([], []) when --yield_history was not used.
+    """
+    lags  = {}
+    masks = {}
+    for col in feature_cols:
+        m = re.fullmatch(r"yield_lag(\d+)", col)
+        if m:
+            lags[int(m.group(1))] = col
+            continue
+        m = re.fullmatch(r"yield_lagmask(\d+)", col)
+        if m:
+            masks[int(m.group(1))] = col
+    order = sorted(lags)
+    if order != sorted(masks):
+        raise ValueError("Mismatched yield_lag / yield_lagmask feature columns.")
+    return [lags[j] for j in order], [masks[j] for j in order]
+
+
 def run_fold(adm2_df, feature_cols, all_years, fold_col, fold_value, fold_label,
-             model_type, fold_dir, cv_scheme="year"):
+             model_type, fold_dir, cv_scheme="year", forecast_year=1,
+             guard_history_leak=True):
     """Train a tabular model leaving out one fold (a year or a climate cell).
 
     The held-out fold is the rows where adm2_df[fold_col] == fold_value; the
@@ -382,6 +478,20 @@ def run_fold(adm2_df, feature_cols, all_years, fold_col, fold_value, fold_label,
         print(f"  fold {fold_label}: no test data — skipping")
         return None
 
+    # Prior-yield lag features can carry this fold's held-out labels into the
+    # training rows (year T's yield is year T+1's lag 1); blank those entries.
+    n_hist_masked = None
+    lag_cols, mask_cols = _yield_lag_columns(feature_cols)
+    if lag_cols and guard_history_leak:
+        hist, hmask, n_hist_masked = _suppress_history_leak(
+            X_tr[lag_cols].to_numpy(dtype=float),
+            X_tr[mask_cols].to_numpy(dtype=float),
+            adm2_df.loc[train_mask], adm2_df.loc[test_mask], forecast_year,
+        )
+        X_tr = X_tr.copy()
+        X_tr[lag_cols]  = hist
+        X_tr[mask_cols] = hmask
+
     model = YieldModel(model_type)
     model.fit(X_tr, y_tr)
     y_pred = model.predict(X_te)
@@ -391,6 +501,7 @@ def run_fold(adm2_df, feature_cols, all_years, fold_col, fold_value, fold_label,
             dict(zip(feature_cols, model.feature_importances_.tolist()))
             if model.feature_importances_ is not None else None
         ),
+        "history_entries_masked": n_hist_masked,
     }
     train_years = sorted(adm2_df.loc[train_mask, "hindcast_start"].unique().tolist())
     test_years  = sorted(adm2_df.loc[test_mask,  "hindcast_start"].unique().tolist())
@@ -424,11 +535,21 @@ def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_valu
     val_seqs,   val_tgts   = sequences[test_mask],  targets[test_mask]
     meta_te = sample_meta.loc[test_mask, meta_cols].copy()
 
-    hist_kwargs = {}
+    hist_kwargs   = {}
+    n_hist_masked = None
     if yield_hist is not None:
+        train_hist, train_hmask = yield_hist[train_mask], yield_mask[train_mask]
+        # The held-out fold's yields are lag features of later training samples;
+        # blank them so the model never trains on this fold's labels.
+        if not args.allow_history_leakage:
+            train_hist, train_hmask, n_hist_masked = _suppress_history_leak(
+                train_hist, train_hmask,
+                sample_meta.loc[train_mask], sample_meta.loc[test_mask],
+                args.forecast_year,
+            )
         hist_kwargs = dict(
-            train_hist=yield_hist[train_mask], train_hist_mask=yield_mask[train_mask],
-            val_hist=yield_hist[test_mask],    val_hist_mask=yield_mask[test_mask],
+            train_hist=train_hist,          train_hist_mask=train_hmask,
+            val_hist=yield_hist[test_mask], val_hist_mask=yield_mask[test_mask],
         )
 
     log_target = args.target == "log_yield"
@@ -461,6 +582,7 @@ def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_valu
         "epochs":       args.epochs,
         "batch_size":   args.batch_size,
         "lr":           args.lr,
+        "history_entries_masked": n_hist_masked,
     }
     train_years = sorted(sample_meta.loc[train_mask, "hindcast_start"].unique().tolist())
     test_years  = sorted(sample_meta.loc[test_mask,  "hindcast_start"].unique().tolist())
@@ -568,10 +690,33 @@ def main():
             "from R/county-climate-cell.R)."
         )
 
-    pheno_tag = ("_pheno-" + "-".join(args.use_phenology)) if args.use_phenology else ""
+    # Resolve the climate feature space once; both paths and the run name use it.
+    climate_vars = resolve_climate_vars(args.climate_vars)
+
+    if args.phenology_lookback_years < 1:
+        raise ValueError(
+            f"--phenology_lookback_years must be >= 1, got "
+            f"{args.phenology_lookback_years}."
+        )
+    if args.phenology_lookback_years > 1 and not args.use_phenology:
+        raise ValueError(
+            "--phenology_lookback_years has no effect without --use_phenology "
+            "(e.g. --use_phenology ndvi)."
+        )
+
+    lookback_tag = ("" if args.phenology_lookback_years == 1
+                    else f"-lb{args.phenology_lookback_years}")
+    pheno_tag = (("_pheno-" + "-".join(args.use_phenology) + lookback_tag)
+                 if args.use_phenology else "")
     cv_tag    = "" if args.cv_scheme == "year" else f"_cv-{args.cv_scheme}"
+    # Tag the run name with anything that changes the feature space, so ablation
+    # arms are distinguishable by folder (defaults stay untagged for continuity).
+    clim_tag  = ("" if climate_vars == list(WEATHER_VARS)
+                 else "_clim-" + "-".join(v.split("_")[0] for v in climate_vars))
+    hist_tag  = "_yhist" if args.yield_history else ""
     exp_id  = (
-        f"loo_{args.crop}_{args.model_type}_{args.feature_mode}_{args.target}{pheno_tag}{cv_tag}"
+        f"loo_{args.crop}_{args.model_type}_{args.feature_mode}_{args.target}"
+        f"{clim_tag}{hist_tag}{pheno_tag}{cv_tag}"
         f"_{study_start}_{study_end}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     )
     exp_dir = os.path.join(args.results_dir, exp_id)
@@ -585,11 +730,16 @@ def main():
     print(f"Model           : {args.model_type}")
     print(f"Feature mode    : {args.feature_mode}")
     print(f"Target          : {args.target}")
+    print(f"Climate vars    : {','.join(climate_vars)}")
+    if args.yield_history:
+        print(f"Yield history   : on  (leak guard: "
+              f"{'OFF — training sees held-out labels' if args.allow_history_leakage else 'on'})")
     print(f"CV scheme       : {args.cv_scheme}"
           + (f"  (lookup: {args.cell_lookup})" if args.cv_scheme == "cell" else ""))
     if args.use_phenology:
+        lags = phenology_lags(args.phenology_lag_years, args.phenology_lookback_years)
         print(f"Phenology       : {','.join(args.use_phenology)} "
-              f"(lag {args.phenology_lag_years}yr)")
+              f"({len(lags)} season(s), lags {lags[0]}–{lags[-1]}yr)")
     print(f"Results dir     : {exp_dir}")
 
     # Load data once — reused across all folds. The PatchTST ("tst") path uses
@@ -600,7 +750,7 @@ def main():
     sequences = targets = sample_meta = None
     if use_tst:
         load_climate_crop_data, build_sequence_array, _ = _import_tst()
-        from tst_implementation import CLIMATE_CHANNELS, phenology_channel_cols
+        from tst_implementation import phenology_channel_cols
         daily_df = load_climate_crop_data(
             data_dir=args.data_dir,
             hindcast_years=all_years,
@@ -611,9 +761,15 @@ def main():
             use_phenology=args.use_phenology,
             phenology_suffix=args.phenology_suffix,
             phenology_lag_years=args.phenology_lag_years,
+            phenology_lookback_years=args.phenology_lookback_years,
             forecast_year=args.forecast_year,
         )
-        channels = CLIMATE_CHANNELS + phenology_channel_cols(args.use_phenology)
+        # CLIMATE_CHANNELS is the full default set; climate_vars may be a subset
+        # and its order fixes the input channel order. Phenology channels follow,
+        # one per variable per lookback season.
+        channels = list(climate_vars) + phenology_channel_cols(
+            args.use_phenology, args.phenology_lag_years,
+            args.phenology_lookback_years)
         sequences, targets, sample_meta = build_sequence_array(daily_df, channels=channels)
         # Prior-yield history branch (row-aligned to sequences/sample_meta).
         yield_hist = yield_mask = None
@@ -640,6 +796,8 @@ def main():
             use_phenology=args.use_phenology,
             phenology_lag_years=args.phenology_lag_years,
             phenology_suffix=args.phenology_suffix,
+            phenology_lookback_years=args.phenology_lookback_years,
+            climate_vars=climate_vars,
         )
         county_meta = adm2_df[["adm2_id", "adm2", "adm1"]].drop_duplicates("adm2_id")
 
@@ -700,7 +858,9 @@ def main():
         else:
             result = run_fold(adm2_df, feature_cols, all_years,
                               fold_col, fold_value, fold_label,
-                              args.model_type, fold_dir, cv_scheme=args.cv_scheme)
+                              args.model_type, fold_dir, cv_scheme=args.cv_scheme,
+                              forecast_year=args.forecast_year,
+                              guard_history_leak=not args.allow_history_leakage)
         if result is None:
             continue
         fold_meta, errors = result
@@ -740,10 +900,13 @@ def main():
         "sample_counties":    args.sample_counties,
         "sample_seed":        args.sample_seed,
         "forecast_year":      args.forecast_year,
+        "climate_vars":       climate_vars,
         "yield_history":      args.yield_history,
         "yield_history_base": args.yield_history_base,
+        "allow_history_leakage": args.allow_history_leakage,
         "use_phenology":      args.use_phenology,
         "phenology_lag_years": args.phenology_lag_years,
+        "phenology_lookback_years": args.phenology_lookback_years,
         "preseason_buffer":   args.preseason_buffer,
         "postharvest_buffer": args.postharvest_buffer,
         "study_start":        study_start,
