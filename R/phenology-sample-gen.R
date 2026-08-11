@@ -63,6 +63,14 @@ COUNTRY_CONFIG <- list(
     out_dir         = file.path(proc_root, "BF_processed_data"),
     load_boundaries = function() load_cybench_boundaries(file.path(cybench_poly, "BF", "BF.shp")),
     adm_id_to_adm2  = function(adm_id) adm_id
+  ),
+  ET = list(
+    cy_country      = "ET",
+    crop            = "maize",
+    aoi             = "ET",
+    out_dir         = file.path(proc_root, "ET_preprocessed_data"),
+    load_boundaries = function() load_cybench_boundaries(file.path(cybench_poly, "ET", "ET.shp")),
+    adm_id_to_adm2  = function(adm_id) adm_id
   )
 )
 

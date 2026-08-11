@@ -80,6 +80,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data_loader import (
     PHENOLOGY_CHANNELS,
     build_yield_history_matrix,
+    draw_seed,
     load_county_yield_series,
     parse_climate_vars,
     phenology_lag_suffix,
@@ -87,11 +88,15 @@ from data_loader import (
     resolve_climate_vars,
 )
 
-set_seed(42)
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
+
+# Fallback seed for callers that don't pass one. Seeding is NOT done at import
+# time — every entry point resolves a seed explicitly (CLI --seed, or the seed
+# threaded in from run_loo_experiment.py) and passes it to
+# train_predict_patchtst, so multi-seed replicates actually differ.
+DEFAULT_SEED = 42
 
 # Climate channels used as input features (order determines channel index).
 CLIMATE_CHANNELS = ["tasmax_C", "tasmin_C", "hursmin", "pr_mm"]
@@ -901,6 +906,7 @@ def train_predict_patchtst(
     val_hist: np.ndarray | None = None,
     val_hist_mask: np.ndarray | None = None,
     history_hidden: int = 64,
+    seed: int = DEFAULT_SEED,
 ) -> np.ndarray:
     """Train a PatchTST model on one train/val split and return val predictions.
 
@@ -924,6 +930,12 @@ def train_predict_patchtst(
     log_target : bool
         If True the model learns log(yield); predictions are exp'd back so the
         returned array is always in original yield units.
+    seed : int
+        Seed for weight init, dropout and dataloader shuffling. Set globally
+        (random/numpy/torch) here and handed to the HF Trainer, so two calls
+        differing only in `seed` give an independent replicate of the same
+        configuration. Callers running seed replicates should pass the same
+        seed to every fold of one experiment.
 
     Returns
     -------
@@ -932,6 +944,10 @@ def train_predict_patchtst(
     """
     hp = {**DEFAULT_HPARAMS, **(hparams or {})}
     tc = {**DEFAULT_TRAIN_CFG, **(train_cfg or {})}
+
+    # Seed before any model construction so weight init is reproducible.
+    set_seed(seed)
+    print(f"[seed]  {seed}")
 
     # ── Normalise climate inputs (fit on training data only to avoid leakage) ──
     ch_mean, ch_std = fit_normalizer(train_seqs)
@@ -996,7 +1012,7 @@ def train_predict_patchtst(
         logging_steps=20,
         report_to="none",
         label_names=["target_values"],
-        seed=42,
+        seed=seed,
     )
     trainer = Trainer(
         model=model,
@@ -1126,6 +1142,12 @@ def parse_args() -> argparse.Namespace:
                    help="AdamW learning rate.")
     p.add_argument("--output_dir",    type=str,   default="./patchtst_output",
                    help="Directory for Trainer checkpoints and logs.")
+    p.add_argument("--seed",          type=int,   default=None,
+                   help="Random seed for weight init, dropout, shuffling and the "
+                        "single-year county split. Default: drawn from OS entropy "
+                        "so repeated runs are independent replicates. The value "
+                        "used is always recorded in run_meta.json — pass it back "
+                        "here to reproduce a run exactly.")
     return p.parse_args()
 
 
@@ -1135,6 +1157,7 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
+    seed = args.seed if args.seed is not None else draw_seed()
 
     # ── resolve year lists and validate args ──────────────────────────────────
     if args.study_years is not None:
@@ -1157,7 +1180,8 @@ def main():
         mode        = "county_split"
 
     # ── create a unique run directory for outputs ─────────────────────────────
-    run_id  = f"patchtst_{args.crop}_test{test_year}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_id  = (f"patchtst_{args.crop}_test{test_year}_seed{seed}"
+               f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     run_dir = os.path.join(args.output_dir, run_id)
     os.makedirs(run_dir, exist_ok=True)
 
@@ -1165,6 +1189,8 @@ def main():
     print(f"  PatchTST Yield Predictor")
     print(f"  Run ID : {run_id}")
     print(f"  Crop   : {args.crop}  |  mode: {mode}")
+    print(f"  Seed   : {seed}"
+          f"{'' if args.seed is not None else '  (drawn — pass --seed to reproduce)'}")
     clim_desc = ','.join(resolve_climate_vars(args.climate_vars))
     print(f"  Inputs : climate [{clim_desc}]"
           f"{(' + phenology ' + ','.join(args.use_phenology)) if args.use_phenology else ''}")
@@ -1221,7 +1247,8 @@ def main():
     else:
         # Single year: random county split for a quick local sanity check
         idx = np.arange(len(sequences))
-        train_idx, val_idx = train_test_split(idx, test_size=args.val_frac, random_state=42)
+        train_idx, val_idx = train_test_split(idx, test_size=args.val_frac,
+                                              random_state=seed)
         train_mask = np.zeros(len(sequences), dtype=bool)
         val_mask   = np.zeros(len(sequences), dtype=bool)
         train_mask[train_idx] = True
@@ -1262,6 +1289,7 @@ def main():
         ),
         train_cfg=dict(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr),
         log_target=log_target,
+        seed=seed,
         **hist_kwargs,
     )
     targets = val_tgts.squeeze()  # always original yield units
@@ -1298,6 +1326,8 @@ def main():
         "run_id":             run_id,
         "crop":               args.crop,
         "model_type":         "patchtst",
+        "seed":               seed,
+        "seed_source":        "explicit" if args.seed is not None else "drawn",
         "test_year":          test_year if mode == "temporal" else all_years[0],
         "train_years":        train_years if mode == "temporal" else [],
         "rmse_overall":       metrics["rmse"],

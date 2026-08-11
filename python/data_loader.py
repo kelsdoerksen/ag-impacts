@@ -32,14 +32,32 @@ build_timeseries_features  → (adm2_df, feature_cols)   pivoted daily features
 available_crops(data_dir)  → list[str]
 parse_climate_vars(str)    → list[str]                 --climate_vars parsing
 history_leak_mask(...)     → ndarray (N, L) bool       held-out labels in history
+draw_seed()                → int                       fresh OS-entropy run seed
 """
 
 import glob
 import os
 import re
+import secrets
 
 import numpy as np
 import pandas as pd
+
+# Upper bound for drawn seeds: numpy's legacy seed API and sklearn's
+# random_state both cap at 2**32-1, and torch/transformers accept anything in
+# that range, so a 31-bit draw is safe everywhere the seed is threaded.
+SEED_MAX = 2 ** 31 - 1
+
+
+def draw_seed() -> int:
+    """Draw a fresh run seed from OS entropy.
+
+    Used when no --seed is given so repeated launches of the same configuration
+    are genuinely independent replicates. The drawn value is always recorded in
+    the run's diagnostics, so any run can be reproduced exactly by passing it
+    back via --seed.
+    """
+    return secrets.randbelow(SEED_MAX) + 1
 
 WEATHER_VARS    = ["tasmax_C", "tasmin_C", "hursmin", "pr_mm"]
 FEATURE_MODES   = ["aggregated", "timeseries"]

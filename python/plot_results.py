@@ -63,6 +63,42 @@ def _clip_to_conus(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     mask = gdf.to_crs("EPSG:4326").geometry.intersects(_CONUS_BBOX)
     return gdf[mask].copy()
 
+
+# ===== AOI GEOMETRY CONFIG =====
+# Per-AOI adm2 shapefile handling, so the same plotting code serves CONUS and the
+# cy-bench AOIs. Each entry gives:
+#   adm2_col   : shapefile column holding the id that matches adm2_id in the
+#                results CSVs. Renamed to GEOID on load so every downstream join
+#                (which is written against GEOID) works unchanged.
+#   crs        : equal-area projection to draw in, chosen for that region.
+#   clip_conus : drop geometries outside the CONUS bbox — only ever right for the
+#                US shapefile, which ships Alaska/Hawaii/territories.
+#   zfill      : zero-pad adm2_id to this width before joining. US FIPS codes lose
+#                their leading zero through CSV round-trips; the cy-bench ids are
+#                alphanumeric and must be left alone.
+AOI_GEO = {
+    "CONUS": dict(adm2_col="GEOID",  crs="EPSG:5070",    clip_conus=True,  zfill=5),
+    # Africa Albers Equal Area Conic. BF straddles UTM zones 30N/31N, so a
+    # single UTM zone would skew one side of the country.
+    "BF":    dict(adm2_col="adm_id", crs="ESRI:102022",  clip_conus=False, zfill=0),
+}
+
+# Default adm2 shapefile per AOI, so --county_shp can be omitted for known AOIs.
+_PROC_ROOT = "/Users/kdoerkse/Documents/UCT/AgImpacts"
+AOI_DEFAULT_SHP = {
+    "CONUS": f"{_PROC_ROOT}/us_county_2020_shapefile/cb_2020_us_county_20m.shp",
+    "BF":    f"{_PROC_ROOT}/cy-bench/polygons/BF/BF.shp",
+}
+
+
+def aoi_geo_config(aoi: str) -> dict:
+    if aoi not in AOI_GEO:
+        raise ValueError(
+            f"No geometry config for AOI {aoi!r}. Known: {sorted(AOI_GEO)}. "
+            "Add an entry to AOI_GEO in plot_results.py."
+        )
+    return AOI_GEO[aoi]
+
 DEFAULT_SHP = (
     "/Users/kdoerkse/Documents/UCT/AgImpacts/ir_shapefile/agglomerated-world-new.shp"
 )
@@ -152,13 +188,31 @@ def attach_state_names(states_gdf, errors):
     return states_gdf.merge(lookup, on="state_fips", how="left")
 
 
-def load_counties_geo(county_shp):
+def load_counties_geo(county_shp=None, aoi="CONUS"):
     """
-    Load a Census-style county shapefile, filter to CONUS, reproject.
-    Expects a GEOID column (5-char FIPS string).
+    Load an adm2 shapefile for `aoi`, filter and reproject per AOI_GEO.
+
+    CONUS expects a Census-style shapefile with a GEOID column (5-char FIPS);
+    cy-bench AOIs (e.g. BF) use their adm_id column, which is renamed to GEOID
+    so the downstream joins are AOI-agnostic. county_shp defaults to the known
+    shapefile for that AOI (AOI_DEFAULT_SHP).
     """
+    cfg        = aoi_geo_config(aoi)
+    county_shp = county_shp or AOI_DEFAULT_SHP.get(aoi)
+    if not county_shp:
+        raise ValueError(f"No default shapefile for AOI {aoi!r} — pass --county_shp.")
+
     gdf = gpd.read_file(county_shp)
-    return _clip_to_conus(gdf).to_crs("EPSG:5070")
+    if cfg["adm2_col"] not in gdf.columns:
+        raise ValueError(
+            f"Shapefile {county_shp!r} has no {cfg['adm2_col']!r} column "
+            f"(has {list(gdf.columns)}). Check --county_shp matches --aoi {aoi}."
+        )
+    if cfg["adm2_col"] != "GEOID":
+        gdf = gdf.rename(columns={cfg["adm2_col"]: "GEOID"})
+    if cfg["clip_conus"]:
+        gdf = _clip_to_conus(gdf)
+    return gdf.to_crs(cfg["crs"])
 
 
 # ---------------------------------------------------------------------------

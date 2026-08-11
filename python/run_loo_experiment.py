@@ -5,7 +5,7 @@ RMSE per county aggregated across all folds.
 Data is loaded once and reused across folds for efficiency.
 
 Directory layout created under --results_dir:
-    loo_{model}_{start}_{end}_{timestamp}/
+    loo_{model}_{start}_{end}_cfg-{hash}_seed{seed}_{timestamp}/
         fold_{year}/          per-fold outputs (plot_results.py compatible)
             adm2_errors.csv
             adm1_rmse.csv
@@ -13,6 +13,20 @@ Directory layout created under --results_dir:
         loo_all_errors.csv    all county × year predictions combined
         loo_county_rmse.csv   RMSE per county across folds
         loo_meta.json         experiment metadata + per-fold summary
+        run_diagnostics.json  seed, config fingerprint, environment, metrics
+        run_diagnostics.txt   the same, human-readable
+
+Seed replicates
+---------------
+Every run draws a fresh seed unless --seed is given, and records it. Runs that
+share a feature space / AOI / CV setup share a config hash (cfg-xxxxxxxx in the
+folder name), so a set of seed replicates is identifiable by folder name alone
+and can be pooled by aggregate_seed_runs.py for mean ± std reporting:
+
+    for s in 1 2 3 4 5; do
+        python run_loo_experiment.py --seed $s ...same args... ;
+    done
+    python aggregate_seed_runs.py --runs_dir /path/to/results
 
 Example:
     python run_loo_experiment.py \\
@@ -26,7 +40,10 @@ import os
 import re
 import sys
 import json
+import hashlib
+import platform
 import argparse
+import subprocess
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -38,6 +55,7 @@ from data_loader import (
     SUPPORTED_CROPS,
     TARGET_OPTIONS,
     WEATHER_VARS,
+    draw_seed,
     history_leak_mask,
     load_and_prepare,
     parse_climate_vars,
@@ -87,6 +105,157 @@ MODEL_CHOICES = SUPPORTED_MODELS + ["tst"]
 TABULAR_TARGETS = TARGET_OPTIONS              # ["yield", "yield_pct_change"]
 TST_TARGETS     = ["yield", "log_yield"]
 ALL_TARGETS     = TARGET_OPTIONS + ["log_yield"]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Run identity: config fingerprint + diagnostics
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_config_key(args, climate_vars, study_start, study_end):
+    """Everything that defines this experiment arm, EXCEPT the seed.
+
+    Two runs that differ only in --seed produce an identical config key (and so
+    an identical config hash), which is what lets aggregate_seed_runs.py pool
+    them into one mean ± std. Anything that changes the feature space, the data,
+    the AOI, the CV scheme or the model capacity must appear here — otherwise
+    runs that are not comparable would be averaged together.
+
+    --sample_seed is a *configuration* seed (it picks which counties are in the
+    study), not a training seed, so it belongs in the key: two runs over
+    different county samples are different arms.
+    """
+    key = {
+        "crop":               args.crop,
+        "model_type":         args.model_type,
+        "feature_mode":       args.feature_mode,
+        "target":             args.target,
+        "forecast_year":      args.forecast_year,
+        "aoi":                args.aoi,
+        "climate_model":      args.climate_model,
+        "ens_member":         args.ens_member,
+        "climate_vars":       list(climate_vars),
+        "preseason_buffer":   args.preseason_buffer,
+        "postharvest_buffer": args.postharvest_buffer,
+        "study_start":        study_start,
+        "study_end":          study_end,
+        "yield_history":      bool(args.yield_history),
+        "yield_history_base": args.yield_history_base,
+        "allow_history_leakage": bool(args.allow_history_leakage),
+        "use_phenology":      list(args.use_phenology) if args.use_phenology else None,
+        "phenology_suffix":   args.phenology_suffix,
+        "phenology_lag_years": args.phenology_lag_years,
+        "phenology_lookback_years": args.phenology_lookback_years,
+        "cv_scheme":          args.cv_scheme,
+        # basename only: the same lookup at a different path on another machine
+        # is still the same configuration.
+        "cell_lookup":        (os.path.basename(args.cell_lookup)
+                               if args.cell_lookup else None),
+        "region":             args.region,
+        "random_region_seed": args.random_region_seed,
+        "sample_counties":    args.sample_counties,
+        "sample_seed":        args.sample_seed,
+    }
+    if args.model_type == "tst":
+        # Model capacity / optimisation settings change the arm, but only the
+        # tst path reads them — including them for tabular runs would churn the
+        # hash whenever an unrelated PatchTST default moves.
+        key["tst_hparams"] = {
+            "patch_length": args.patch_length,
+            "patch_stride": args.patch_stride,
+            "d_model":      args.d_model,
+            "num_layers":   args.num_layers,
+            "num_heads":    args.num_heads,
+            "ffn_dim":      args.ffn_dim,
+            "attn_dropout": args.attn_dropout,
+            "head_dropout": args.head_dropout,
+            "epochs":       args.epochs,
+            "batch_size":   args.batch_size,
+            "lr":           args.lr,
+        }
+    return key
+
+
+def config_hash(config_key) -> str:
+    """Short stable fingerprint of a config key (sorted-key JSON → sha1)."""
+    blob = json.dumps(config_key, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(blob.encode()).hexdigest()[:8]
+
+
+def _git_commit():
+    """Current repo commit (short), or None outside a git checkout."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", os.path.dirname(os.path.abspath(__file__)),
+             "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip() or None if out.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _package_versions(include_torch):
+    """Versions of the libraries that affect results, best-effort."""
+    versions = {"python": platform.python_version()}
+    for mod in ["numpy", "pandas", "sklearn"] + (
+            ["torch", "transformers"] if include_torch else []):
+        try:
+            versions[mod] = __import__(mod).__version__
+        except Exception:
+            versions[mod] = None
+    return versions
+
+
+def write_diagnostics(exp_dir, diagnostics):
+    """Write run_diagnostics.json (+ a readable .txt twin) into exp_dir.
+
+    Called once before the folds run — so a crashed run still records its seed
+    and configuration — and again afterwards with the fold metrics filled in.
+    """
+    with open(os.path.join(exp_dir, "run_diagnostics.json"), "w") as f:
+        json.dump(diagnostics, f, indent=2)
+
+    lines = [
+        "LOO run diagnostics",
+        "=" * 60,
+        f"exp_id       : {diagnostics['exp_id']}",
+        f"config_hash  : {diagnostics['config_hash']}   "
+        f"(runs sharing this hash are seed replicates)",
+        f"seed         : {diagnostics['seed']}  ({diagnostics['seed_source']})",
+        f"started      : {diagnostics['started_at']}",
+        f"finished     : {diagnostics.get('finished_at') or '— (in progress)'}",
+        f"git_commit   : {diagnostics.get('git_commit')}",
+        f"host         : {diagnostics.get('host')}",
+        "",
+        "Command",
+        "-" * 60,
+        diagnostics["command"],
+        "",
+        "Configuration (defines the seed-replicate group)",
+        "-" * 60,
+    ]
+    for k, v in sorted(diagnostics["config"].items()):
+        lines.append(f"  {k:<26}: {v}")
+
+    lines += ["", "Environment", "-" * 60]
+    for k, v in sorted(diagnostics["versions"].items()):
+        lines.append(f"  {k:<26}: {v}")
+
+    results = diagnostics.get("results")
+    if results:
+        lines += ["", "Results", "-" * 60,
+                  f"  {'n_folds':<26}: {results['n_folds']}",
+                  f"  {'overall_rmse':<26}: {results['overall_rmse']:,.2f}",
+                  f"  {'overall_mae':<26}: {results['overall_mae']:,.2f}",
+                  "", f"  {'fold':>12}  {'rmse':>12}  {'r2':>8}  {'n_test':>7}"]
+        for fold in results["folds"]:
+            r2 = fold["r2"]
+            r2_str = "     nan" if r2 is None or np.isnan(r2) else f"{r2:>8.3f}"
+            lines.append(f"  {fold['fold_label']:>12}  {fold['rmse']:>12,.1f}  "
+                         f"{r2_str}  {fold['n_test']:>7}")
+
+    with open(os.path.join(exp_dir, "run_diagnostics.txt"), "w") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def _sample_dispersed_counties(adm2_df: pd.DataFrame, n: int, seed: int) -> list:
@@ -195,6 +364,16 @@ def parse_args():
     parser.add_argument(
         "--sample_seed", type=int, default=None,
         help="Random seed for --sample_counties. Required when --sample_counties is set.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Training seed for this run: sklearn random_state / PatchTST weight "
+             "init, dropout and shuffling. The same seed is used for every fold, "
+             "so one run = one replicate. Default: drawn from OS entropy, so "
+             "launching the same command 5 times gives 5 independent replicates "
+             "to average. The value used is recorded in run_diagnostics.json and "
+             "in the folder name (seed<N>) — pass it back to reproduce a run. "
+             "Distinct from --sample_seed, which picks the counties.",
     )
 
     # ── data source (used by both paths) ──
@@ -457,11 +636,12 @@ def _yield_lag_columns(feature_cols):
 
 def run_fold(adm2_df, feature_cols, all_years, fold_col, fold_value, fold_label,
              model_type, fold_dir, cv_scheme="year", forecast_year=1,
-             guard_history_leak=True):
+             guard_history_leak=True, seed=42):
     """Train a tabular model leaving out one fold (a year or a climate cell).
 
     The held-out fold is the rows where adm2_df[fold_col] == fold_value; the
-    model trains on every other row.
+    model trains on every other row. `seed` is the estimator's random_state and
+    is held constant across the folds of one run (one run = one replicate).
     """
     meta_cols   = ["adm2_id", "adm2", "adm1", "hindcast_start"]
 
@@ -492,7 +672,7 @@ def run_fold(adm2_df, feature_cols, all_years, fold_col, fold_value, fold_label,
         X_tr[lag_cols]  = hist
         X_tr[mask_cols] = hmask
 
-    model = YieldModel(model_type)
+    model = YieldModel(model_type, random_state=seed)
     model.fit(X_tr, y_tr)
     y_pred = model.predict(X_te)
 
@@ -502,6 +682,7 @@ def run_fold(adm2_df, feature_cols, all_years, fold_col, fold_value, fold_label,
             if model.feature_importances_ is not None else None
         ),
         "history_entries_masked": n_hist_masked,
+        "seed": seed,
     }
     train_years = sorted(adm2_df.loc[train_mask, "hindcast_start"].unique().tolist())
     test_years  = sorted(adm2_df.loc[test_mask,  "hindcast_start"].unique().tolist())
@@ -514,12 +695,14 @@ def run_fold(adm2_df, feature_cols, all_years, fold_col, fold_value, fold_label,
 
 def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_value,
                  fold_label, fold_dir, args, cv_scheme="year",
-                 yield_hist=None, yield_mask=None):
+                 yield_hist=None, yield_mask=None, seed=42):
     """Train PatchTST leaving out one fold (a year or a climate cell).
 
     The held-out fold is the samples where sample_meta[fold_col] == fold_value;
     the model trains on every other sample. When yield_hist/yield_mask are given
-    (row-aligned to sequences), the prior-yield branch is trained too.
+    (row-aligned to sequences), the prior-yield branch is trained too. `seed`
+    drives weight init/dropout/shuffling and is held constant across the folds
+    of one run (one run = one replicate).
     """
     _, _, train_predict_patchtst = _import_tst()
     meta_cols  = ["adm2_id", "adm2", "adm1", "hindcast_start"]
@@ -568,10 +751,12 @@ def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_valu
         ),
         train_cfg=dict(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr),
         log_target=log_target,
+        seed=seed,
         **hist_kwargs,
     )
 
     extra_meta = {
+        "seed":         seed,
         "target":       args.target,
         "patch_length": args.patch_length,
         "patch_stride": args.patch_stride,
@@ -704,6 +889,15 @@ def main():
             "(e.g. --use_phenology ndvi)."
         )
 
+    # One seed per run, used for every fold, so a run is one clean replicate.
+    seed        = args.seed if args.seed is not None else draw_seed()
+    seed_source = "explicit" if args.seed is not None else "drawn"
+
+    # Config fingerprint: identical for runs that differ only in --seed, so a
+    # replicate set is recognisable from the folder name alone.
+    cfg      = build_config_key(args, climate_vars, study_start, study_end)
+    cfg_hash = config_hash(cfg)
+
     lookback_tag = ("" if args.phenology_lookback_years == 1
                     else f"-lb{args.phenology_lookback_years}")
     pheno_tag = (("_pheno-" + "-".join(args.use_phenology) + lookback_tag)
@@ -717,12 +911,36 @@ def main():
     exp_id  = (
         f"loo_{args.crop}_{args.model_type}_{args.feature_mode}_{args.target}"
         f"{clim_tag}{hist_tag}{pheno_tag}{cv_tag}"
-        f"_{study_start}_{study_end}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        f"_{study_start}_{study_end}_cfg-{cfg_hash}_seed{seed}"
+        f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     )
     exp_dir = os.path.join(args.results_dir, exp_id)
     os.makedirs(exp_dir, exist_ok=True)
 
+    # Written now so an interrupted run still records its seed and config, then
+    # rewritten with metrics once the folds finish.
+    diagnostics = {
+        "exp_id":      exp_id,
+        "config_hash": cfg_hash,
+        "seed":        seed,
+        "seed_source": seed_source,
+        "started_at":  datetime.now().isoformat(timespec="seconds"),
+        "finished_at": None,
+        "command":     " ".join(sys.argv),
+        "data_dir":    os.path.abspath(args.data_dir),
+        "results_dir": os.path.abspath(args.results_dir),
+        "git_commit":  _git_commit(),
+        "host":        platform.node(),
+        "versions":    _package_versions(include_torch=args.model_type == "tst"),
+        "config":      cfg,
+        "results":     None,
+    }
+    write_diagnostics(exp_dir, diagnostics)
+
     print(f"Experiment      : {exp_id}")
+    print(f"Config hash     : {cfg_hash}  (seed replicates share this)")
+    print(f"Seed            : {seed}"
+          f"{'' if seed_source == 'explicit' else '  (drawn — see run_diagnostics.json)'}")
     print(f"Crop            : {args.crop}")
     print(f"Study years     : {study_start}–{study_end}  ({len(all_years)} folds, s-year)")
     print(f"Forecast year   : FY{args.forecast_year}  "
@@ -854,13 +1072,15 @@ def main():
             result = run_fold_tst(sequences, targets, sample_meta, all_years,
                                   fold_col, fold_value, fold_label, fold_dir, args,
                                   cv_scheme=args.cv_scheme,
-                                  yield_hist=yield_hist, yield_mask=yield_mask)
+                                  yield_hist=yield_hist, yield_mask=yield_mask,
+                                  seed=seed)
         else:
             result = run_fold(adm2_df, feature_cols, all_years,
                               fold_col, fold_value, fold_label,
                               args.model_type, fold_dir, cv_scheme=args.cv_scheme,
                               forecast_year=args.forecast_year,
-                              guard_history_leak=not args.allow_history_leakage)
+                              guard_history_leak=not args.allow_history_leakage,
+                              seed=seed)
         if result is None:
             continue
         fold_meta, errors = result
@@ -894,6 +1114,9 @@ def main():
 
     exp_meta = {
         "exp_id":             exp_id,
+        "config_hash":        cfg_hash,
+        "seed":               seed,
+        "seed_source":        seed_source,
         "crop":               args.crop,
         "target":             args.target,
         "region":             region,
@@ -924,6 +1147,21 @@ def main():
     with open(os.path.join(exp_dir, "loo_meta.json"), "w") as f:
         json.dump(exp_meta, f, indent=2)
 
+    diagnostics["finished_at"] = datetime.now().isoformat(timespec="seconds")
+    diagnostics["results"] = {
+        "n_folds":      len(fold_metas),
+        "overall_rmse": overall_rmse,
+        "overall_mae":  overall_mae,
+        "n_counties":   int(all_errors["adm2_id"].nunique()),
+        "n_samples":    int(len(all_errors)),
+        "folds": [
+            {"fold_label": fm["fold_label"], "rmse": fm["rmse_overall"],
+             "r2": fm["r2_overall"], "n_test": fm["n_test"]}
+            for fm in fold_metas
+        ],
+    }
+    write_diagnostics(exp_dir, diagnostics)
+
     # Summary
     print(f"\n{'='*60}")
     print(f"LOO experiment complete — {args.model_type.upper()} {study_start}–{study_end}")
@@ -945,9 +1183,15 @@ def main():
     print(f"{'':>10}  {overall_mae:>10,.0f}  {'':>6}  (LOO MAE  across all folds)")
     print(f"\nCounty RMSE saved to: {exp_dir}/loo_county_rmse.csv")
     print(f"All errors saved to:  {exp_dir}/loo_all_errors.csv")
+    print(f"Diagnostics saved to: {exp_dir}/run_diagnostics.json (seed={seed})")
     print(
         f"\nTo plot a single fold:\n"
         f"  python plot_results.py --save_dir {exp_dir}/fold_<year> [--county_shp ...]"
+    )
+    print(
+        f"\nTo pool seed replicates of this configuration (cfg-{cfg_hash}):\n"
+        f"  python aggregate_seed_runs.py --runs_dir {args.results_dir} "
+        f"--config_hash {cfg_hash}"
     )
 
 

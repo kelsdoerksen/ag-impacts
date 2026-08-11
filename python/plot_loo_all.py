@@ -65,9 +65,10 @@ def parse_args():
     )
     p.add_argument(
         "--metrics", nargs="+", default=["rmse", "mae"],
-        choices=["rmse", "mae", "n_obs"],
+        choices=["rmse", "mae", "n_obs", "rmse_std"],
         help="Which experiment-level county maps to draw from loo_county_rmse.csv. "
-             "Default: rmse mae.",
+             "Default: rmse mae. 'rmse_std' (across-seed spread) only exists when "
+             "--exp_dir is an aggregate_seed_runs.py output folder.",
     )
     p.add_argument(
         "--skip_folds", action="store_true",
