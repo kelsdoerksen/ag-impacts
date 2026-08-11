@@ -51,6 +51,13 @@ COUNTRY_CONFIG <- list(
     crop       = "corn",
     aoi        = "BF",
     out_dir    = file.path(proc_root, "BF_processed_data")
+  ),
+  ET = list(
+    cy_country = "ET",
+    cy_crop    = "maize",
+    crop       = "corn",
+    aoi        = "ET",
+    out_dir    = file.path(proc_root, "ET_preprocessed_data")
   )
 )
 

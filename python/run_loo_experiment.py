@@ -408,9 +408,12 @@ def parse_args():
                         help="Oldest calendar year of yield history to include "
                              "(default: earliest year in the crop data).")
     parser.add_argument("--aoi", type=str, default="CONUS",
-                        help="Area-of-interest tag in the crop filename "
-                             "(crop_<crop>_<aoi>.parquet). E.g. 'CONUS' or 'germany'. "
-                             "tst path only. Default: CONUS.")
+                        help="Area-of-interest tag in the data filenames: "
+                             "crop_<crop>_<aoi>.parquet, the climate parquets "
+                             "(climate_<aoi>_<model>_s<year>-<ens>.parquet; the "
+                             "original CONUS series has no AOI token) and, unless "
+                             "--phenology_suffix says otherwise, the phenology "
+                             "parquets. E.g. 'CONUS', 'ET', 'BF'. Default: CONUS.")
     parser.add_argument("--use_phenology", type=_parse_phenology_arg, default=None,
                         metavar="VARS",
                         help="Comma-separated CY-Bench phenology variables to add "

@@ -2,8 +2,10 @@
 Load, merge, and featurise climate + crop parquets for yield model training.
 
 Expected files in data_dir:
-  Climate:  climate_{climate_model}_s{hindcast_start}_{ens_member}.parquet
-  Crop:     crop_{crop}_CONUS.parquet
+  Climate:  {climate_model}/climate_{aoi}_{climate_model}_s{hindcast_start}-{ens_member}.parquet
+            (the original CONUS series omits the AOI token; see "Climate file
+            resolution" below for every convention accepted)
+  Crop:     crop_{crop}_{aoi}.parquet
 
 Two feature modes
 -----------------
@@ -29,7 +31,7 @@ load_crop_climate_data(…)  → daily DataFrame            raw merged daily dat
 aggregate_daily(daily_df)  → (adm2_df, weather_cols)   seasonal aggregation
 build_features(adm2_df, …) → (adm2_df, feature_cols)   drop-NaN step
 build_timeseries_features  → (adm2_df, feature_cols)   pivoted daily features
-available_crops(data_dir)  → list[str]
+available_crops(data_dir, aoi) → list[str]
 parse_climate_vars(str)    → list[str]                 --climate_vars parsing
 history_leak_mask(...)     → ndarray (N, L) bool       held-out labels in history
 draw_seed()                → int                       fresh OS-entropy run seed
@@ -179,12 +181,171 @@ def _parse_hindcast_year(filepath: str) -> int:
     return int(m.group(1))
 
 
-def available_crops(data_dir: str) -> list[str]:
-    """List crop names that have a crop_{name}_CONUS.parquet in data_dir."""
-    files = glob.glob(os.path.join(data_dir, "crop_*_CONUS.parquet"))
+# ---------------------------------------------------------------------------
+# Climate file resolution
+# ---------------------------------------------------------------------------
+#
+# Climate parquets have accumulated several naming conventions:
+#
+#   climate_{model}_s{year}-{ens}.parquet          original CONUS FY1 series
+#   climate_{aoi}_{model}_s{year}-{ens}.parquet    AOI series with ens suffix
+#   climate_{aoi}_{model}_fy{n}_s{year}.parquet    AOI series, forecast-year tag
+#
+# All three are accepted, most specific first. The AOI is matched explicitly so
+# a non-CONUS run can never silently pick up the CONUS series (or another AOI's)
+# out of a shared folder — that would train on the wrong region's weather while
+# looking perfectly healthy.
+
+# AOI tags naming the original CONUS series, whose FY1 files predate the
+# AOI-in-filename convention and therefore carry no AOI token.
+CONUS_ALIASES = {"CONUS", "USA", "US"}
+
+
+def _is_conus(aoi: str) -> bool:
+    return str(aoi).upper() in CONUS_ALIASES
+
+
+def climate_dir(data_dir: str, climate_model: str, forecast_year: int = 1) -> str:
+    """Folder holding the climate parquets for one forecast-year product.
+
+    FY1 lives in {data_dir}/{climate_model}/; later forecast years get their own
+    {data_dir}/FY{n}/ folder.
+    """
+    return os.path.join(
+        data_dir, climate_model if forecast_year == 1 else f"FY{forecast_year}")
+
+
+def climate_name_candidates(climate_model: str, ens_member: str, aoi: str,
+                            forecast_year: int = 1, year="*") -> list[str]:
+    """Ordered basename patterns for one hindcast year's climate parquet.
+
+    `year` may be a literal year or "*" to build glob patterns for a whole
+    series. AOI-tagged names come first; the AOI-less legacy name is offered
+    only for CONUS, so other AOIs cannot resolve to it.
+    """
+    fy = forecast_year
+    if fy == 1:
+        names = [
+            f"climate_{aoi}_{climate_model}_s{year}-{ens_member}.parquet",
+            f"climate_{aoi}_{climate_model}_fy1_s{year}.parquet",
+            f"climate_{aoi}_{climate_model}_s{year}.parquet",
+        ]
+        if _is_conus(aoi):
+            names += [
+                f"climate_{climate_model}_s{year}-{ens_member}.parquet",
+                f"climate_{climate_model}_s{year}.parquet",
+            ]
+    else:
+        names = [
+            f"climate_{aoi}_{climate_model}_fy{fy}_s{year}.parquet",
+            f"climate_{aoi}_{climate_model}_fy{fy}_s{year}-{ens_member}.parquet",
+        ]
+        if _is_conus(aoi):
+            names.append(f"climate_{climate_model}_fy{fy}_s{year}.parquet")
+    return names
+
+
+def _aoi_prefix_ok(basename: str, climate_model: str, aoi: str) -> bool:
+    """Does this filename belong to `aoi`?
+
+    Non-CONUS AOIs must carry their tag as the segment right after 'climate_'.
+    CONUS accepts its own tag or the legacy AOI-less form (climate_{model}_…),
+    but not a file tagged with some other AOI.
+    """
+    if basename.startswith(f"climate_{aoi}_"):
+        return True
+    if not _is_conus(aoi):
+        return False
+    return (basename.startswith(f"climate_{climate_model}")
+            or any(basename.startswith(f"climate_{a}_") for a in CONUS_ALIASES))
+
+
+def _climate_dir_listing(cdir: str, limit: int = 8) -> str:
+    """A short 'what is actually in there' hint for error messages."""
+    if not os.path.isdir(cdir):
+        return f"    (directory does not exist: {cdir})"
+    found = sorted(os.path.basename(p)
+                   for p in glob.glob(os.path.join(cdir, "*.parquet")))
+    if not found:
+        return "    (no .parquet files in that directory)"
+    shown = "\n".join(f"    {n}" for n in found[:limit])
+    if len(found) > limit:
+        shown += f"\n    … and {len(found) - limit} more"
+    return shown
+
+
+def find_climate_file(data_dir: str, climate_model: str, year: int,
+                      ens_member: str = "r1i4p1f1", aoi: str = "CONUS",
+                      forecast_year: int = 1) -> str:
+    """Locate the climate parquet for one hindcast year, honouring the AOI.
+
+    Tries every known naming convention for `aoi` in order, then falls back to
+    any parquet in the folder that carries both this AOI and an _s{year} token.
+    Raises FileNotFoundError listing what was tried and what is present.
+    """
+    cdir = climate_dir(data_dir, climate_model, forecast_year)
+    candidates = climate_name_candidates(
+        climate_model, ens_member, aoi, forecast_year, year)
+
+    for name in candidates:
+        path = os.path.join(cdir, name)
+        if os.path.exists(path):
+            return path
+
+    # Fallback: an unanticipated variant of the name, but still this AOI and year.
+    year_re = re.compile(rf"(?:^|[_-])s{year}(?:[^0-9]|$)")
+    loose = sorted(
+        p for p in glob.glob(os.path.join(cdir, "*.parquet"))
+        if year_re.search(os.path.basename(p))
+        and _aoi_prefix_ok(os.path.basename(p), climate_model, aoi)
+    )
+    if loose:
+        return loose[0]
+
+    raise FileNotFoundError(
+        f"No climate parquet for AOI {aoi!r}, year {year} in {cdir!r}.\n"
+        f"  Tried:\n" + "".join(f"    {n}\n" for n in candidates) +
+        f"  Present in that directory:\n{_climate_dir_listing(cdir)}\n"
+        f"  Check --data_dir, --climate_model, --ens_member, --aoi and the year range."
+    )
+
+
+def find_climate_files(data_dir: str, climate_model: str,
+                       ens_member: str = "r1i4p1f1", aoi: str = "CONUS",
+                       forecast_year: int = 1,
+                       hindcast_years: list | None = None) -> list[str]:
+    """Locate the climate parquets for a whole series, one per hindcast year.
+
+    With hindcast_years given, each year is resolved individually (so a series
+    whose naming changed partway through still loads). Without it, every file
+    in the folder belonging to this AOI is returned.
+    """
+    if hindcast_years is not None:
+        return [find_climate_file(data_dir, climate_model, y, ens_member,
+                                  aoi, forecast_year)
+                for y in sorted(hindcast_years)]
+
+    cdir  = climate_dir(data_dir, climate_model, forecast_year)
+    found = {}
+    for pattern in climate_name_candidates(
+            climate_model, ens_member, aoi, forecast_year, year="*"):
+        for path in sorted(glob.glob(os.path.join(cdir, pattern))):
+            # First (most specific) pattern to claim a year wins.
+            found.setdefault(_parse_hindcast_year(path), path)
+    if not found:
+        raise FileNotFoundError(
+            f"No climate parquets for AOI {aoi!r} in {cdir!r}.\n"
+            f"  Present in that directory:\n{_climate_dir_listing(cdir)}"
+        )
+    return [found[y] for y in sorted(found)]
+
+
+def available_crops(data_dir: str, aoi: str = "CONUS") -> list[str]:
+    """List crop names that have a crop_{name}_{aoi}.parquet in data_dir."""
+    files = glob.glob(os.path.join(data_dir, f"crop_*_{aoi}.parquet"))
     crops = []
     for f in files:
-        m = re.search(r"crop_(.+)_CONUS\.parquet", os.path.basename(f))
+        m = re.search(rf"crop_(.+)_{re.escape(aoi)}\.parquet", os.path.basename(f))
         if m:
             crops.append(m.group(1))
     return sorted(crops)
@@ -500,12 +661,14 @@ def load_crop_climate_data(
         [Nov 1 of yield year − 1,  Nov 1 of yield year]
 
     forecast_year selects which lead-year climate product to use:
-        1 (default) — {data_dir}/{climate_model}/climate_{climate_model}_s*-{ens_member}.parquet
-                      (s{Y-1} run, forecasts calendar year Y = hindcast_start + 1)
-        2           — {data_dir}/FY2/climate_{aoi}_{climate_model}_fy2_s*.parquet
-                      (s{Y-2} run, forecasts calendar year Y = hindcast_start + 2)
+        1 (default) — {data_dir}/{climate_model}/  (s{Y-1} run, forecasts
+                      calendar year Y = hindcast_start + 1)
+        2           — {data_dir}/FY2/             (s{Y-2} run, forecasts
+                      calendar year Y = hindcast_start + 2)
     In both cases the target (yield) year is hindcast_start + forecast_year, and
-    the crop yield is matched on that target year.
+    the crop yield is matched on that target year. Filenames are resolved by
+    find_climate_files, which accepts every naming convention in use and matches
+    the AOI explicitly — see the "Climate file resolution" section above.
 
     Returns a daily DataFrame with columns:
         adm2_id, adm2, adm1, hindcast_start, yield_year, date, doy,
@@ -516,26 +679,10 @@ def load_crop_climate_data(
         raise ValueError(f"feature_mode must be one of {FEATURE_MODES}")
 
     # ---- climate ----
-    # Forecast year 1 (standard) lives under {data_dir}/{climate_model}/ and
-    # carries the ens_member in the filename; forecast year >1 products live in
-    # their own {data_dir}/FY{n}/ folder and are named per-AOI without ens_member.
-    if forecast_year == 1:
-        pattern = os.path.join(
-            data_dir, f"{climate_model}/climate_{climate_model}_s*-{ens_member}.parquet")
-    else:
-        pattern = os.path.join(
-            data_dir, f"FY{forecast_year}",
-            f"climate_{aoi}_{climate_model}_fy{forecast_year}_s*.parquet")
-    files   = sorted(glob.glob(pattern))
-    if not files:
-        raise FileNotFoundError(f"No climate parquets found matching {pattern!r}")
-    if hindcast_years is not None:
-        hset  = set(hindcast_years)
-        files = [f for f in files if _parse_hindcast_year(f) in hset]
-        if not files:
-            raise FileNotFoundError(
-                f"No climate parquets matched hindcast_years={hindcast_years}"
-            )
+    # Resolved per hindcast year and per AOI, so a folder holding more than one
+    # AOI's series cannot cross-contaminate a run.
+    files = find_climate_files(data_dir, climate_model, ens_member, aoi,
+                               forecast_year, hindcast_years)
 
     print(f"Loading {len(files)} climate parquet(s) (forecast year {forecast_year})...")
     climate_df = pd.concat([_read_parquet(f) for f in files], ignore_index=True)
@@ -552,11 +699,11 @@ def load_crop_climate_data(
     )
 
     # ---- crop ----
-    crop_file = os.path.join(data_dir, f"crop_{crop}_CONUS.parquet")
+    crop_file = os.path.join(data_dir, f"crop_{crop}_{aoi}.parquet")
     if not os.path.exists(crop_file):
         raise FileNotFoundError(
             f"Crop parquet not found: {crop_file!r}\n"
-            f"Available crops: {available_crops(data_dir)}"
+            f"Available crops for AOI {aoi!r}: {available_crops(data_dir, aoi)}"
         )
     crop_df = _read_parquet(crop_file)
     crop_df = _apply_target(crop_df, target)

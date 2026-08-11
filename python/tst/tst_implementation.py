@@ -24,9 +24,11 @@ Reference: https://huggingface.co/blog/patchtst
 
 Data files expected under --data_dir
 --------------------------------------
-  {data_dir}/{climate_model}/climate_{climate_model}_s{year}-{ens_member}.parquet
-      Daily climate (one file per hindcast year, 366 rows per county)
-  {data_dir}/crop_{crop}_CONUS.parquet
+  {data_dir}/{climate_model}/climate_{aoi}_{climate_model}_s{year}-{ens_member}.parquet
+      Daily climate (one file per hindcast year, 366 rows per county). The
+      original CONUS series omits the AOI token; other conventions are accepted
+      too — see "Climate file resolution" in data_loader.py.
+  {data_dir}/crop_{crop}_{aoi}.parquet
       Annual yield per county (one row per (county, hindcast_start))
 
 Usage modes
@@ -52,7 +54,6 @@ with the files produced by parquet-cpp-arrow 23.x).
 """
 
 import argparse
-import glob
 import json
 import os
 import sys
@@ -81,6 +82,7 @@ from data_loader import (
     PHENOLOGY_CHANNELS,
     build_yield_history_matrix,
     draw_seed,
+    find_climate_file,
     load_county_yield_series,
     parse_climate_vars,
     phenology_lag_suffix,
@@ -177,44 +179,15 @@ def _find_climate_file(
     data_dir: str, climate_model: str, year: int, ens_member: str,
     forecast_year: int = 1, aoi: str = "CONUS",
 ) -> str:
-    """Locate the climate parquet for one hindcast year, tolerating AOI naming.
+    """Locate the climate parquet for one hindcast year, honouring the AOI.
 
-    Forecast year 1 (standard) files live under {data_dir}/{climate_model}/:
-    CONUS files are named climate_{climate_model}_s{year}-{ens_member}.parquet;
-    other AOIs (e.g. Germany) use climate_{aoi}_{climate_model}_s{year}.parquet
-    with no ensemble suffix. Try the exact CONUS name first, then fall back to
-    any parquet in the climate_model dir whose name carries the year token.
-
-    Forecast year >1 products live in their own {data_dir}/FY{n}/ folder and
-    are named climate_{aoi}_{climate_model}_fy{n}_s{year}.parquet.
+    Thin wrapper over data_loader.find_climate_file so the sequence path and the
+    tabular path resolve filenames identically — see the "Climate file
+    resolution" section in data_loader.py for the conventions accepted.
     """
-    if forecast_year != 1:
-        fdir  = os.path.join(data_dir, f"FY{forecast_year}")
-        exact = os.path.join(
-            fdir, f"climate_{aoi}_{climate_model}_fy{forecast_year}_s{year}.parquet")
-        if os.path.exists(exact):
-            return exact
-        matches = sorted(glob.glob(os.path.join(fdir, f"*fy{forecast_year}_s{year}*.parquet")))
-        if matches:
-            return matches[0]
-        raise FileNotFoundError(
-            f"No FY{forecast_year} climate parquet for year {year} in {fdir!r} "
-            f"(tried {os.path.basename(exact)!r}). "
-            "Check --data_dir, --climate_model, --aoi, and year range."
-        )
-
-    cdir  = os.path.join(data_dir, climate_model)
-    exact = os.path.join(cdir, f"climate_{climate_model}_s{year}-{ens_member}.parquet")
-    if os.path.exists(exact):
-        return exact
-    matches = sorted(glob.glob(os.path.join(cdir, f"*s{year}*.parquet")))
-    if matches:
-        return matches[0]
-    raise FileNotFoundError(
-        f"No climate parquet for year {year} in {cdir!r} "
-        f"(tried exact name {os.path.basename(exact)!r} then *s{year}*.parquet). "
-        "Check --data_dir, --climate_model, and year range."
-    )
+    return find_climate_file(data_dir, climate_model, year,
+                             ens_member=ens_member, aoi=aoi,
+                             forecast_year=forecast_year)
 
 
 def _merge_phenology(
