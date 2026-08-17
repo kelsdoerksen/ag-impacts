@@ -133,6 +133,28 @@ def resolve_climate_vars(climate_vars: list | None) -> list[str]:
 # Target helpers
 # ---------------------------------------------------------------------------
 
+def drop_invalid_yield(df: pd.DataFrame, context: str = "") -> pd.DataFrame:
+    """Drop rows whose observed yield is missing or non-positive.
+
+    The cy-bench yield files encode "no crop was harvested here" as yield 0 with
+    harvest_area/production of 0 or NaN — whole countries (FI, IE, EE, LV) are
+    nothing but such rows. They are structural zeros, not bad harvests: in the
+    CONUS parquet the 1st percentile of positive yields is ~940 kg/ha against a
+    median of ~5,600, so a 0 is a different kind of record rather than the left
+    tail of the distribution. Training on them teaches the model that a county
+    produced nothing, and log(0) = -inf makes --target log_yield diverge on the
+    first optimizer step.
+    """
+    n_before = len(df)
+    out      = df[df["yield"].notna() & (df["yield"] > 0)].copy()
+    n_zero   = int((df["yield"].notna() & (df["yield"] <= 0)).sum())
+    if n_zero:
+        where = f" [{context}]" if context else ""
+        print(f"[data]{where} Dropped {n_zero:,} rows with non-positive yield "
+              f"(of {n_before:,}); these are 'no crop harvested' records.")
+    return out
+
+
 def _apply_target(crop_df: pd.DataFrame, target: str) -> pd.DataFrame:
     """Overwrite the 'yield' column with the requested target variable.
 
@@ -375,7 +397,7 @@ def load_county_yield_series(data_dir: str, crop: str, aoi: str = "CONUS") -> pd
             f"Crop parquet not found for yield history: {path!r}. Check --crop/--aoi."
         )
     df = _read_parquet(path)[["adm2_id", "hindcast_start", "yield"]].copy()
-    df = df.dropna(subset=["yield"])
+    df = drop_invalid_yield(df, context="yield history")
     df["cal_year"] = df["hindcast_start"].astype(int) + 1
     return (
         df[["adm2_id", "cal_year", "yield"]]
@@ -706,6 +728,11 @@ def load_crop_climate_data(
             f"Available crops for AOI {aoi!r}: {available_crops(data_dir, aoi)}"
         )
     crop_df = _read_parquet(crop_file)
+    # Filter structural zeros on the RAW yield, before _apply_target — once the
+    # target is yield_pct_change the column holds percent changes, which are
+    # legitimately negative. Doing it first also stops pct_change dividing by a
+    # zero prior year.
+    crop_df = drop_invalid_yield(crop_df, context=f"{crop}/{aoi}")
     crop_df = _apply_target(crop_df, target)
     # Crop yield is keyed by hindcast_start under the FY1 convention, i.e. it is
     # the yield for calendar year hindcast_start + 1. Express that as target_year

@@ -117,10 +117,17 @@ def parse_args():
         help="Global shapefile (ISO + hierid columns) for state-level maps.",
     )
     parser.add_argument(
+        "--aoi", type=str, default="CONUS", choices=sorted(AOI_GEO),
+        help="AOI whose adm2 geometry to draw. Selects the id column, "
+             "projection and default shapefile. Non-CONUS AOIs skip the "
+             "US-FIPS-keyed admin1 maps. Default: CONUS.",
+    )
+    parser.add_argument(
         "--county_shp", type=str, default=None,
         help=(
-            "Census-style county shapefile with a GEOID column (e.g. "
-            "cb_2020_us_county_20m.shp from tigris). Required for admin2 maps."
+            "adm2 shapefile. Optional — defaults to the known file for --aoi "
+            "(CONUS: cb_2020_us_county_20m.shp from tigris, with a GEOID "
+            "column; BF: cy-bench/polygons/BF/BF.shp). Required for admin2 maps."
         ),
     )
     parser.add_argument(
@@ -138,7 +145,7 @@ def parse_args():
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_run(save_dir):
+def load_run(save_dir, aoi="CONUS"):
     meta_path = os.path.join(save_dir, "run_meta.json")
     if not os.path.exists(meta_path):
         raise FileNotFoundError(
@@ -148,8 +155,12 @@ def load_run(save_dir):
         meta = json.load(f)
     adm1_rmse = pd.read_csv(os.path.join(save_dir, "adm1_rmse.csv"))
     errors    = pd.read_csv(os.path.join(save_dir, "adm2_errors.csv"))
-    # Ensure adm2_id is a zero-padded 5-char string to match GEOID
-    errors["adm2_id"] = errors["adm2_id"].astype(str).str.zfill(5)
+    # US FIPS codes lose their leading zero through CSV round-trips, so re-pad
+    # them to match GEOID. cy-bench ids are alphanumeric (zfill=0) — leave them.
+    zfill = aoi_geo_config(aoi)["zfill"]
+    errors["adm2_id"] = errors["adm2_id"].astype(str)
+    if zfill:
+        errors["adm2_id"] = errors["adm2_id"].str.zfill(zfill)
     return meta, adm1_rmse, errors
 
 
@@ -520,6 +531,12 @@ def plot_yield_density(errors: pd.DataFrame, save_dir: str) -> None:
     y_true = errors["y_true"].values
     y_pred = errors["y_pred"].values
 
+    # gaussian_kde needs a spread of points; thin folds (e.g. a BF year with a
+    # single reporting adm2) have nothing to estimate a density from.
+    if len(y_true) < 3 or np.ptp(y_true) == 0 or np.ptp(y_pred) == 0:
+        print(f"  yield_density.png — skipped (only {len(y_true)} test point(s))")
+        return
+
     xs        = np.linspace(min(y_true.min(), y_pred.min()),
                             max(y_true.max(), y_pred.max()), 600)
     dens_true = gaussian_kde(y_true)(xs)
@@ -554,7 +571,7 @@ def plot_yield_density(errors: pd.DataFrame, save_dir: str) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-def plot_fold(save_dir, states_gdf, counties_gdf=None, n_bins=10):
+def plot_fold(save_dir, states_gdf, counties_gdf=None, n_bins=10, aoi="CONUS"):
     """Generate the full plot suite for one fold/run into save_dir.
 
     Takes pre-loaded shapefiles so a batch caller (plot_loo_all.py) can load
@@ -571,12 +588,21 @@ def plot_fold(save_dir, states_gdf, counties_gdf=None, n_bins=10):
         County geometries from load_counties_geo, or None to skip admin2 maps.
     n_bins : int
         Observed-yield bins for the bin analysis.
+    aoi : str
+        AOI key from AOI_GEO. Controls adm2_id padding and whether the
+        admin1 (state) maps run — those are keyed off US FIPS codes and are
+        skipped for the cy-bench AOIs.
     """
-    meta, adm1_rmse, errors = load_run(save_dir)
+    meta, adm1_rmse, errors = load_run(save_dir, aoi=aoi)
 
-    # Drop Hawaii (state FIPS 15) from all outputs
-    errors    = errors[errors["adm2_id"].str[:2] != "15"].copy()
-    adm1_rmse = adm1_rmse[adm1_rmse["adm1"] != "Hawaii"].copy()
+    if aoi == "CONUS":
+        # Drop Hawaii (state FIPS 15) from all outputs
+        errors    = errors[errors["adm2_id"].str[:2] != "15"].copy()
+        adm1_rmse = adm1_rmse[adm1_rmse["adm1"] != "Hawaii"].copy()
+    else:
+        # The admin1 maps derive state_fips from the first two digits of
+        # adm2_id, which only exists for US FIPS ids.
+        states_gdf = None
 
     # State geometries are optional: skip admin1 maps / state borders when the
     # global shapefile isn't available (e.g. county-only CONUS runs on an HPC).
@@ -635,18 +661,23 @@ def plot_fold(save_dir, states_gdf, counties_gdf=None, n_bins=10):
     print(f"\nAll plots saved to {save_dir}/")
 
 
-def load_plot_geometries(shp_path, country, county_shp):
+def load_plot_geometries(shp_path, country, county_shp, aoi="CONUS"):
     """Load the state (required) and optional county shapefiles for plotting.
 
     Returns (states_gdf, counties_gdf); either may be None. The state shapefile
     is optional — if shp_path is missing or doesn't exist, state-level (admin1)
     maps are skipped rather than raising (e.g. county-only CONUS runs on an HPC
-    that doesn't have the global shapefile). Shared by the single-fold CLI and
-    the batch runner so both load the shapefiles the same way — and, for the
-    batch runner, exactly once.
+    that doesn't have the global shapefile). The admin1 maps are US-only, so
+    they are skipped outright for the non-CONUS AOIs. county_shp falls back to
+    the known shapefile for the AOI when it exists on disk. Shared by the
+    single-fold CLI and the batch runner so both load the shapefiles the same
+    way — and, for the batch runner, exactly once.
     """
     states_gdf = None
-    if shp_path and os.path.exists(shp_path):
+    if aoi != "CONUS":
+        print(f"AOI {aoi}: skipping state-level (admin1) maps "
+              "(they are keyed off US FIPS codes).")
+    elif shp_path and os.path.exists(shp_path):
         print(f"Loading global shapefile: {shp_path}")
         states_gdf = load_states_geo(shp_path, country)
         print(f"States loaded: {len(states_gdf)}")
@@ -655,20 +686,23 @@ def load_plot_geometries(shp_path, country, county_shp):
               "skipping state-level (admin1) maps. Pass --shp_path to enable them.")
 
     counties_gdf = None
-    if county_shp:
+    county_shp = county_shp or AOI_DEFAULT_SHP.get(aoi)
+    if county_shp and os.path.exists(county_shp):
         print(f"Loading county shapefile: {county_shp}")
-        counties_gdf = load_counties_geo(county_shp)
-        print(f"Counties loaded: {len(counties_gdf)}")
+        counties_gdf = load_counties_geo(county_shp, aoi=aoi)
+        print(f"Admin-2 units loaded: {len(counties_gdf)}")
     else:
-        print("No --county_shp provided; skipping county (admin2) maps.")
+        print(f"No adm2 shapefile for AOI {aoi} ({county_shp!r}); "
+              "skipping county (admin2) maps. Pass --county_shp to enable them.")
     return states_gdf, counties_gdf
 
 
 def main():
     args = parse_args()
     states_gdf, counties_gdf = load_plot_geometries(
-        args.shp_path, args.country, args.county_shp)
-    plot_fold(args.save_dir, states_gdf, counties_gdf, n_bins=args.n_bins)
+        args.shp_path, args.country, args.county_shp, aoi=args.aoi)
+    plot_fold(args.save_dir, states_gdf, counties_gdf,
+              n_bins=args.n_bins, aoi=args.aoi)
 
 
 if __name__ == "__main__":

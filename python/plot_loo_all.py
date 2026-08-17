@@ -15,6 +15,9 @@ Usage
         --exp_dir    /home/crl/kdoerksen/results/loo_corn_tst_aggregated_yield_pheno-ndvi_1980_2020_20260728_214113 \\
         --county_shp /path/to/cb_2020_us_county_20m.shp
 
+    python plot_loo_all.py --aoi BF \\
+        --exp_dir    /path/to/results/BF/loo_corn_tst_..._2002_2018_<ts>
+
 Notes
 -----
 - Folds with no data (e.g. pre-2002 years when NDVI is used) have no fold_<year>/
@@ -29,6 +32,7 @@ import re
 import traceback
 
 from plot_results import (
+    AOI_GEO,
     DEFAULT_SHP,
     load_plot_geometries,
     plot_fold,
@@ -51,9 +55,16 @@ def parse_args():
         help="Global shapefile (ISO + hierid columns) for state-level maps.",
     )
     p.add_argument(
+        "--aoi", type=str, default="CONUS", choices=sorted(AOI_GEO),
+        help="AOI whose adm2 geometry to draw. Selects the id column, "
+             "projection and default shapefile. Non-CONUS AOIs skip the "
+             "US-FIPS-keyed admin1 maps. Default: CONUS.",
+    )
+    p.add_argument(
         "--county_shp", type=str, default=None,
-        help="Census-style county shapefile with a GEOID column. Required for "
-             "admin2 (county) maps and the experiment-level county map.",
+        help="adm2 shapefile. Optional — defaults to the known file for --aoi "
+             "(CONUS: cb_2020_us_county_20m.shp, BF: cy-bench/polygons/BF/BF.shp). "
+             "Required for admin2 (county) maps and the experiment-level map.",
     )
     p.add_argument(
         "--country", type=str, default="USA",
@@ -96,7 +107,7 @@ def main():
 
     # Load shapefiles once and reuse for every fold.
     states_gdf, counties_gdf = load_plot_geometries(
-        args.shp_path, args.country, args.county_shp)
+        args.shp_path, args.country, args.county_shp, aoi=args.aoi)
 
     n_ok = 0
     failures = []
@@ -111,7 +122,8 @@ def main():
                 continue
             print(f"\n{'=' * 70}\n[{name}]")
             try:
-                plot_fold(d, states_gdf, counties_gdf, n_bins=args.n_bins)
+                plot_fold(d, states_gdf, counties_gdf,
+                          n_bins=args.n_bins, aoi=args.aoi)
                 n_ok += 1
             except Exception as exc:  # keep going through the batch
                 print(f"  [error] {name}: {exc}")
@@ -125,7 +137,7 @@ def main():
         for metric in args.metrics:
             try:
                 exp_maps.append(plot_loo_county_map(args.exp_dir, counties_gdf,
-                                                    metric=metric))
+                                                    metric=metric, aoi=args.aoi))
             except Exception as exc:
                 print(f"  [error] experiment {metric} map: {exc}")
                 failures.append((f"exp:{metric}", str(exc)))

@@ -82,6 +82,7 @@ from data_loader import (
     PHENOLOGY_CHANNELS,
     build_yield_history_matrix,
     draw_seed,
+    drop_invalid_yield,
     find_climate_file,
     load_county_yield_series,
     parse_climate_vars,
@@ -342,13 +343,12 @@ def load_climate_crop_data(
     crop_df["hindcast_start"] = crop_df["hindcast_start"].astype(int)
     crop_df["target_year"]    = crop_df["hindcast_start"] + 1
     target_years = {y + forecast_year for y in hindcast_years}
-    crop_subset = (
+    crop_subset = drop_invalid_yield(
         crop_df[crop_df["target_year"].isin(target_years)][
             ["adm2_id", "target_year", "yield"]
-        ]
-        .dropna(subset=["yield"])
-        .reset_index(drop=True)
-    )
+        ],
+        context="tst crop subset",
+    ).reset_index(drop=True)
     if crop_subset.empty:
         raise ValueError(
             f"No yield data found for target years {sorted(target_years)} in {crop_path!r}."
@@ -461,7 +461,10 @@ def build_sequence_array(
         row = meta_map.loc[(adm2_id, hindcast_start)]
         county_yield = float(row["yield"])
 
-        if np.isnan(seq).any() or np.isnan(county_yield):
+        # county_yield <= 0 is a "no crop harvested" record; it also makes
+        # log(y) non-finite under --target log_yield. Guard here as well as in
+        # the loader so the builder fails safe whatever it is handed.
+        if np.isnan(seq).any() or not county_yield > 0:
             n_skipped += 1
             continue
 
@@ -554,7 +557,23 @@ class YieldSequenceDataset(Dataset):
         self.log_target = log_target
         self.sequences  = torch.tensor(sequences, dtype=torch.float32)
         t = torch.tensor(targets, dtype=torch.float32)
+        if log_target and not bool((t > 0).all()):
+            bad = int((t <= 0).sum())
+            raise ValueError(
+                f"--target log_yield requires strictly positive yields, but "
+                f"{bad} of {t.numel()} targets are <= 0 (min {float(t.min()):.4g}). "
+                "log(0) is -inf, which makes the loss and every weight NaN on the "
+                "first optimizer step. These are 'no crop harvested' records — "
+                "they should have been removed by drop_invalid_yield()."
+            )
         self.targets = torch.log(t) if log_target else t
+        if not bool(torch.isfinite(self.targets).all()):
+            bad = int((~torch.isfinite(self.targets)).sum())
+            raise ValueError(
+                f"{bad} of {self.targets.numel()} targets are not finite after "
+                f"{'log ' if log_target else ''}transform. Training would produce "
+                "NaN predictions and fail at the metrics step."
+            )
         self.yield_history = (torch.tensor(yield_history, dtype=torch.float32)
                               if yield_history is not None else None)
         self.yield_mask    = (torch.tensor(yield_mask, dtype=torch.float32)
@@ -983,6 +1002,10 @@ def train_predict_patchtst(
         greater_is_better=False,
         save_total_limit=2,
         logging_steps=20,
+        # Default True silently replaces a NaN/inf step loss with a share of the
+        # running total, which pins the logged loss at 0.0 and hides divergence
+        # for the whole run. At this data scale we want to see it immediately.
+        logging_nan_inf_filter=False,
         report_to="none",
         label_names=["target_values"],
         seed=seed,
