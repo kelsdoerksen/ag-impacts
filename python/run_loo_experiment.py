@@ -156,6 +156,7 @@ def build_config_key(args, climate_vars, study_start, study_end):
         "yield_history":      bool(args.yield_history),
         "yield_history_base": args.yield_history_base,
         "yield_history_len":  args.yield_history_len,
+        "static_covars":      list(args.static_covars) if args.static_covars else None,
         "val_years":          args.val_years,
         "allow_history_leakage": bool(args.allow_history_leakage),
         "use_phenology":      list(args.use_phenology) if args.use_phenology else None,
@@ -831,7 +832,7 @@ def run_fold(adm2_df, feature_cols, all_years, fold_col, fold_value, fold_label,
 
 def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_value,
                  fold_label, fold_dir, args, cv_scheme="year",
-                 yield_hist=None, yield_mask=None, seed=42):
+                 yield_hist=None, yield_mask=None, static_arr=None, seed=42):
     """Train PatchTST leaving out one fold (a year or a climate cell).
 
     The held-out fold is the samples where sample_meta[fold_col] == fold_value;
@@ -935,6 +936,14 @@ def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_valu
                 np.asarray(eval_tgts, dtype=float).reshape(-1),
                 standardize).reshape(-1, 1).astype(np.float32)
 
+    static_kwargs = {}
+    if static_arr is not None:
+        static_kwargs = dict(
+            train_static=static_arr[train_mask],
+            val_static=static_arr[test_mask],
+            eval_static=static_arr[val_mask] if has_val else None,
+        )
+
     log_target = args.target == "log_yield"
     y_pred = train_predict_patchtst(
         train_seqs, fit_train, val_seqs, fit_val,
@@ -954,6 +963,7 @@ def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_valu
         log_target=log_target,
         seed=seed,
         **hist_kwargs,
+        **static_kwargs,
     )
 
     if args.target in ANOMALY_TARGETS:
@@ -1072,6 +1082,20 @@ def main():
             f"--target {args.target!r} is not valid for model 'tst'. "
             f"Choose from {TST_TARGETS}."
         )
+    if args.static_covars:
+        if args.model_type != "tst":
+            raise SystemExit("--static_covars is implemented for --model_type tst only.")
+        if args.target not in ANOMALY_TARGETS:
+            raise SystemExit(
+                f"--static_covars requires an anomaly target, got --target "
+                f"{args.target!r}. Under leave-one-year-out a coordinate pair is "
+                f"effectively a unit ID: against absolute yield the model uses it "
+                f"to look up each unit's mean (lat/lon alone scores R2 0.547 on "
+                f"CONUS, matching county climatology, at anomaly R2 0.011). Use "
+                f"--target {' or '.join(ANOMALY_TARGETS)} so the baseline is "
+                f"already removed and the features can only condition the "
+                f"weather response."
+            )
     if args.model_type != "tst" and args.target not in TABULAR_TARGETS:
         raise ValueError(
             f"--target {args.target!r} is not valid for tabular model "
@@ -1207,6 +1231,22 @@ def main():
                 sample_meta, args.data_dir, args.crop, args.aoi,
                 base_year=args.yield_history_base,
                 max_len=args.yield_history_len)
+        # Static per-unit covariates, row-aligned to sequences/sample_meta.
+        static_arr = None
+        if args.static_covars:
+            sc = load_static_covariates(args.static_covars, aoi=args.aoi)
+            cols = [c for t in args.static_covars for c in STATIC_COVARS[t]]
+            merged = sample_meta[["adm2_id"]].merge(sc, on="adm2_id", how="left")
+            missing = int(merged[cols].isna().any(axis=1).sum())
+            if missing:
+                raise ValueError(
+                    f"{missing:,} of {len(merged):,} samples have no static "
+                    f"covariates — check the adm2_id ids in the shapefile match "
+                    f"the crop parquet for --aoi {args.aoi}."
+                )
+            static_arr = merged[cols].to_numpy(dtype=np.float32)
+            print(f"[data] Static covariates: {cols} for "
+                  f"{sample_meta['adm2_id'].nunique():,} units")
         county_meta = sample_meta[["adm2_id", "adm2", "adm1"]].drop_duplicates("adm2_id")
     else:
         adm2_df, feature_cols = load_and_prepare(
@@ -1285,7 +1325,7 @@ def main():
                                   fold_col, fold_value, fold_label, fold_dir, args,
                                   cv_scheme=args.cv_scheme,
                                   yield_hist=yield_hist, yield_mask=yield_mask,
-                                  seed=seed)
+                                  static_arr=static_arr, seed=seed)
         else:
             result = run_fold(adm2_df, feature_cols, all_years,
                               fold_col, fold_value, fold_label,
@@ -1340,6 +1380,7 @@ def main():
         "yield_history":      args.yield_history,
         "yield_history_base": args.yield_history_base,
         "yield_history_len":  args.yield_history_len,
+        "static_covars":      list(args.static_covars) if args.static_covars else None,
         "val_years":          args.val_years,
         "allow_history_leakage": args.allow_history_leakage,
         "use_phenology":      args.use_phenology,
