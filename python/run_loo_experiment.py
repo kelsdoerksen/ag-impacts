@@ -57,9 +57,11 @@ from data_loader import (
     TARGET_OPTIONS,
     WEATHER_VARS,
     CountyBaseline,
+    STATIC_COVARS,
     draw_seed,
     history_leak_mask,
     load_and_prepare,
+    load_static_covariates,
     parse_climate_vars,
     phenology_lags,
     resolve_climate_vars,
@@ -96,6 +98,17 @@ def _parse_phenology_arg(s: str) -> list:
             f"Unknown phenology variable(s) {bad}. Choices: {PHENOLOGY_VARS}"
         )
     return vars_
+
+
+def _parse_static_arg(s: str) -> list:
+    """Parse a comma-separated --static_covars value (e.g. 'latlon')."""
+    toks = [v.strip() for v in s.split(",") if v.strip()]
+    bad  = [v for v in toks if v not in STATIC_COVARS]
+    if bad:
+        raise argparse.ArgumentTypeError(
+            f"Unknown static covariate(s) {bad}. Choices: {sorted(STATIC_COVARS)}"
+        )
+    return toks
 
 
 # Models selectable on the CLI: the sklearn tabular models plus the PatchTST
@@ -355,15 +368,6 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--anomaly_detrend", action="store_true",
-        help="Fit the county baseline as a straight line through the training "
-             "years instead of a flat mean. Maize carries a strong technology "
-             "trend (~+140 kg/ha/yr on CONUS 2002-2018) which otherwise sits in "
-             "the anomaly as variance no weather signal can explain — it is 14%% "
-             "of the flat-mean anomaly variance. Applies to the anomaly targets "
-             "and to --baseline_metric.",
-    )
-    parser.add_argument(
         "--baseline_metric", action="store_true", default=True,
         help="Score every fold against county climatology (what the county "
              "normally yields) and report anomaly-space R². On by default: a "
@@ -432,6 +436,18 @@ def parse_args():
                              "--yield_history_base (default off). Tabular models get "
                              "lag feature columns; the tst model gets a second "
                              "time-series branch.")
+    parser.add_argument("--static_covars", type=_parse_static_arg, default=None,
+                        metavar="VARS",
+                        help="Comma-separated time-invariant per-unit features fed "
+                             "through a small side branch (tst only). Currently: "
+                             "'latlon' (polygon centroid). REQUIRES an anomaly "
+                             "target: under leave-one-year-out a coordinate pair "
+                             "is effectively a unit ID, so against absolute yield "
+                             "the model just looks up each unit's mean (lat/lon "
+                             "alone scores R2 0.547 on CONUS, matching climatology, "
+                             "with anomaly R2 of 0.011). Once the baseline is "
+                             "removed they can condition the weather response "
+                             "instead. Default: off.")
     parser.add_argument("--val_years", type=int, default=2,
                         help="Whole training years held out per fold for "
                              "checkpoint selection (tst only). Without this the "
@@ -540,7 +556,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def _fit_fold_baseline(args, tr_ids, tr_years, tr_y):
+def _fit_fold_baseline(args, tr_ids, tr_y):
     """County climatology for one fold, fit on training rows only.
 
     Returns None when --target is not an anomaly target and no baseline metric
@@ -548,10 +564,10 @@ def _fit_fold_baseline(args, tr_ids, tr_years, tr_y):
     """
     if args.target not in ANOMALY_TARGETS and not args.baseline_metric:
         return None
-    return CountyBaseline(detrend=args.anomaly_detrend).fit(tr_ids, tr_years, tr_y)
+    return CountyBaseline().fit(tr_ids, tr_y)
 
 
-def _baseline_scores(baseline, te_ids, te_years, y_true, y_pred, standardize):
+def _baseline_scores(baseline, te_ids, y_true, y_pred, standardize):
     """Score this fold against county climatology, and in anomaly space.
 
     Two numbers that absolute-yield RMSE cannot give you:
@@ -562,13 +578,12 @@ def _baseline_scores(baseline, te_ids, te_years, y_true, y_pred, standardize):
     """
     if baseline is None:
         return {}
-    base_pred = baseline.inverse(te_ids, te_years,
-                                 np.zeros(len(y_true)), standardize=False)
+    base_pred = baseline.inverse(te_ids, np.zeros(len(y_true)), standardize=False)
     base_rmse = float(np.sqrt(np.mean((base_pred - y_true) ** 2)))
     model_rmse = float(np.sqrt(np.mean((y_pred - y_true) ** 2)))
 
-    a_true = baseline.transform(te_ids, te_years, y_true, standardize)
-    a_pred = baseline.transform(te_ids, te_years, y_pred, standardize)
+    a_true = baseline.transform(te_ids, y_true, standardize)
+    a_pred = baseline.transform(te_ids, y_pred, standardize)
     ss_tot = float(np.sum((a_true - a_true.mean()) ** 2))
     return {
         "baseline_climatology_rmse": base_rmse,
@@ -668,8 +683,19 @@ def _finalize_fold(meta_te, y_true, y_pred, all_years, fold_label, model_type,
     skill_str = f"err%={pct_error:+.1f}%" if pct_error is not None else f"R²={r2:.3f}"
     n_masked  = fold_meta.get("history_entries_masked")
     leak_note = f"  hist_masked={n_masked:,}" if n_masked else ""
+    # Anomaly R² is the number that says whether the model beat county
+    # climatology (predicting "no deviation from normal" scores 0 by
+    # construction), so lead with it when it is available. Absolute-yield RMSE
+    # stays alongside it for continuity with earlier runs.
+    r2a = fold_meta.get("r2_anomaly")
+    ca  = fold_meta.get("corr_anomaly")
+    anom_str = ""
+    if r2a is not None:
+        anom_str = f"  R²anom={r2a:+.3f}"
+        if ca is not None:
+            anom_str += f"  r={ca:+.3f}"
     print(
-        f"  fold {fold_label}: RMSE={rmse:>10,.0f}  {skill_str}"
+        f"  fold {fold_label}: RMSE={rmse:>10,.0f}  {skill_str}{anom_str}"
         f"  n_train={n_train}  n_test={len(y_true)}{leak_note}"
     )
     return fold_meta, errors
@@ -770,21 +796,19 @@ def run_fold(adm2_df, feature_cols, all_years, fold_col, fold_value, fold_label,
     # train on the anomaly, and invert the predictions back to kg/ha so every
     # metric and CSV downstream stays in yield units.
     tr_ids   = adm2_df.loc[train_mask, "adm2_id"].to_numpy()
-    tr_years = adm2_df.loc[train_mask, "hindcast_start"].to_numpy()
     te_ids   = meta_te["adm2_id"].to_numpy()
-    te_years = meta_te["hindcast_start"].to_numpy()
-    baseline = _fit_fold_baseline(args_ns, tr_ids, tr_years, y_tr.to_numpy())
+    baseline = _fit_fold_baseline(args_ns, tr_ids, y_tr.to_numpy())
     standardize = args_ns.target == "yield_zscore"
 
     y_fit = y_tr
     if args_ns.target in ANOMALY_TARGETS:
-        y_fit = baseline.transform(tr_ids, tr_years, y_tr.to_numpy(), standardize)
+        y_fit = baseline.transform(tr_ids, y_tr.to_numpy(), standardize)
 
     model = YieldModel(model_type, random_state=seed)
     model.fit(X_tr, y_fit)
     y_pred = model.predict(X_te)
     if args_ns.target in ANOMALY_TARGETS:
-        y_pred = baseline.inverse(te_ids, te_years, y_pred, standardize)
+        y_pred = baseline.inverse(te_ids, y_pred, standardize)
 
     extra_meta = {
         "feature_importances": (
@@ -793,10 +817,8 @@ def run_fold(adm2_df, feature_cols, all_years, fold_col, fold_value, fold_label,
         ),
         "history_entries_masked": n_hist_masked,
         "target": args_ns.target,
-        "anomaly_detrend": args_ns.anomaly_detrend,
         "seed": seed,
-        **_baseline_scores(baseline, te_ids, te_years,
-                           y_te.to_numpy(), y_pred, standardize),
+        **_baseline_scores(baseline, te_ids, y_te.to_numpy(), y_pred, standardize),
     }
     train_years = sorted(adm2_df.loc[train_mask, "hindcast_start"].unique().tolist())
     test_years  = sorted(adm2_df.loc[test_mask,  "hindcast_start"].unique().tolist())
@@ -893,11 +915,9 @@ def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_valu
     # held-out year never contributes to its own normalisation. The model learns
     # the anomaly; predictions are inverted to kg/ha before scoring.
     tr_ids   = sample_meta.loc[train_mask, "adm2_id"].to_numpy()
-    tr_years = sample_meta.loc[train_mask, "hindcast_start"].to_numpy()
     te_ids   = meta_te["adm2_id"].to_numpy()
-    te_years = meta_te["hindcast_start"].to_numpy()
     y_true_orig = np.asarray(val_tgts, dtype=float).reshape(-1)
-    baseline    = _fit_fold_baseline(args, tr_ids, tr_years,
+    baseline    = _fit_fold_baseline(args, tr_ids,
                                      np.asarray(train_tgts, dtype=float).reshape(-1))
     standardize = args.target == "yield_zscore"
 
@@ -906,15 +926,12 @@ def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_valu
 
     fit_train, fit_val, fit_eval = train_tgts, val_tgts, eval_tgts
     if args.target in ANOMALY_TARGETS:
-        fit_train = baseline.transform(tr_ids, tr_years,
-                                       np.asarray(train_tgts).reshape(-1),
+        fit_train = baseline.transform(tr_ids, np.asarray(train_tgts).reshape(-1),
                                        standardize).reshape(-1, 1).astype(np.float32)
-        fit_val   = baseline.transform(te_ids, te_years, y_true_orig,
-                                       standardize).reshape(-1, 1).astype(np.float32)
+        fit_val   = baseline.transform(te_ids, y_true_orig, standardize).reshape(-1, 1).astype(np.float32)
         if has_val:
             fit_eval = baseline.transform(
                 sample_meta.loc[val_mask, "adm2_id"].to_numpy(),
-                sample_meta.loc[val_mask, "hindcast_start"].to_numpy(),
                 np.asarray(eval_tgts, dtype=float).reshape(-1),
                 standardize).reshape(-1, 1).astype(np.float32)
 
@@ -940,16 +957,15 @@ def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_valu
     )
 
     if args.target in ANOMALY_TARGETS:
-        y_pred = baseline.inverse(te_ids, te_years, y_pred, standardize)
+        y_pred = baseline.inverse(te_ids, y_pred, standardize)
 
     extra_meta = {
         "seed":         seed,
         "target":       args.target,
-        "anomaly_detrend": args.anomaly_detrend,
         "val_years": val_years or None,
         "n_val": int(val_mask.sum()),
-        **_baseline_scores(baseline, te_ids, te_years,
-                           y_true_orig, np.asarray(y_pred).reshape(-1), standardize),
+        **_baseline_scores(baseline, te_ids, y_true_orig,
+                           np.asarray(y_pred).reshape(-1), standardize),
         "patch_length": args.patch_length,
         "patch_stride": args.patch_stride,
         "d_model":      args.d_model,
@@ -1367,19 +1383,37 @@ def main():
     print(f"{'='*60}")
     single_sample_folds = any(fm["pct_error"] is not None for fm in fold_metas)
     skill_hdr = "err%  " if single_sample_folds else "R²    "
-    print(f"{'Fold':>10}  {'RMSE':>10}  {skill_hdr:>6}  {'n_test':>7}")
+    # Anomaly columns: R² measured after each county's own baseline is removed.
+    # Predicting "no deviation from normal" scores 0 there, so R²anom > 0 means
+    # the fold beat county climatology — the question absolute RMSE cannot answer.
+    has_anom = any(fm.get("r2_anomaly") is not None for fm in fold_metas)
+    anom_hdr = f"  {'R²anom':>7}  {'r_anom':>7}  {'vs clim':>8}" if has_anom else ""
+    print(f"{'Fold':>10}  {'RMSE':>10}  {skill_hdr:>6}{anom_hdr}  {'n_test':>7}")
     for fm in fold_metas:
         if fm["pct_error"] is not None:
             skill_val = f"{fm['pct_error']:>+6.1f}%"
         else:
             skill_val = f"{fm['r2_overall']:>6.3f} "
+        anom_val = ""
+        if has_anom:
+            def _f(v, w=7, spec="+.3f"):
+                return f"{'—':>{w}}" if v is None else f"{format(v, spec):>{w}}"
+            anom_val = (f"  {_f(fm.get('r2_anomaly'))}  {_f(fm.get('corr_anomaly'))}"
+                        f"  {_f(fm.get('skill_vs_climatology_pct'), 8, '+.1f')}")
         print(
             f"{fm['fold_label']:>10}  {fm['rmse_overall']:>10,.0f}"
-            f"  {skill_val}  {fm['n_test']:>7}"
+            f"  {skill_val}{anom_val}  {fm['n_test']:>7}"
         )
     print(f"{'':>10}  {'─'*10}  {'─'*6}")
     print(f"{'Overall':>10}  {overall_rmse:>10,.0f}  {'':>6}  (LOO RMSE across all folds)")
     print(f"{'':>10}  {overall_mae:>10,.0f}  {'':>6}  (LOO MAE  across all folds)")
+    if has_anom:
+        r2as = [fm["r2_anomaly"] for fm in fold_metas if fm.get("r2_anomaly") is not None]
+        beat = sum(1 for fm in fold_metas if fm.get("beats_climatology"))
+        print(f"\n{'':>10}  mean R²anom = {np.mean(r2as):+.3f}   "
+              f"folds beating county climatology: {beat}/{len(fold_metas)}")
+        print(f"{'':>10}  (R²anom > 0 means the model beat 'predict this county's "
+              f"normal yield'.)")
     print(f"\nCounty RMSE saved to: {exp_dir}/loo_county_rmse.csv")
     print(f"All errors saved to:  {exp_dir}/loo_all_errors.csv")
     print(f"Diagnostics saved to: {exp_dir}/run_diagnostics.json (seed={seed})")

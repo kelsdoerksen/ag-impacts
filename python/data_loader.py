@@ -173,20 +173,14 @@ class CountyBaseline:
 
     Fitting on training rows only is the whole point. Under leave-one-year-out
     the test year must not contribute to its own baseline, so a new instance is
-    fit inside each fold. `detrend` chooses what "normally" means: a flat mean,
-    or a per-county straight line through the training years. Maize carries a
-    strong technology trend (~+140 kg/ha/yr on CONUS 2002-2018, and a 3.6x rise
-    since 1950), so a flat mean leaves that trend sitting in the anomaly as
-    variance no weather signal can explain.
+    fit inside each fold.
 
     Counties too thin to fit on their own fall back to the pooled training
     baseline, and sigma is floored so a near-constant county cannot produce
     explosive z-scores.
     """
 
-    def __init__(self, detrend: bool = False, min_years: int = 3,
-                 sigma_floor_frac: float = 0.1):
-        self.detrend          = detrend
+    def __init__(self, min_years: int = 3, sigma_floor_frac: float = 0.1):
         self.min_years        = max(int(min_years), 2)
         self.sigma_floor_frac = float(sigma_floor_frac)
         self.params: dict = {}
@@ -194,61 +188,52 @@ class CountyBaseline:
         self.n_fallback       = 0
 
     @staticmethod
-    def _fit_one(years, vals, detrend, min_years):
-        """Return (intercept, slope, sigma) for one county, or None if too thin."""
+    def _fit_one(vals, min_years):
+        """Return (mean, sigma) for one county, or None if too thin."""
         n = len(vals)
         if n < min_years:
             return None
-        if detrend and n >= 4:
-            slope, intercept = np.polyfit(years, vals, 1)
-            resid = vals - (intercept + slope * years)
-        else:
-            slope, intercept = 0.0, float(vals.mean())
-            resid = vals - intercept
+        mean = float(vals.mean())
         # ddof=1 where possible: these are estimates, not the population.
-        sigma = float(resid.std(ddof=1)) if n > 1 else 0.0
-        return float(intercept), float(slope), sigma
+        sigma = float((vals - mean).std(ddof=1)) if n > 1 else 0.0
+        return mean, sigma
 
-    def fit(self, adm2_ids, years, y):
+    def fit(self, adm2_ids, y):
         adm2_ids = np.asarray(adm2_ids)
-        years    = np.asarray(years, dtype=float)
         y        = np.asarray(y, dtype=float)
 
-        g = self._fit_one(years, y, self.detrend, 2) or (float(y.mean()), 0.0, float(y.std()))
-        self.global_params = g
-        floor = max(g[2] * self.sigma_floor_frac, 1e-6)
+        g = self._fit_one(y, 2) or (float(y.mean()), float(y.std()))
+        floor = max(g[1] * self.sigma_floor_frac, 1e-6)
 
         self.n_fallback = 0
         for aid in np.unique(adm2_ids):
-            m   = adm2_ids == aid
-            fit = self._fit_one(years[m], y[m], self.detrend, self.min_years)
+            fit = self._fit_one(y[adm2_ids == aid], self.min_years)
             if fit is None:
                 self.n_fallback += 1
                 continue
-            intercept, slope, sigma = fit
-            self.params[aid] = (intercept, slope, max(sigma, floor))
-        self.global_params = (g[0], g[1], max(g[2], floor))
+            mean, sigma = fit
+            self.params[aid] = (mean, max(sigma, floor))
+        self.global_params = (g[0], max(g[1], floor))
         return self
 
-    def _lookup(self, adm2_ids, years):
+    def _lookup(self, adm2_ids):
         """Vectorised (baseline, sigma) for each row, falling back where unfit."""
-        gi, gs, gsig = self.global_params
+        gm, gsig = self.global_params
         base  = np.empty(len(adm2_ids), dtype=float)
         sigma = np.empty(len(adm2_ids), dtype=float)
-        for i, (aid, yr) in enumerate(zip(adm2_ids, years)):
-            intercept, slope, s = self.params.get(aid, (gi, gs, gsig))
-            base[i], sigma[i] = intercept + slope * yr, s
+        for i, aid in enumerate(adm2_ids):
+            base[i], sigma[i] = self.params.get(aid, (gm, gsig))
         return base, sigma
 
-    def transform(self, adm2_ids, years, y, standardize: bool):
+    def transform(self, adm2_ids, y, standardize: bool):
         """kg/ha -> anomaly (or z-score). Inverse of `inverse`."""
-        base, sigma = self._lookup(np.asarray(adm2_ids), np.asarray(years, dtype=float))
+        base, sigma = self._lookup(np.asarray(adm2_ids))
         anom = np.asarray(y, dtype=float) - base
         return anom / sigma if standardize else anom
 
-    def inverse(self, adm2_ids, years, z, standardize: bool):
+    def inverse(self, adm2_ids, z, standardize: bool):
         """anomaly (or z-score) -> kg/ha, so every metric downstream is in yield units."""
-        base, sigma = self._lookup(np.asarray(adm2_ids), np.asarray(years, dtype=float))
+        base, sigma = self._lookup(np.asarray(adm2_ids))
         z = np.asarray(z, dtype=float)
         return (z * sigma + base) if standardize else (z + base)
 
@@ -507,6 +492,47 @@ def load_county_yield_series(data_dir: str, crop: str, aoi: str = "CONUS") -> pd
         .drop_duplicates(["adm2_id", "cal_year"])
         .reset_index(drop=True)
     )
+
+
+STATIC_COVARS = {
+    # token -> the columns load_static_covariates() must produce
+    "latlon": ["lat", "lon"],
+}
+
+
+def load_static_covariates(covars, aoi="CONUS", county_shp=None) -> pd.DataFrame:
+    """Time-invariant per-admin-unit features: adm2_id plus one column each.
+
+    Currently only 'latlon' (polygon centroid, degrees). Centroids are taken in
+    the AOI's equal-area projection and then converted to lat/lon, so they are
+    not distorted by the projection.
+
+    A WARNING on what these can do. Under leave-one-YEAR-out every unit appears
+    in training, so a precise coordinate pair is effectively a unit ID, and a
+    model will happily use it to look up that unit's mean yield: on CONUS a
+    random forest given ONLY lat/lon scores RMSE 1,707 / R2 0.547, matching
+    county climatology (1,716 / 0.542) with a correlation of 0.994 — and an
+    anomaly R2 of 0.011, i.e. no forecast skill at all. Against an absolute
+    yield target these features therefore inflate the headline metric without
+    adding anything. They are only meaningful once the county baseline has been
+    removed (an anomaly target), where they can condition *how* a unit responds
+    to weather rather than *what it usually yields*. run_loo_experiment.py
+    enforces that pairing.
+    """
+    unknown = [c for c in covars if c not in STATIC_COVARS]
+    if unknown:
+        raise ValueError(f"Unknown static covariate(s) {unknown}. "
+                         f"Choices: {sorted(STATIC_COVARS)}")
+    # Lazy: pulls geopandas (and matplotlib via plot_results), which the rest of
+    # this module deliberately does not require.
+    from plot_results import load_counties_geo
+
+    gdf = load_counties_geo(county_shp, aoi=aoi)          # equal-area projection
+    cen = gdf.geometry.centroid.to_crs("EPSG:4326")
+    out = pd.DataFrame({"adm2_id": gdf["GEOID"].astype(str),
+                        "lat": cen.y.to_numpy(), "lon": cen.x.to_numpy()})
+    cols = [c for tok in covars for c in STATIC_COVARS[tok]]
+    return out[["adm2_id"] + cols].drop_duplicates("adm2_id").reset_index(drop=True)
 
 
 def build_yield_history_matrix(

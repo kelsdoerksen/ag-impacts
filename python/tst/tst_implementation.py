@@ -541,7 +541,8 @@ class YieldSequenceDataset(Dataset):
 
     def __init__(self, sequences: np.ndarray, targets: np.ndarray, log_target: bool = False,
                  yield_history: np.ndarray | None = None,
-                 yield_mask: np.ndarray | None = None):
+                 yield_mask: np.ndarray | None = None,
+                 static: np.ndarray | None = None):
         """
         Parameters
         ----------
@@ -578,6 +579,8 @@ class YieldSequenceDataset(Dataset):
                               if yield_history is not None else None)
         self.yield_mask    = (torch.tensor(yield_mask, dtype=torch.float32)
                               if yield_mask is not None else None)
+        self.static        = (torch.tensor(static, dtype=torch.float32)
+                              if static is not None else None)
 
     def __len__(self) -> int:
         return len(self.sequences)
@@ -590,6 +593,8 @@ class YieldSequenceDataset(Dataset):
         if self.yield_history is not None:
             item["yield_history"] = self.yield_history[idx]  # (L,)
             item["yield_mask"]    = self.yield_mask[idx]     # (L,)
+        if self.static is not None:
+            item["static_features"] = self.static[idx]       # (S,)
         return item
 
 
@@ -676,6 +681,8 @@ def build_patchtst_model(
     head_dropout: float = 0.1,
     yield_history_len: int | None = None,
     history_hidden: int = 64,
+    static_dim: int = 0,
+    static_hidden: int = 32,
 ) -> PatchTSTForRegression:
     """Construct a PatchTSTForRegression model for scalar yield prediction.
 
@@ -755,11 +762,17 @@ def build_patchtst_model(
         scaling=None,           # we normalise inputs ourselves; skip internal scaling
         loss="mse",
     )
-    if yield_history_len:
-        print(f"[model] + prior-yield history branch: L={yield_history_len} "
-              f"→ MLP({history_hidden}) concatenated before the regression head")
+    if yield_history_len or static_dim:
+        if yield_history_len:
+            print(f"[model] + prior-yield history branch: L={yield_history_len} "
+                  f"→ MLP({history_hidden}) concatenated before the regression head")
+        if static_dim:
+            print(f"[model] + static-covariate branch: {static_dim} feature(s) "
+                  f"→ MLP({static_hidden}) concatenated before the regression head")
         return PatchTSTWithYieldHistory(
-            config, history_len=yield_history_len, history_hidden=history_hidden)
+            config, history_len=yield_history_len or 0,
+            history_hidden=history_hidden,
+            static_dim=static_dim, static_hidden=static_hidden)
     return PatchTSTForRegression(config)
 
 
@@ -779,22 +792,40 @@ class PatchTSTWithYieldHistory(PatchTSTForRegression):
     """
 
     def __init__(self, config: PatchTSTConfig, history_len: int,
-                 history_hidden: int = 64):
+                 history_hidden: int = 64, static_dim: int = 0,
+                 static_hidden: int = 32):
         super().__init__(config)
         self.history_len = history_len
-        # Input is [history || mask] so the encoder can down-weight padded slots.
-        self.yield_encoder = nn.Sequential(
-            nn.Linear(2 * history_len, history_hidden),
-            nn.ReLU(),
-            nn.Dropout(config.head_dropout),
-            nn.Linear(history_hidden, history_hidden),
-            nn.ReLU(),
-        )
+        self.static_dim  = static_dim
+        extra = 0
+        if history_len:
+            # Input is [history || mask] so the encoder can down-weight padded slots.
+            self.yield_encoder = nn.Sequential(
+                nn.Linear(2 * history_len, history_hidden),
+                nn.ReLU(),
+                nn.Dropout(config.head_dropout),
+                nn.Linear(history_hidden, history_hidden),
+                nn.ReLU(),
+            )
+            extra += history_hidden
+        else:
+            self.yield_encoder = None
+        if static_dim:
+            # Deliberately small: these are a handful of scalars that condition
+            # the response, not a modality with structure to attend over.
+            self.static_encoder = nn.Sequential(
+                nn.Linear(static_dim, static_hidden),
+                nn.ReLU(),
+                nn.Linear(static_hidden, static_hidden),
+                nn.ReLU(),
+            )
+            extra += static_hidden
+        else:
+            self.static_encoder = None
         pooled_dim = config.num_input_channels * config.d_model
         self.head_dropout = (nn.Dropout(config.head_dropout)
                              if config.head_dropout > 0 else nn.Identity())
-        self.combined_projection = nn.Linear(pooled_dim + history_hidden,
-                                             config.num_targets)
+        self.combined_projection = nn.Linear(pooled_dim + extra, config.num_targets)
         self.post_init()
 
     def forward(
@@ -803,6 +834,7 @@ class PatchTSTWithYieldHistory(PatchTSTForRegression):
         target_values: torch.Tensor | None = None,
         yield_history: torch.Tensor | None = None,
         yield_mask: torch.Tensor | None = None,
+        static_features: torch.Tensor | None = None,
         past_observed_mask: torch.Tensor | None = None,
         output_hidden_states: bool | None = None,
         output_attentions: bool | None = None,
@@ -823,13 +855,19 @@ class PatchTSTWithYieldHistory(PatchTSTForRegression):
         pooled = torch.flatten(pooled, start_dim=1)           # (bs, C*d_model)
 
         bs = past_values.shape[0]
-        if yield_history is None:
-            yield_history = past_values.new_zeros((bs, self.history_len))
-        if yield_mask is None:
-            yield_mask = past_values.new_zeros((bs, self.history_len))
-        hist_feat = self.yield_encoder(torch.cat([yield_history, yield_mask], dim=1))
+        parts = [self.head_dropout(pooled)]
+        if self.yield_encoder is not None:
+            if yield_history is None:
+                yield_history = past_values.new_zeros((bs, self.history_len))
+            if yield_mask is None:
+                yield_mask = past_values.new_zeros((bs, self.history_len))
+            parts.append(self.yield_encoder(torch.cat([yield_history, yield_mask], dim=1)))
+        if self.static_encoder is not None:
+            if static_features is None:
+                static_features = past_values.new_zeros((bs, self.static_dim))
+            parts.append(self.static_encoder(static_features))
 
-        combined = torch.cat([self.head_dropout(pooled), hist_feat], dim=1)
+        combined = torch.cat(parts, dim=1)
         y_hat = self.combined_projection(combined)            # (bs, num_targets)
 
         loss = None
@@ -901,6 +939,9 @@ def train_predict_patchtst(
     eval_tgts: np.ndarray | None = None,
     eval_hist: np.ndarray | None = None,
     eval_hist_mask: np.ndarray | None = None,
+    train_static: np.ndarray | None = None,
+    val_static: np.ndarray | None = None,
+    eval_static: np.ndarray | None = None,
     history_hidden: int = 64,
     seed: int = DEFAULT_SEED,
 ) -> np.ndarray:
@@ -965,14 +1006,30 @@ def train_predict_patchtst(
         val_hist_n   = apply_history_normalizer(val_hist,   val_hist_mask,   h_mean, h_std)
         history_len  = train_hist.shape[1]
 
+    # Static covariates: z-scored on the training rows only, same as everything
+    # else. A near-constant column would blow up on divide, so floor the std.
+    static_dim = 0
+    train_static_n = val_static_n = eval_static_n = None
+    if train_static is not None:
+        static_dim = train_static.shape[1]
+        s_mean = train_static.mean(axis=0)
+        s_std  = np.where(train_static.std(axis=0) < 1e-8, 1.0, train_static.std(axis=0))
+        print(f"[norm]  Static covariates: {static_dim} feature(s), "
+              f"means {np.round(s_mean, 2).tolist()}")
+        norm = lambda a: None if a is None else ((a - s_mean) / s_std).astype(np.float32)
+        train_static_n, val_static_n, eval_static_n = (
+            norm(train_static), norm(val_static), norm(eval_static))
+
     train_dataset = YieldSequenceDataset(
         train_seqs_n, train_tgts, log_target=log_target,
-        yield_history=train_hist_n, yield_mask=train_hist_mask)
+        yield_history=train_hist_n, yield_mask=train_hist_mask,
+        static=train_static_n)
     # val_* is the fold being PREDICTED (the held-out test year). It is used
     # only by trainer.predict at the end.
     val_dataset   = YieldSequenceDataset(
         val_seqs_n, val_tgts, log_target=log_target,
-        yield_history=val_hist_n, yield_mask=val_hist_mask)
+        yield_history=val_hist_n, yield_mask=val_hist_mask,
+        static=val_static_n)
 
     # eval_* is the model-SELECTION set, carved out of the training years. Kept
     # separate from val_* so checkpoint selection never sees the test fold —
@@ -986,7 +1043,8 @@ def train_predict_patchtst(
         eval_dataset = YieldSequenceDataset(
             apply_normalizer(eval_seqs, ch_mean, ch_std), eval_tgts,
             log_target=log_target,
-            yield_history=eval_hist_n, yield_mask=eval_hist_mask)
+            yield_history=eval_hist_n, yield_mask=eval_hist_mask,
+            static=eval_static_n)
         print(f"[split] Model selection on {len(eval_dataset):,} held-out "
               f"TRAINING samples; test fold never seen until predict.")
     else:
@@ -1009,6 +1067,7 @@ def train_predict_patchtst(
         head_dropout=hp["head_dropout"],
         yield_history_len=history_len,
         history_hidden=history_hidden,
+        static_dim=static_dim,
     )
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[model] Actual trainable parameters: {n_params:,}\n")

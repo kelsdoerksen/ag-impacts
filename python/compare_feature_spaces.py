@@ -158,15 +158,32 @@ def climatology_predictions(idx, y_true):
     return loo.fillna(df["y"].mean()).to_numpy()
 
 
-def score(y_true, y_pred):
+def score(y_true, y_pred, clim=None):
+    """Absolute-yield metrics, plus anomaly metrics when a climatology is given.
+
+    The anomaly numbers are the ones that speak to forecast skill: both truth
+    and prediction have each county's own baseline removed, so what is left is
+    the year-to-year deviation weather could explain. Predicting "no deviation"
+    scores r2_anomaly = 0, which makes the sign of that column the answer to
+    "did this arm beat county climatology?".
+    """
     err = y_pred - y_true
     ss_tot = float(np.sum((y_true - y_true.mean()) ** 2))
-    return dict(
+    out = dict(
         rmse=float(np.sqrt(np.mean(err ** 2))),
         mae=float(np.mean(np.abs(err))),
         r2=float(1 - np.sum(err ** 2) / ss_tot) if ss_tot > 0 else np.nan,
         bias=float(np.mean(err)),
     )
+    if clim is not None:
+        a_true, a_pred = y_true - clim, y_pred - clim
+        ss = float(np.sum((a_true - a_true.mean()) ** 2))
+        out["r2_anomaly"] = float(1 - np.sum((a_pred - a_true) ** 2) / ss) if ss > 0 else np.nan
+        out["corr_anomaly"] = (float(np.corrcoef(a_true, a_pred)[0, 1])
+                               if a_pred.std() > 0 else np.nan)
+        # Did it call the direction of the county's departure from normal?
+        out["sign_agreement"] = float(np.mean(np.sign(a_true) == np.sign(a_pred)))
+    return out
 
 
 def overall_table(preds, y, baseline):
@@ -176,7 +193,10 @@ def overall_table(preds, y, baseline):
     is the ablation contrast (what did this input buy?), skill_vs_climatology is
     the absolute one (is this a useful model at all?).
     """
-    rows = [dict(arm=label, n=len(y), **score(y, p)) for label, p in preds.items()]
+    clim = preds.get(CLIMATOLOGY)
+    rows = [dict(arm=label, n=len(y),
+                 **score(y, p, clim=None if label == CLIMATOLOGY else clim))
+            for label, p in preds.items()]
     base_rmse = next(r["rmse"] for r in rows if r["arm"] == baseline)
     clim_rmse = next((r["rmse"] for r in rows if r["arm"] == CLIMATOLOGY), None)
     for r in rows:
@@ -266,7 +286,20 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     print(f"\n{'=' * 74}\nOverall (paired on {len(idx):,} samples, baseline = {baseline})")
-    print(overall.to_string(index=False, float_format="{:,.3f}".format))
+    abs_cols = ["arm", "n", "rmse", "mae", "r2", "bias",
+                "skill_vs_baseline_pct", "skill_vs_climatology_pct"]
+    print(overall[[c for c in abs_cols if c in overall]]
+          .to_string(index=False, float_format="{:,.3f}".format))
+
+    anom_cols = ["arm", "r2_anomaly", "corr_anomaly", "sign_agreement"]
+    if all(c in overall for c in anom_cols[1:]):
+        print(f"\nForecast skill — county baseline removed from truth and prediction")
+        print(overall[overall.arm != CLIMATOLOGY][anom_cols]
+              .to_string(index=False, float_format="{:,.3f}".format))
+        print("  r2_anomaly > 0  ⇒  beat county climatology "
+              "(predicting 'no deviation from normal' scores exactly 0)")
+        print("  sign_agreement  ⇒  how often the above/below-normal direction "
+              "was right (0.5 = coin flip)")
 
     print(f"\n{'=' * 74}\nPer-fold RMSE")
     print(per_fold.to_string(index=False, float_format="{:,.0f}".format))
