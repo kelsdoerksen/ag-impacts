@@ -64,6 +64,14 @@ def draw_seed() -> int:
 WEATHER_VARS    = ["tasmax_C", "tasmin_C", "hursmin", "pr_mm"]
 FEATURE_MODES   = ["aggregated", "timeseries"]
 TARGET_OPTIONS  = ["yield", "yield_pct_change"]
+
+# Targets expressed relative to a county's own history. Unlike the entries in
+# TARGET_OPTIONS these CANNOT be applied when the crop table is loaded: their
+# baseline must be fit on each fold's training years only, or the test year
+# leaks into its own normalisation. They are applied inside the fold runners
+# (see CountyBaseline) and inverted before scoring, so every metric, CSV and
+# plot downstream stays in kg/ha.
+ANOMALY_TARGETS = ["yield_anomaly", "yield_zscore"]
 SUPPORTED_CROPS = ["corn", "cassava", "rice", "sorghum", "soy", "wheat"]
 
 # Short CLI tokens for the daily climate variables, so a feature-space ablation
@@ -155,6 +163,96 @@ def drop_invalid_yield(df: pd.DataFrame, context: str = "") -> pd.DataFrame:
     return out
 
 
+class CountyBaseline:
+    """Per-county expected yield, fit on training rows only.
+
+    This is the "county climatology" reference: what a county normally yields,
+    estimated from its own other years. It is both the honest null model for a
+    yield forecast (beating it is the minimum bar) and the offset that turns an
+    absolute-yield target into a weather-skill target.
+
+    Fitting on training rows only is the whole point. Under leave-one-year-out
+    the test year must not contribute to its own baseline, so a new instance is
+    fit inside each fold. `detrend` chooses what "normally" means: a flat mean,
+    or a per-county straight line through the training years. Maize carries a
+    strong technology trend (~+140 kg/ha/yr on CONUS 2002-2018, and a 3.6x rise
+    since 1950), so a flat mean leaves that trend sitting in the anomaly as
+    variance no weather signal can explain.
+
+    Counties too thin to fit on their own fall back to the pooled training
+    baseline, and sigma is floored so a near-constant county cannot produce
+    explosive z-scores.
+    """
+
+    def __init__(self, detrend: bool = False, min_years: int = 3,
+                 sigma_floor_frac: float = 0.1):
+        self.detrend          = detrend
+        self.min_years        = max(int(min_years), 2)
+        self.sigma_floor_frac = float(sigma_floor_frac)
+        self.params: dict = {}
+        self.global_params: tuple = (0.0, 0.0, 1.0)
+        self.n_fallback       = 0
+
+    @staticmethod
+    def _fit_one(years, vals, detrend, min_years):
+        """Return (intercept, slope, sigma) for one county, or None if too thin."""
+        n = len(vals)
+        if n < min_years:
+            return None
+        if detrend and n >= 4:
+            slope, intercept = np.polyfit(years, vals, 1)
+            resid = vals - (intercept + slope * years)
+        else:
+            slope, intercept = 0.0, float(vals.mean())
+            resid = vals - intercept
+        # ddof=1 where possible: these are estimates, not the population.
+        sigma = float(resid.std(ddof=1)) if n > 1 else 0.0
+        return float(intercept), float(slope), sigma
+
+    def fit(self, adm2_ids, years, y):
+        adm2_ids = np.asarray(adm2_ids)
+        years    = np.asarray(years, dtype=float)
+        y        = np.asarray(y, dtype=float)
+
+        g = self._fit_one(years, y, self.detrend, 2) or (float(y.mean()), 0.0, float(y.std()))
+        self.global_params = g
+        floor = max(g[2] * self.sigma_floor_frac, 1e-6)
+
+        self.n_fallback = 0
+        for aid in np.unique(adm2_ids):
+            m   = adm2_ids == aid
+            fit = self._fit_one(years[m], y[m], self.detrend, self.min_years)
+            if fit is None:
+                self.n_fallback += 1
+                continue
+            intercept, slope, sigma = fit
+            self.params[aid] = (intercept, slope, max(sigma, floor))
+        self.global_params = (g[0], g[1], max(g[2], floor))
+        return self
+
+    def _lookup(self, adm2_ids, years):
+        """Vectorised (baseline, sigma) for each row, falling back where unfit."""
+        gi, gs, gsig = self.global_params
+        base  = np.empty(len(adm2_ids), dtype=float)
+        sigma = np.empty(len(adm2_ids), dtype=float)
+        for i, (aid, yr) in enumerate(zip(adm2_ids, years)):
+            intercept, slope, s = self.params.get(aid, (gi, gs, gsig))
+            base[i], sigma[i] = intercept + slope * yr, s
+        return base, sigma
+
+    def transform(self, adm2_ids, years, y, standardize: bool):
+        """kg/ha -> anomaly (or z-score). Inverse of `inverse`."""
+        base, sigma = self._lookup(np.asarray(adm2_ids), np.asarray(years, dtype=float))
+        anom = np.asarray(y, dtype=float) - base
+        return anom / sigma if standardize else anom
+
+    def inverse(self, adm2_ids, years, z, standardize: bool):
+        """anomaly (or z-score) -> kg/ha, so every metric downstream is in yield units."""
+        base, sigma = self._lookup(np.asarray(adm2_ids), np.asarray(years, dtype=float))
+        z = np.asarray(z, dtype=float)
+        return (z * sigma + base) if standardize else (z + base)
+
+
 def _apply_target(crop_df: pd.DataFrame, target: str) -> pd.DataFrame:
     """Overwrite the 'yield' column with the requested target variable.
 
@@ -164,8 +262,12 @@ def _apply_target(crop_df: pd.DataFrame, target: str) -> pd.DataFrame:
                        Rows with no prior year become NaN and are dropped later
                        by .dropna(subset=["yield"]).
     """
+    # Anomaly targets are fit per fold on training rows only, so the crop table
+    # keeps raw yield here and the fold runners do the transform.
+    if target in ANOMALY_TARGETS:
+        return crop_df
     if target not in TARGET_OPTIONS:
-        raise ValueError(f"target must be one of {TARGET_OPTIONS}")
+        raise ValueError(f"target must be one of {TARGET_OPTIONS + ANOMALY_TARGETS}")
     if target == "yield":
         return crop_df
     df = crop_df.sort_values(["adm2_id", "hindcast_start"]).copy()
@@ -932,6 +1034,7 @@ def load_and_prepare(
     aoi: str = "CONUS",
     yield_history: bool = False,
     yield_history_base: int | None = None,
+    yield_history_len: int | None = None,
     use_phenology: list | None = None,
     phenology_lag_years: int = 1,
     phenology_suffix: str | None = None,
@@ -986,7 +1089,8 @@ def load_and_prepare(
 
     if yield_history:
         adm2_df, hist_cols = _append_yield_history_features(
-            adm2_df, data_dir, crop, aoi, forecast_year, yield_history_base)
+            adm2_df, data_dir, crop, aoi, forecast_year, yield_history_base,
+            max_len=yield_history_len)
         feature_cols = feature_cols + hist_cols
 
     if use_phenology:
@@ -1006,6 +1110,7 @@ def _append_yield_history_features(
     aoi: str,
     forecast_year: int,
     base_year: int | None,
+    max_len: int | None = None,
 ) -> tuple[pd.DataFrame, list]:
     """Append prior-yield lag columns (+ validity masks) to a featurised frame.
 
@@ -1019,7 +1124,7 @@ def _append_yield_history_features(
     })
     yseries = load_county_yield_series(data_dir, crop, aoi)
     hist, mask, base_year, L = build_yield_history_matrix(
-        meta, yseries, base_year=base_year)
+        meta, yseries, base_year=base_year, max_len=max_len)
 
     lag_cols  = [f"yield_lag{j + 1}"     for j in range(L)]
     mask_cols = [f"yield_lagmask{j + 1}" for j in range(L)]

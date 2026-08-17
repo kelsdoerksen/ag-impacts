@@ -51,10 +51,12 @@ from sklearn.metrics import root_mean_squared_error
 
 from models import YieldModel, SUPPORTED_MODELS
 from data_loader import (
+    ANOMALY_TARGETS,
     FEATURE_MODES,
     SUPPORTED_CROPS,
     TARGET_OPTIONS,
     WEATHER_VARS,
+    CountyBaseline,
     draw_seed,
     history_leak_mask,
     load_and_prepare,
@@ -102,9 +104,9 @@ MODEL_CHOICES = SUPPORTED_MODELS + ["tst"]
 
 # Targets valid for the tabular (sklearn) and tst (PatchTST) paths respectively.
 # yield_pct_change is a tabular-only derived target; log_yield is tst-only.
-TABULAR_TARGETS = TARGET_OPTIONS              # ["yield", "yield_pct_change"]
-TST_TARGETS     = ["yield", "log_yield"]
-ALL_TARGETS     = TARGET_OPTIONS + ["log_yield"]
+TABULAR_TARGETS = TARGET_OPTIONS + ANOMALY_TARGETS
+TST_TARGETS     = ["yield", "log_yield"] + ANOMALY_TARGETS
+ALL_TARGETS     = TARGET_OPTIONS + ["log_yield"] + ANOMALY_TARGETS
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -140,6 +142,7 @@ def build_config_key(args, climate_vars, study_start, study_end):
         "study_end":          study_end,
         "yield_history":      bool(args.yield_history),
         "yield_history_base": args.yield_history_base,
+        "yield_history_len":  args.yield_history_len,
         "allow_history_leakage": bool(args.allow_history_leakage),
         "use_phenology":      list(args.use_phenology) if args.use_phenology else None,
         "phenology_suffix":   args.phenology_suffix,
@@ -340,10 +343,34 @@ def parse_args():
         "--target", type=str, choices=ALL_TARGETS, default="yield",
         help=(
             "'yield': predict absolute yield. "
-            "'yield_pct_change': predict percent change vs. prior year (tabular models only). "
-            "'log_yield': predict log(yield), reported in original units (tst only). "
-            "Default: yield."
+            "'yield_pct_change': percent change vs. prior year (tabular models only). "
+            "'log_yield': log(yield), reported in original units (tst only). "
+            "'yield_anomaly': deviation from the county's own baseline, in kg/ha. "
+            "'yield_zscore': that deviation in county standard deviations, so a "
+            "prediction of 1.0 means 'one sigma above what this county normally does'. "
+            "The two anomaly targets fit their baseline on each fold's training "
+            "years only and invert predictions back to kg/ha, so RMSE stays "
+            "comparable to a --target yield run. Default: yield."
         ),
+    )
+    parser.add_argument(
+        "--anomaly_detrend", action="store_true",
+        help="Fit the county baseline as a straight line through the training "
+             "years instead of a flat mean. Maize carries a strong technology "
+             "trend (~+140 kg/ha/yr on CONUS 2002-2018) which otherwise sits in "
+             "the anomaly as variance no weather signal can explain — it is 14%% "
+             "of the flat-mean anomaly variance. Applies to the anomaly targets "
+             "and to --baseline_metric.",
+    )
+    parser.add_argument(
+        "--baseline_metric", action="store_true", default=True,
+        help="Score every fold against county climatology (what the county "
+             "normally yields) and report anomaly-space R². On by default: a "
+             "yield model that does not beat this null is not yet useful.",
+    )
+    parser.add_argument(
+        "--no_baseline_metric", dest="baseline_metric", action="store_false",
+        help="Skip the county-climatology baseline scoring.",
     )
     parser.add_argument(
         "--region", type=str, default=None,
@@ -404,6 +431,17 @@ def parse_args():
                              "--yield_history_base (default off). Tabular models get "
                              "lag feature columns; the tst model gets a second "
                              "time-series branch.")
+    parser.add_argument("--yield_history_len", type=int, default=None,
+                        help="Rolling window: keep only the N most recent prior "
+                             "years of history per sample. Unlike "
+                             "--yield_history_base (an absolute floor year, which "
+                             "blanks the early folds entirely) this window moves "
+                             "with each sample's target year. Strongly "
+                             "recommended: the default reaches back to the "
+                             "earliest year in the crop file (1950 on CONUS), so "
+                             "the vector spans a 3.6x technology trend and the "
+                             "mean of it scores R2 = -1.1 as a predictor; the "
+                             "last 5 years score +0.53. Default: unlimited.")
     parser.add_argument("--yield_history_base", type=int, default=None,
                         help="Oldest calendar year of yield history to include "
                              "(default: earliest year in the crop data).")
@@ -490,6 +528,49 @@ def parse_args():
     tst.add_argument("--lr",           type=float, default=1e-4,
                      help="AdamW learning rate.")
     return parser.parse_args()
+
+
+def _fit_fold_baseline(args, tr_ids, tr_years, tr_y):
+    """County climatology for one fold, fit on training rows only.
+
+    Returns None when --target is not an anomaly target and no baseline metric
+    was requested, so the ordinary paths pay nothing.
+    """
+    if args.target not in ANOMALY_TARGETS and not args.baseline_metric:
+        return None
+    return CountyBaseline(detrend=args.anomaly_detrend).fit(tr_ids, tr_years, tr_y)
+
+
+def _baseline_scores(baseline, te_ids, te_years, y_true, y_pred, standardize):
+    """Score this fold against county climatology, and in anomaly space.
+
+    Two numbers that absolute-yield RMSE cannot give you:
+      * how the model compares to simply predicting what the county normally
+        yields (the null a yield forecast has to beat), and
+      * R² measured on the anomaly, where the between-county variance the model
+        cannot learn from weather has been removed — i.e. actual weather skill.
+    """
+    if baseline is None:
+        return {}
+    base_pred = baseline.inverse(te_ids, te_years,
+                                 np.zeros(len(y_true)), standardize=False)
+    base_rmse = float(np.sqrt(np.mean((base_pred - y_true) ** 2)))
+    model_rmse = float(np.sqrt(np.mean((y_pred - y_true) ** 2)))
+
+    a_true = baseline.transform(te_ids, te_years, y_true, standardize)
+    a_pred = baseline.transform(te_ids, te_years, y_pred, standardize)
+    ss_tot = float(np.sum((a_true - a_true.mean()) ** 2))
+    return {
+        "baseline_climatology_rmse": base_rmse,
+        "skill_vs_climatology_pct": (float(100 * (1 - model_rmse / base_rmse))
+                                     if base_rmse > 0 else None),
+        "beats_climatology": bool(model_rmse < base_rmse),
+        "r2_anomaly": (float(1 - np.sum((a_pred - a_true) ** 2) / ss_tot)
+                       if ss_tot > 0 else None),
+        "corr_anomaly": (float(np.corrcoef(a_true, a_pred)[0, 1])
+                         if len(a_true) > 1 and a_true.std() > 0
+                         and a_pred.std() > 0 else None),
+    }
 
 
 def _finalize_fold(meta_te, y_true, y_pred, all_years, fold_label, model_type,
@@ -638,7 +719,7 @@ def _yield_lag_columns(feature_cols):
 
 
 def run_fold(adm2_df, feature_cols, all_years, fold_col, fold_value, fold_label,
-             model_type, fold_dir, cv_scheme="year", forecast_year=1,
+             model_type, fold_dir, args_ns, cv_scheme="year", forecast_year=1,
              guard_history_leak=True, seed=42):
     """Train a tabular model leaving out one fold (a year or a climate cell).
 
@@ -675,9 +756,25 @@ def run_fold(adm2_df, feature_cols, all_years, fold_col, fold_value, fold_label,
         X_tr[lag_cols]  = hist
         X_tr[mask_cols] = hmask
 
+    # Anomaly targets: fit the county baseline on this fold's training rows,
+    # train on the anomaly, and invert the predictions back to kg/ha so every
+    # metric and CSV downstream stays in yield units.
+    tr_ids   = adm2_df.loc[train_mask, "adm2_id"].to_numpy()
+    tr_years = adm2_df.loc[train_mask, "hindcast_start"].to_numpy()
+    te_ids   = meta_te["adm2_id"].to_numpy()
+    te_years = meta_te["hindcast_start"].to_numpy()
+    baseline = _fit_fold_baseline(args_ns, tr_ids, tr_years, y_tr.to_numpy())
+    standardize = args_ns.target == "yield_zscore"
+
+    y_fit = y_tr
+    if args_ns.target in ANOMALY_TARGETS:
+        y_fit = baseline.transform(tr_ids, tr_years, y_tr.to_numpy(), standardize)
+
     model = YieldModel(model_type, random_state=seed)
-    model.fit(X_tr, y_tr)
+    model.fit(X_tr, y_fit)
     y_pred = model.predict(X_te)
+    if args_ns.target in ANOMALY_TARGETS:
+        y_pred = baseline.inverse(te_ids, te_years, y_pred, standardize)
 
     extra_meta = {
         "feature_importances": (
@@ -685,7 +782,11 @@ def run_fold(adm2_df, feature_cols, all_years, fold_col, fold_value, fold_label,
             if model.feature_importances_ is not None else None
         ),
         "history_entries_masked": n_hist_masked,
+        "target": args_ns.target,
+        "anomaly_detrend": args_ns.anomaly_detrend,
         "seed": seed,
+        **_baseline_scores(baseline, te_ids, te_years,
+                           y_te.to_numpy(), y_pred, standardize),
     }
     train_years = sorted(adm2_df.loc[train_mask, "hindcast_start"].unique().tolist())
     test_years  = sorted(adm2_df.loc[test_mask,  "hindcast_start"].unique().tolist())
@@ -738,9 +839,29 @@ def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_valu
             val_hist=yield_hist[test_mask], val_hist_mask=yield_mask[test_mask],
         )
 
+    # Anomaly targets: baseline fit on this fold's training samples only, so the
+    # held-out year never contributes to its own normalisation. The model learns
+    # the anomaly; predictions are inverted to kg/ha before scoring.
+    tr_ids   = sample_meta.loc[train_mask, "adm2_id"].to_numpy()
+    tr_years = sample_meta.loc[train_mask, "hindcast_start"].to_numpy()
+    te_ids   = meta_te["adm2_id"].to_numpy()
+    te_years = meta_te["hindcast_start"].to_numpy()
+    y_true_orig = np.asarray(val_tgts, dtype=float).reshape(-1)
+    baseline    = _fit_fold_baseline(args, tr_ids, tr_years,
+                                     np.asarray(train_tgts, dtype=float).reshape(-1))
+    standardize = args.target == "yield_zscore"
+
+    fit_train, fit_val = train_tgts, val_tgts
+    if args.target in ANOMALY_TARGETS:
+        fit_train = baseline.transform(tr_ids, tr_years,
+                                       np.asarray(train_tgts).reshape(-1),
+                                       standardize).reshape(-1, 1).astype(np.float32)
+        fit_val   = baseline.transform(te_ids, te_years, y_true_orig,
+                                       standardize).reshape(-1, 1).astype(np.float32)
+
     log_target = args.target == "log_yield"
     y_pred = train_predict_patchtst(
-        train_seqs, train_tgts, val_seqs, val_tgts,
+        train_seqs, fit_train, val_seqs, fit_val,
         run_dir=fold_dir,
         hparams=dict(
             patch_length=args.patch_length,
@@ -758,9 +879,15 @@ def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_valu
         **hist_kwargs,
     )
 
+    if args.target in ANOMALY_TARGETS:
+        y_pred = baseline.inverse(te_ids, te_years, y_pred, standardize)
+
     extra_meta = {
         "seed":         seed,
         "target":       args.target,
+        "anomaly_detrend": args.anomaly_detrend,
+        **_baseline_scores(baseline, te_ids, te_years,
+                           y_true_orig, np.asarray(y_pred).reshape(-1), standardize),
         "patch_length": args.patch_length,
         "patch_stride": args.patch_stride,
         "d_model":      args.d_model,
@@ -911,6 +1038,8 @@ def main():
     clim_tag  = ("" if climate_vars == list(WEATHER_VARS)
                  else "_clim-" + "-".join(v.split("_")[0] for v in climate_vars))
     hist_tag  = "_yhist" if args.yield_history else ""
+    if args.yield_history and args.yield_history_len:
+        hist_tag += f"{args.yield_history_len}"
     exp_id  = (
         f"loo_{args.crop}_{args.model_type}_{args.feature_mode}_{args.target}"
         f"{clim_tag}{hist_tag}{pheno_tag}{cv_tag}"
@@ -998,7 +1127,8 @@ def main():
             from tst_implementation import build_yield_history_arrays
             yield_hist, yield_mask, _, _ = build_yield_history_arrays(
                 sample_meta, args.data_dir, args.crop, args.aoi,
-                base_year=args.yield_history_base)
+                base_year=args.yield_history_base,
+                max_len=args.yield_history_len)
         county_meta = sample_meta[["adm2_id", "adm2", "adm1"]].drop_duplicates("adm2_id")
     else:
         adm2_df, feature_cols = load_and_prepare(
@@ -1014,6 +1144,7 @@ def main():
             aoi=args.aoi,
             yield_history=args.yield_history,
             yield_history_base=args.yield_history_base,
+            yield_history_len=args.yield_history_len,
             use_phenology=args.use_phenology,
             phenology_lag_years=args.phenology_lag_years,
             phenology_suffix=args.phenology_suffix,
@@ -1080,7 +1211,8 @@ def main():
         else:
             result = run_fold(adm2_df, feature_cols, all_years,
                               fold_col, fold_value, fold_label,
-                              args.model_type, fold_dir, cv_scheme=args.cv_scheme,
+                              args.model_type, fold_dir, args,
+                              cv_scheme=args.cv_scheme,
                               forecast_year=args.forecast_year,
                               guard_history_leak=not args.allow_history_leakage,
                               seed=seed)
@@ -1129,6 +1261,7 @@ def main():
         "climate_vars":       climate_vars,
         "yield_history":      args.yield_history,
         "yield_history_base": args.yield_history_base,
+        "yield_history_len":  args.yield_history_len,
         "allow_history_leakage": args.allow_history_leakage,
         "use_phenology":      args.use_phenology,
         "phenology_lag_years": args.phenology_lag_years,
