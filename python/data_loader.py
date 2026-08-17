@@ -500,7 +500,8 @@ STATIC_COVARS = {
 }
 
 
-def load_static_covariates(covars, aoi="CONUS", county_shp=None) -> pd.DataFrame:
+def load_static_covariates(covars, aoi="CONUS", county_shp=None,
+                           search_dirs=()) -> pd.DataFrame:
     """Time-invariant per-admin-unit features: adm2_id plus one column each.
 
     Currently only 'latlon' (polygon centroid, degrees). Centroids are taken in
@@ -525,9 +526,12 @@ def load_static_covariates(covars, aoi="CONUS", county_shp=None) -> pd.DataFrame
                          f"Choices: {sorted(STATIC_COVARS)}")
     # Lazy: pulls geopandas (and matplotlib via plot_results), which the rest of
     # this module deliberately does not require.
-    from plot_results import load_counties_geo
+    from plot_results import load_counties_geo, resolve_aoi_shp
 
-    gdf = load_counties_geo(county_shp, aoi=aoi)          # equal-area projection
+    # Resolve before loading so a missing file names every path tried rather
+    # than surfacing as a bare pyogrio DataSourceError.
+    shp = resolve_aoi_shp(aoi, county_shp, search_dirs=search_dirs)
+    gdf = load_counties_geo(shp, aoi=aoi)                 # equal-area projection
     cen = gdf.geometry.centroid.to_crs("EPSG:4326")
     out = pd.DataFrame({"adm2_id": gdf["GEOID"].astype(str),
                         "lat": cen.y.to_numpy(), "lon": cen.x.to_numpy()})

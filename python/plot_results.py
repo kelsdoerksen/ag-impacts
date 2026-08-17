@@ -84,11 +84,60 @@ AOI_GEO = {
 }
 
 # Default adm2 shapefile per AOI, so --county_shp can be omitted for known AOIs.
-_PROC_ROOT = "/Users/kdoerkse/Documents/UCT/AgImpacts"
-AOI_DEFAULT_SHP = {
-    "CONUS": f"{_PROC_ROOT}/us_county_2020_shapefile/cb_2020_us_county_20m.shp",
-    "BF":    f"{_PROC_ROOT}/cy-bench/polygons/BF/BF.shp",
+# Root holding the shapefiles. Overridable so the same code runs on a laptop and
+# on the lab machine, where nothing lives under /Users: set AGIMPACTS_ROOT, or
+# pass an explicit --county_shp / --static_shp.
+_PROC_ROOT = os.environ.get("AGIMPACTS_ROOT",
+                            "/Users/kdoerkse/Documents/UCT/AgImpacts")
+
+# Path of each AOI's shapefile relative to that root, so a resolver can also go
+# looking for the same layout under other directories (see resolve_aoi_shp).
+AOI_SHP_RELPATH = {
+    "CONUS": "us_county_2020_shapefile/cb_2020_us_county_20m.shp",
+    "BF":    "cy-bench/polygons/BF/BF.shp",
 }
+AOI_DEFAULT_SHP = {a: os.path.join(_PROC_ROOT, r)
+                   for a, r in AOI_SHP_RELPATH.items()}
+
+
+def resolve_aoi_shp(aoi: str, county_shp: str | None = None,
+                    search_dirs=()) -> str:
+    """Find the adm2 shapefile for `aoi`, or raise saying everywhere it looked.
+
+    Order: an explicit path, then $AGIMPACTS_ROOT (or the built-in default),
+    then the same relative layout under each of `search_dirs` — which lets a run
+    find the shapefile next to its --data_dir without any configuration.
+    """
+    if county_shp:
+        if not os.path.exists(county_shp):
+            raise FileNotFoundError(f"Shapefile not found: {county_shp!r}")
+        return county_shp
+
+    rel = AOI_SHP_RELPATH.get(aoi)
+    if rel is None:
+        raise ValueError(f"No default shapefile known for AOI {aoi!r}; pass an "
+                         f"explicit path. Known: {sorted(AOI_SHP_RELPATH)}")
+
+    tried = []
+    roots = [_PROC_ROOT]
+    for d in search_dirs:
+        if not d:
+            continue
+        d = os.path.abspath(d)
+        roots += [d, os.path.dirname(d)]      # beside --data_dir, and one up
+    for root in roots:
+        cand = os.path.join(root, rel)
+        tried.append(cand)
+        if os.path.exists(cand):
+            return cand
+
+    raise FileNotFoundError(
+        f"Could not find the adm2 shapefile for AOI {aoi!r}. Tried:\n  "
+        + "\n  ".join(dict.fromkeys(tried))
+        + "\n\nFix by any of: pass the path explicitly (--county_shp / "
+          "--static_shp), or set AGIMPACTS_ROOT to the directory holding "
+          f"{rel!r}."
+    )
 
 
 def aoi_geo_config(aoi: str) -> dict:
@@ -686,14 +735,17 @@ def load_plot_geometries(shp_path, country, county_shp, aoi="CONUS"):
               "skipping state-level (admin1) maps. Pass --shp_path to enable them.")
 
     counties_gdf = None
-    county_shp = county_shp or AOI_DEFAULT_SHP.get(aoi)
-    if county_shp and os.path.exists(county_shp):
-        print(f"Loading county shapefile: {county_shp}")
-        counties_gdf = load_counties_geo(county_shp, aoi=aoi)
-        print(f"Admin-2 units loaded: {len(counties_gdf)}")
+    try:
+        # Same resolution order as the training path, so a machine that can run
+        # the model can also plot it without extra configuration.
+        shp = resolve_aoi_shp(aoi, county_shp)
+    except (FileNotFoundError, ValueError) as exc:
+        # Plotting is optional — degrade to skipping the maps rather than dying.
+        print(f"{exc}\nSkipping county (admin2) maps.")
     else:
-        print(f"No adm2 shapefile for AOI {aoi} ({county_shp!r}); "
-              "skipping county (admin2) maps. Pass --county_shp to enable them.")
+        print(f"Loading county shapefile: {shp}")
+        counties_gdf = load_counties_geo(shp, aoi=aoi)
+        print(f"Admin-2 units loaded: {len(counties_gdf)}")
     return states_gdf, counties_gdf
 
 

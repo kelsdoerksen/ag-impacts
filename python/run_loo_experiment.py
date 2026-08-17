@@ -449,6 +449,11 @@ def parse_args():
                              "with anomaly R2 of 0.011). Once the baseline is "
                              "removed they can condition the weather response "
                              "instead. Default: off.")
+    parser.add_argument("--static_shp", type=str, default=None,
+                        help="adm2 shapefile for --static_covars. Optional: the "
+                             "known path for --aoi is tried first, then the same "
+                             "layout under --data_dir. Set AGIMPACTS_ROOT to move "
+                             "the default off this machine's paths.")
     parser.add_argument("--val_years", type=int, default=2,
                         help="Whole training years held out per fold for "
                              "checkpoint selection (tst only). Without this the "
@@ -1234,7 +1239,9 @@ def main():
         # Static per-unit covariates, row-aligned to sequences/sample_meta.
         static_arr = None
         if args.static_covars:
-            sc = load_static_covariates(args.static_covars, aoi=args.aoi)
+            sc = load_static_covariates(args.static_covars, aoi=args.aoi,
+                                        county_shp=args.static_shp,
+                                        search_dirs=(args.data_dir,))
             cols = [c for t in args.static_covars for c in STATIC_COVARS[t]]
             merged = sample_meta[["adm2_id"]].merge(sc, on="adm2_id", how="left")
             missing = int(merged[cols].isna().any(axis=1).sum())
