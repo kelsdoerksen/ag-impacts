@@ -897,6 +897,10 @@ def train_predict_patchtst(
     train_hist_mask: np.ndarray | None = None,
     val_hist: np.ndarray | None = None,
     val_hist_mask: np.ndarray | None = None,
+    eval_seqs: np.ndarray | None = None,
+    eval_tgts: np.ndarray | None = None,
+    eval_hist: np.ndarray | None = None,
+    eval_hist_mask: np.ndarray | None = None,
     history_hidden: int = 64,
     seed: int = DEFAULT_SEED,
 ) -> np.ndarray:
@@ -964,9 +968,30 @@ def train_predict_patchtst(
     train_dataset = YieldSequenceDataset(
         train_seqs_n, train_tgts, log_target=log_target,
         yield_history=train_hist_n, yield_mask=train_hist_mask)
+    # val_* is the fold being PREDICTED (the held-out test year). It is used
+    # only by trainer.predict at the end.
     val_dataset   = YieldSequenceDataset(
         val_seqs_n, val_tgts, log_target=log_target,
         yield_history=val_hist_n, yield_mask=val_hist_mask)
+
+    # eval_* is the model-SELECTION set, carved out of the training years. Kept
+    # separate from val_* so checkpoint selection never sees the test fold —
+    # picking the best epoch by test loss is selecting on the test set, which
+    # optimistically biases every metric the run reports.
+    eval_dataset = None
+    if eval_seqs is not None:
+        eval_hist_n = (apply_history_normalizer(eval_hist, eval_hist_mask,
+                                                h_mean, h_std)
+                       if use_history and eval_hist is not None else None)
+        eval_dataset = YieldSequenceDataset(
+            apply_normalizer(eval_seqs, ch_mean, ch_std), eval_tgts,
+            log_target=log_target,
+            yield_history=eval_hist_n, yield_mask=eval_hist_mask)
+        print(f"[split] Model selection on {len(eval_dataset):,} held-out "
+              f"TRAINING samples; test fold never seen until predict.")
+    else:
+        print("[split] No validation split — taking the final epoch's weights "
+              "(selecting on the test fold would bias the reported metrics).")
 
     # ── Build model ──
     # Derive channel count from the data so optional phenology channels flow
@@ -995,9 +1020,12 @@ def train_predict_patchtst(
         per_device_train_batch_size=tc["batch_size"],
         per_device_eval_batch_size=tc["batch_size"],
         learning_rate=tc["lr"],
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        load_best_model_at_end=True,
+        # Only select checkpoints when there is a genuine validation split to
+        # select on. Without one we take the final epoch rather than peeking at
+        # the test fold.
+        eval_strategy="epoch" if eval_dataset is not None else "no",
+        save_strategy="epoch" if eval_dataset is not None else "no",
+        load_best_model_at_end=eval_dataset is not None,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         save_total_limit=2,
@@ -1014,13 +1042,13 @@ def train_predict_patchtst(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=val_dataset,
+        eval_dataset=eval_dataset,
     )
 
     print(f"[train] Starting training ({tc['epochs']} epochs)…\n")
     trainer.train()
 
-    print("\n[eval]  Running final inference on validation set…")
+    print("\n[eval]  Running final inference on the held-out test fold…")
     pred_output = trainer.predict(val_dataset, metric_key_prefix="val")
     preds = pred_output.predictions.squeeze()  # (N,)
     if log_target:

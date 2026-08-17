@@ -143,6 +143,7 @@ def build_config_key(args, climate_vars, study_start, study_end):
         "yield_history":      bool(args.yield_history),
         "yield_history_base": args.yield_history_base,
         "yield_history_len":  args.yield_history_len,
+        "val_years":          args.val_years,
         "allow_history_leakage": bool(args.allow_history_leakage),
         "use_phenology":      list(args.use_phenology) if args.use_phenology else None,
         "phenology_suffix":   args.phenology_suffix,
@@ -431,6 +432,15 @@ def parse_args():
                              "--yield_history_base (default off). Tabular models get "
                              "lag feature columns; the tst model gets a second "
                              "time-series branch.")
+    parser.add_argument("--val_years", type=int, default=2,
+                        help="Whole training years held out per fold for "
+                             "checkpoint selection (tst only). Without this the "
+                             "Trainer selects the best epoch on the TEST fold, "
+                             "which is model selection on the test set and "
+                             "optimistically biases every reported metric. Held "
+                             "out by year, not by row, so the split matches the "
+                             "LOO protocol. 0 disables the split and takes the "
+                             "final epoch instead. Default: 2.")
     parser.add_argument("--yield_history_len", type=int, default=None,
                         help="Rolling window: keep only the N most recent prior "
                              "years of history per sample. Unlike "
@@ -818,25 +828,65 @@ def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_valu
         print(f"  fold {fold_label}: no test data — skipping")
         return None
 
+    # Carve the model-selection set out of the TRAINING years, by whole years so
+    # it matches the LOO protocol — a random sample of rows would put the same
+    # year on both sides of the split, and yields within a year are strongly
+    # correlated, so it would not measure generalisation to an unseen season.
+    val_mask = np.zeros_like(train_mask)
+    val_years = []
+    if args.val_years > 0 and cv_scheme == "year":
+        pool = sorted(set(sample_meta.loc[train_mask, "hindcast_start"]))
+        n_val = min(args.val_years, max(len(pool) - 1, 0))
+        if n_val:
+            # Seeded per fold so the choice is reproducible but not identical
+            # across folds (which would make one year carry all the selection).
+            rng = np.random.default_rng(abs(hash((seed, str(fold_value)))) % (2 ** 32))
+            val_years = sorted(rng.choice(pool, size=n_val, replace=False).tolist())
+            val_mask  = train_mask & sample_meta["hindcast_start"].isin(val_years).to_numpy()
+            train_mask = train_mask & ~val_mask
+            print(f"  fold {fold_label}: validation years {val_years} "
+                  f"({int(val_mask.sum()):,} samples) held out of training")
+
     train_seqs, train_tgts = sequences[train_mask], targets[train_mask]
     val_seqs,   val_tgts   = sequences[test_mask],  targets[test_mask]
     meta_te = sample_meta.loc[test_mask, meta_cols].copy()
+    has_val = bool(val_mask.any())
 
     hist_kwargs   = {}
     n_hist_masked = None
     if yield_hist is not None:
         train_hist, train_hmask = yield_hist[train_mask], yield_mask[train_mask]
-        # The held-out fold's yields are lag features of later training samples;
-        # blank them so the model never trains on this fold's labels.
+        eval_hist  = yield_hist[val_mask] if has_val else None
+        eval_hmask = yield_mask[val_mask] if has_val else None
+        # Prior-yield history makes a held-out year's LABELS visible as other
+        # samples' lag features. Both held-out sets need blocking, not just the
+        # test fold:
+        #   * training rows must not carry test-year OR validation-year yields —
+        #     the latter would make validation loss optimistic and corrupt the
+        #     checkpoint choice, which is the whole point of the split;
+        #   * validation rows must not carry test-year yields, since validation
+        #     drives model selection.
+        # Test rows keep their full history: a county's own past observed yields
+        # are legitimately known at forecast time.
         if not args.allow_history_leakage:
+            blocked_tr = pd.concat([sample_meta.loc[test_mask],
+                                    sample_meta.loc[val_mask]]) if has_val \
+                         else sample_meta.loc[test_mask]
             train_hist, train_hmask, n_hist_masked = _suppress_history_leak(
                 train_hist, train_hmask,
-                sample_meta.loc[train_mask], sample_meta.loc[test_mask],
+                sample_meta.loc[train_mask], blocked_tr,
                 args.forecast_year,
             )
+            if has_val:
+                eval_hist, eval_hmask, _ = _suppress_history_leak(
+                    eval_hist, eval_hmask,
+                    sample_meta.loc[val_mask], sample_meta.loc[test_mask],
+                    args.forecast_year,
+                )
         hist_kwargs = dict(
             train_hist=train_hist,          train_hist_mask=train_hmask,
             val_hist=yield_hist[test_mask], val_hist_mask=yield_mask[test_mask],
+            eval_hist=eval_hist,            eval_hist_mask=eval_hmask,
         )
 
     # Anomaly targets: baseline fit on this fold's training samples only, so the
@@ -851,17 +901,27 @@ def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_valu
                                      np.asarray(train_tgts, dtype=float).reshape(-1))
     standardize = args.target == "yield_zscore"
 
-    fit_train, fit_val = train_tgts, val_tgts
+    eval_seqs = sequences[val_mask] if has_val else None
+    eval_tgts = targets[val_mask]   if has_val else None
+
+    fit_train, fit_val, fit_eval = train_tgts, val_tgts, eval_tgts
     if args.target in ANOMALY_TARGETS:
         fit_train = baseline.transform(tr_ids, tr_years,
                                        np.asarray(train_tgts).reshape(-1),
                                        standardize).reshape(-1, 1).astype(np.float32)
         fit_val   = baseline.transform(te_ids, te_years, y_true_orig,
                                        standardize).reshape(-1, 1).astype(np.float32)
+        if has_val:
+            fit_eval = baseline.transform(
+                sample_meta.loc[val_mask, "adm2_id"].to_numpy(),
+                sample_meta.loc[val_mask, "hindcast_start"].to_numpy(),
+                np.asarray(eval_tgts, dtype=float).reshape(-1),
+                standardize).reshape(-1, 1).astype(np.float32)
 
     log_target = args.target == "log_yield"
     y_pred = train_predict_patchtst(
         train_seqs, fit_train, val_seqs, fit_val,
+        eval_seqs=eval_seqs, eval_tgts=fit_eval,
         run_dir=fold_dir,
         hparams=dict(
             patch_length=args.patch_length,
@@ -886,6 +946,8 @@ def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_valu
         "seed":         seed,
         "target":       args.target,
         "anomaly_detrend": args.anomaly_detrend,
+        "val_years": val_years or None,
+        "n_val": int(val_mask.sum()),
         **_baseline_scores(baseline, te_ids, te_years,
                            y_true_orig, np.asarray(y_pred).reshape(-1), standardize),
         "patch_length": args.patch_length,
@@ -1262,6 +1324,7 @@ def main():
         "yield_history":      args.yield_history,
         "yield_history_base": args.yield_history_base,
         "yield_history_len":  args.yield_history_len,
+        "val_years":          args.val_years,
         "allow_history_leakage": args.allow_history_leakage,
         "use_phenology":      args.use_phenology,
         "phenology_lag_years": args.phenology_lag_years,
