@@ -62,7 +62,36 @@ def draw_seed() -> int:
     return secrets.randbelow(SEED_MAX) + 1
 
 WEATHER_VARS    = ["tasmax_C", "tasmin_C", "hursmin", "pr_mm"]
-FEATURE_MODES   = ["aggregated", "timeseries"]
+FEATURE_MODES   = ["aggregated", "timeseries", "agro"]
+
+# ── agronomic ("agro") feature mode ──────────────────────────────────────────
+# A deliberately small, physically-motivated feature set for isolating climate
+# skill, in place of the generic mean/std block of "aggregated" mode.
+#
+# Growing degree days use the standard corn formulation: base (lower threshold)
+# temperature 10 C subtracted from the mean daily air temperature, accumulated
+# and floored at zero. Extreme degree days accumulate heat above 30 C, the
+# threshold above which corn yield response turns sharply negative.
+GDD_BASE_C          = 10.0   # corn lower base temperature
+EDD_THRESHOLD_C     = 30.0   # corn extreme-heat threshold
+GDD_PRESEASON_DAYS  = 14     # GDD accumulation starts this many days pre-plant
+
+# Sub-seasonal features are binned into fixed-length blocks measured from the
+# window start rather than calendar months, so block k means the same
+# phenological stage in every county (m01 is always "the month before the
+# planting window opens"). Calendar months cannot do this: the CONUS corn
+# window spans DOY ~0-363 and varies in length by ~80 days, so a given calendar
+# month falls inside some counties' windows and outside others'.
+SEASON_BLOCK_DAYS    = 30
+SEASON_BLOCKS_DEFAULT = 8    # 8 x 30 = 240 days; every CONUS corn window covers it
+
+# Variables summarised per season block, and the statistics computed for each.
+SEASON_BLOCK_VARS  = ["pr_mm", "hursmin"]
+SEASON_BLOCK_STATS = ["mean", "min", "max", "std", "var"]
+
+# Variables summarised over the whole window ("entire time series") with the
+# same five statistics.
+WHOLE_WINDOW_STATS_VARS = ["hursmin"]
 TARGET_OPTIONS  = ["yield", "yield_pct_change"]
 
 # Targets expressed relative to a county's own history. Unlike the entries in
@@ -178,64 +207,230 @@ class CountyBaseline:
     Counties too thin to fit on their own fall back to the pooled training
     baseline, and sigma is floored so a near-constant county cannot produce
     explosive z-scores.
+
+    Detrending
+    ----------
+    With detrend=True the baseline is a per-county straight line in year rather
+    than a flat mean:  base(year) = level + slope * (year - year0).
+
+    This matters because CONUS maize yields carry a large technology trend
+    (~+140 kg/ha/yr) that a climate-only model cannot possibly predict: under
+    leave-one-year-out it does not know which year it is forecasting, so it is
+    anchored near the whole-period mean and systematically over-predicts early
+    years and under-predicts late ones. A flat mean leaves that bias in the
+    anomaly and it swamps the weather signal. Removing it per county is the
+    difference between measuring weather skill and measuring the trend.
+
+    Counties with fewer than min_trend_years distinct years, or with no spread
+    in year, fall back to a flat mean (their trend is not estimable); counties
+    below min_years fall back to the pooled baseline, which is itself
+    trend-fitted when detrend=True.
     """
 
-    def __init__(self, min_years: int = 3, sigma_floor_frac: float = 0.1):
+    def __init__(self, min_years: int = 3, sigma_floor_frac: float = 0.1,
+                 detrend: bool = False, min_trend_years: int = 8):
         self.min_years        = max(int(min_years), 2)
         self.sigma_floor_frac = float(sigma_floor_frac)
+        self.detrend          = bool(detrend)
+        # A line through very few noisy points overfits: the residual sigma
+        # collapses and the extrapolated slope is wild. Require a real series.
+        self.min_trend_years  = max(int(min_trend_years), 3)
+        # aid -> (level, slope, year0, sigma); slope/year0 are 0.0 when flat.
         self.params: dict = {}
-        self.global_params: tuple = (0.0, 0.0, 1.0)
-        self.n_fallback       = 0
+        self.global_params: tuple = (0.0, 0.0, 0.0, 1.0)
+        self.n_fallback       = 0   # counties too thin for their own baseline
+        self.n_flat           = 0   # counties detrended-mode but fit flat
 
     @staticmethod
-    def _fit_one(vals, min_years):
-        """Return (mean, sigma) for one county, or None if too thin."""
+    def _fit_flat(vals, min_years):
+        """Return (level, slope=0, year0=0, sigma) for one county, or None."""
         n = len(vals)
         if n < min_years:
             return None
         mean = float(vals.mean())
         # ddof=1 where possible: these are estimates, not the population.
         sigma = float((vals - mean).std(ddof=1)) if n > 1 else 0.0
-        return mean, sigma
+        return mean, 0.0, 0.0, sigma
 
-    def fit(self, adm2_ids, y):
+    @staticmethod
+    def _fit_line(years, vals, min_trend_years):
+        """Return (level, slope, year0, resid_sigma), or None if not estimable.
+
+        Centred on the county's mean training year so `level` stays the county
+        mean and the slope term is a small correction — extrapolating one year
+        past the training span (the endpoint LOO folds) stays well conditioned.
+        """
+        if len(np.unique(years)) < min_trend_years:
+            return None
+        year0 = float(years.mean())
+        x     = years.astype(float) - year0
+        if x.std() == 0:
+            return None
+        slope, level = np.polyfit(x, vals, 1)
+        resid = vals - (level + slope * x)
+        # dof = n - 2: two parameters were fit.
+        sigma = float(resid.std(ddof=2)) if len(vals) > 2 else 0.0
+        return float(level), float(slope), year0, sigma
+
+    def _fit_county(self, years, vals):
+        if self.detrend:
+            fit = self._fit_line(years, vals, self.min_trend_years)
+            if fit is not None:
+                return fit, False
+        fit = self._fit_flat(vals, self.min_years)
+        return fit, (fit is not None and self.detrend)
+
+    def fit(self, adm2_ids, y, years=None):
+        """Fit per-county baselines. `years` is required when detrend=True."""
         adm2_ids = np.asarray(adm2_ids)
         y        = np.asarray(y, dtype=float)
+        if self.detrend and years is None:
+            raise ValueError("CountyBaseline(detrend=True).fit needs `years`")
+        years = (np.asarray(years, dtype=float) if years is not None
+                 else np.zeros(len(y)))
 
-        g = self._fit_one(y, 2) or (float(y.mean()), float(y.std()))
-        floor = max(g[1] * self.sigma_floor_frac, 1e-6)
+        # Pooled fallback, trend-fitted too so thin counties still shed the
+        # national trend rather than inheriting a flat whole-period mean.
+        g = None
+        if self.detrend:
+            g = self._fit_line(years, y, self.min_trend_years)
+        if g is None:
+            g = self._fit_flat(y, 2) or (float(y.mean()), 0.0, 0.0, float(y.std()))
+        floor = max(g[3] * self.sigma_floor_frac, 1e-6)
 
         self.n_fallback = 0
+        self.n_flat     = 0
         for aid in np.unique(adm2_ids):
-            fit = self._fit_one(y[adm2_ids == aid], self.min_years)
+            sel = adm2_ids == aid
+            fit, was_flat = self._fit_county(years[sel], y[sel])
             if fit is None:
                 self.n_fallback += 1
                 continue
-            mean, sigma = fit
-            self.params[aid] = (mean, max(sigma, floor))
-        self.global_params = (g[0], max(g[1], floor))
+            level, slope, year0, sigma = fit
+            self.n_flat += int(was_flat)
+            self.params[aid] = (level, slope, year0, max(sigma, floor))
+        self.global_params = (g[0], g[1], g[2], max(g[3], floor))
         return self
 
-    def _lookup(self, adm2_ids):
-        """Vectorised (baseline, sigma) for each row, falling back where unfit."""
-        gm, gsig = self.global_params
-        base  = np.empty(len(adm2_ids), dtype=float)
-        sigma = np.empty(len(adm2_ids), dtype=float)
+    def _lookup(self, adm2_ids, years=None):
+        """Vectorised (baseline, sigma) per row, falling back where unfit."""
+        gl, gsl, gy0, gsig = self.global_params
+        n     = len(adm2_ids)
+        years = (np.asarray(years, dtype=float) if years is not None
+                 else np.zeros(n))
+        base  = np.empty(n, dtype=float)
+        sigma = np.empty(n, dtype=float)
         for i, aid in enumerate(adm2_ids):
-            base[i], sigma[i] = self.params.get(aid, (gm, gsig))
+            level, slope, year0, sig = self.params.get(aid, (gl, gsl, gy0, gsig))
+            base[i]  = level + slope * (years[i] - year0)
+            sigma[i] = sig
         return base, sigma
 
-    def transform(self, adm2_ids, y, standardize: bool):
+    def transform(self, adm2_ids, y, standardize: bool, years=None):
         """kg/ha -> anomaly (or z-score). Inverse of `inverse`."""
-        base, sigma = self._lookup(np.asarray(adm2_ids))
+        base, sigma = self._lookup(np.asarray(adm2_ids), years)
         anom = np.asarray(y, dtype=float) - base
         return anom / sigma if standardize else anom
 
-    def inverse(self, adm2_ids, z, standardize: bool):
+    def inverse(self, adm2_ids, z, standardize: bool, years=None):
         """anomaly (or z-score) -> kg/ha, so every metric downstream is in yield units."""
-        base, sigma = self._lookup(np.asarray(adm2_ids))
+        base, sigma = self._lookup(np.asarray(adm2_ids), years)
         z = np.asarray(z, dtype=float)
         return (z * sigma + base) if standardize else (z + base)
+
+
+# Modes for --within_county_features. "none" leaves the design matrix alone.
+WITHIN_COUNTY_MODES = ["none", "center", "zscore"]
+
+
+class WithinCountyScaler:
+    """Re-express each feature as a deviation from that county's own normal.
+
+    Why this exists
+    ---------------
+    A seasonal climate aggregate is mostly a description of *where* a county is,
+    not of *what happened* there this year. Measured on CONUS corn, the share of
+    each feature's variance that lies between counties rather than within a
+    county across years is 0.93 for season-mean tasmax/tasmin, 0.89 for
+    GDD/EDD/hot-day counts, and 0.23 even for per-block precipitation. A tree
+    model handed those columns can identify the county and predict its long-run
+    mean yield — spatial regression dressed up as forecasting. It scores well on
+    absolute yield (R2 up to ~0.7 here) while having no anomaly skill at all.
+
+    Subtracting each county's own training-period feature mean removes that
+    channel: every column becomes "how unusual was this season, for this
+    county", so whatever skill survives is genuinely weather-driven. This is the
+    feature-side counterpart of what CountyBaseline does to the target.
+
+    Fitting on training rows only is essential for the same reason it is in
+    CountyBaseline: under leave-one-year-out the held-out year must not
+    contribute to the mean it is centred on.
+
+    Modes
+    -----
+    center  x - mean_county(x)                    keeps each feature's units
+    zscore  (x - mean_county(x)) / sd_county(x)   puts every county's variability
+                                                  on one scale, so a wet year in
+                                                  Arizona and in Iowa read alike
+
+    Counties unseen in training fall back to the pooled training mean/sd.
+    Features that never vary within a county (plant_doy, and the yield_lagmask
+    indicator columns, which must stay 0/1) can be excluded via `skip_cols`.
+    """
+
+    def __init__(self, mode: str = "center", skip_cols=None, sd_floor_frac: float = 1e-3):
+        if mode not in WITHIN_COUNTY_MODES:
+            raise ValueError(f"mode must be one of {WITHIN_COUNTY_MODES}, got {mode!r}")
+        self.mode          = mode
+        self.skip_cols     = set(skip_cols or [])
+        self.sd_floor_frac = float(sd_floor_frac)
+        self.cols: list    = []
+        self.means         = None   # DataFrame: index adm2_id, columns self.cols
+        self.sds           = None
+        self.global_mean   = None   # Series over self.cols
+        self.global_sd     = None
+        self.n_unseen      = 0
+
+    def fit(self, X, adm2_ids):
+        """Learn per-county means (and sds) from training rows only."""
+        self.cols = [c for c in X.columns if c not in self.skip_cols]
+        ids = pd.Series(np.asarray(adm2_ids), index=X.index, name="_aid")
+        sub = X[self.cols]
+
+        g = sub.groupby(ids)
+        self.means = g.mean()
+        self.global_mean = sub.mean()
+        if self.mode == "zscore":
+            # ddof=1: a county's spread across its training years is an estimate.
+            self.sds = g.std(ddof=1)
+            self.global_sd = sub.std(ddof=1)
+            # A county with one training year, or a feature constant within the
+            # county, gives sd 0 or NaN. Floor against the pooled spread so the
+            # division cannot blow up or produce NaN.
+            floor = (self.global_sd.abs() * self.sd_floor_frac).clip(lower=1e-9)
+            self.global_sd = self.global_sd.fillna(0.0).clip(lower=floor)
+            self.sds = self.sds.fillna(0.0).clip(lower=floor, axis=1)
+        return self
+
+    def transform(self, X, adm2_ids):
+        """Centre (and optionally scale) X against its counties' training normals."""
+        if self.mode == "none":
+            return X
+        ids = pd.Series(np.asarray(adm2_ids), index=X.index, name="_aid")
+        # reindex aligns each row to its county's stats; unseen counties -> NaN,
+        # which we then fill with the pooled values.
+        mu = self.means.reindex(ids.to_numpy())
+        self.n_unseen = int(mu.isna().all(axis=1).sum())
+        mu = mu.fillna(self.global_mean)
+        mu.index = X.index
+
+        out = X.copy()
+        out[self.cols] = X[self.cols].to_numpy() - mu[self.cols].to_numpy()
+        if self.mode == "zscore":
+            sd = self.sds.reindex(ids.to_numpy()).fillna(self.global_sd)
+            sd.index = X.index
+            out[self.cols] = out[self.cols].to_numpy() / sd[self.cols].to_numpy()
+        return out
 
 
 def _apply_target(crop_df: pd.DataFrame, target: str) -> pd.DataFrame:
@@ -812,7 +1007,7 @@ def load_crop_climate_data(
 ) -> pd.DataFrame:
     """Load and merge climate + crop parquets; apply the appropriate date window.
 
-    Aggregated mode window (date-based, year-boundary safe):
+    Aggregated / agro mode window (date-based, year-boundary safe):
         [plant_start_date − preseason_buffer,  harvest_end_date + postharvest_buffer]
 
     Timeseries mode window:
@@ -897,7 +1092,7 @@ def load_crop_climate_data(
     # anchor them to Jan 1 of the yield year before applying buffers.
     yield_yr_jan1 = pd.to_datetime(merged["yield_year"].astype(str) + "-01-01")
 
-    if feature_mode == "aggregated":
+    if feature_mode in ("aggregated", "agro"):
         window_start = yield_yr_jan1 + pd.to_timedelta(
             merged["plant_start_doy"] - preseason_buffer - 1, unit="D"
         )
@@ -976,6 +1171,178 @@ def build_features(adm2_df: pd.DataFrame, weather_cols: list):
     mask    = adm2_df[feature_cols].notna().all(axis=1)
     adm2_df = adm2_df[mask].copy()
     print(f"Samples after dropping NaN features: {len(adm2_df)}")
+    return adm2_df, feature_cols
+
+
+# ---------------------------------------------------------------------------
+# Agronomic features ("agro" feature mode)
+# ---------------------------------------------------------------------------
+
+def _window_start_dates(df: pd.DataFrame, preseason_buffer: int) -> pd.Series:
+    """Nominal first day of each row's seasonal window.
+
+    Recomputed from the crop calendar rather than taken as each group's earliest
+    observed date, so the season-block grid is anchored identically for every
+    county-year even where the climate series is short a leading day.
+    """
+    jan1 = pd.to_datetime(df["yield_year"].astype(str) + "-01-01")
+    return jan1 + pd.to_timedelta(df["plant_start_doy"] - preseason_buffer - 1,
+                                  unit="D")
+
+
+def build_agro_features(
+    daily_df: pd.DataFrame,
+    preseason_buffer: int = 60,
+    season_blocks: int = SEASON_BLOCKS_DEFAULT,
+    gdd_base: float = GDD_BASE_C,
+    edd_threshold: float = EDD_THRESHOLD_C,
+    gdd_preseason_days: int = GDD_PRESEASON_DAYS,
+) -> tuple[pd.DataFrame, list]:
+    """Build the curated agronomic feature set, one row per (adm2_id, hindcast_start).
+
+    Features (all computed inside the seasonal window the loader already applied,
+    i.e. [plant_start − preseason_buffer, harvest_end + postharvest_buffer]):
+
+      Heat accumulation
+        gdd                 Growing degree days: sum of max(Tmean − gdd_base, 0)
+                            over [plant_start − gdd_preseason_days, window end].
+                            Tmean = (tasmax_C + tasmin_C) / 2; gdd_base is the
+                            corn lower threshold, 10 C.
+        edd                 Extreme degree days: sum of max(tasmax_C −
+                            edd_threshold, 0) over the full window — heat load
+                            above 30 C, not just its frequency.
+        days_over_{T}C      Count of days in the window with tasmax_C above the
+                            threshold. Reported alongside edd because "number of
+                            extreme degree days" is used for both quantities.
+
+      Season temperature
+        tasmax_C_mean       Mean daily maximum over the full window.
+        tasmin_C_mean       Mean daily minimum over the full window.
+
+      Whole-window humidity
+        hursmin_{mean,min,max,std,var}
+
+      Sub-seasonal precipitation and humidity
+        {pr_mm,hursmin}_m{NN}_{mean,min,max,std,var}
+                            for NN = 01..season_blocks, where block NN covers
+                            days [(NN−1)·30 + 1, NN·30] measured from the window
+                            start. The final block absorbs any remaining days, so
+                            a longer window lengthens the last block rather than
+                            adding a partly-empty one.
+
+    Notes
+    -----
+    GDD accumulation starts gdd_preseason_days before plant_start_doy, which is
+    only fully inside the loaded window when preseason_buffer >= that value; a
+    warning is printed otherwise since the sum would then be truncated.
+
+    Returns (adm2_df, feature_cols).
+    """
+    if season_blocks < 1:
+        raise ValueError(f"season_blocks must be >= 1, got {season_blocks}")
+    missing = [c for c in ("tasmax_C", "tasmin_C", "hursmin", "pr_mm")
+               if c not in daily_df.columns]
+    if missing:
+        raise ValueError(
+            f"agro feature mode needs daily columns {missing}, which are absent. "
+            "It uses the full weather set, so do not restrict --climate_vars."
+        )
+    if preseason_buffer < gdd_preseason_days:
+        print(
+            f"WARNING: --preseason_buffer {preseason_buffer} is shorter than the "
+            f"{gdd_preseason_days}-day GDD pre-plant lead-in, so GDD is "
+            f"accumulated from the window start instead and undercounts."
+        )
+
+    df = daily_df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    keys = ["adm2_id", "hindcast_start"]
+
+    # ---- daily derived quantities ----
+    tmean = (df["tasmax_C"] + df["tasmin_C"]) / 2.0
+    df["_gdd_day"]  = (tmean - gdd_base).clip(lower=0)
+    df["_edd_day"]  = (df["tasmax_C"] - edd_threshold).clip(lower=0)
+    df["_hot_day"]  = (df["tasmax_C"] > edd_threshold).astype(float)
+
+    # GDD accumulates only from gdd_preseason_days before the planting window
+    # opens, so zero out the earlier part of the window rather than sub-setting
+    # rows (keeps one pass over the frame and one groupby).
+    jan1      = pd.to_datetime(df["yield_year"].astype(str) + "-01-01")
+    gdd_start = jan1 + pd.to_timedelta(
+        df["plant_start_doy"] - gdd_preseason_days - 1, unit="D")
+    df["_gdd_day"] = df["_gdd_day"].where(df["date"] >= gdd_start, 0.0)
+
+    # ---- season block index ----
+    # Days elapsed since the nominal window start, bucketed into fixed-length
+    # blocks. The last block is clipped so it absorbs the variable-length tail.
+    elapsed = (df["date"] - _window_start_dates(df, preseason_buffer)).dt.days
+    df["_block"] = (elapsed // SEASON_BLOCK_DAYS).clip(lower=0,
+                                                       upper=season_blocks - 1)
+
+    # ---- whole-window aggregates ----
+    hot_col = f"days_over_{edd_threshold:g}C"
+    agg = {
+        "gdd":            ("_gdd_day",  "sum"),
+        "edd":            ("_edd_day",  "sum"),
+        hot_col:          ("_hot_day",  "sum"),
+        "tasmax_C_mean":  ("tasmax_C",  "mean"),
+        "tasmin_C_mean":  ("tasmin_C",  "mean"),
+    }
+    for var in WHOLE_WINDOW_STATS_VARS:
+        for stat in SEASON_BLOCK_STATS:
+            agg[f"{var}_{stat}"] = (var, stat)
+    agg["yield"] = ("yield", "first")
+    agg["adm2"]  = ("adm2",  "first")
+    agg["adm1"]  = ("adm1",  "first")
+
+    adm2_df = df.groupby(keys).agg(**agg).reset_index()
+
+    whole_cols = (
+        ["gdd", "edd", hot_col, "tasmax_C_mean", "tasmin_C_mean"]
+        + [f"{v}_{s}" for v in WHOLE_WINDOW_STATS_VARS
+           for s in SEASON_BLOCK_STATS]
+    )
+
+    # ---- per-block aggregates ----
+    # Aggregate once per (county-year, block), then pivot blocks into columns.
+    block_stats = (
+        df.groupby(keys + ["_block"])[SEASON_BLOCK_VARS]
+        .agg(SEASON_BLOCK_STATS)
+    )
+    # MultiIndex columns (var, stat) x block index -> flat {var}_m{NN}_{stat}
+    block_wide = block_stats.unstack("_block")
+    block_wide.columns = [
+        f"{var}_m{int(blk) + 1:02d}_{stat}"
+        for var, stat, blk in block_wide.columns
+    ]
+    block_cols = [
+        f"{var}_m{b + 1:02d}_{stat}"
+        for var in SEASON_BLOCK_VARS
+        for b in range(season_blocks)
+        for stat in SEASON_BLOCK_STATS
+    ]
+    # Name every expected column even if no county-year reached that block, so
+    # the feature matrix has a fixed width and the NaN filter below reports it.
+    block_wide = block_wide.reindex(columns=block_cols)
+    adm2_df = adm2_df.merge(block_wide.reset_index(), on=keys, how="left")
+
+    feature_cols = whole_cols + block_cols
+
+    # A single-day block makes std/var undefined; that is a real coverage gap in
+    # the window, so drop those county-years rather than imputing a zero spread.
+    adm2_df = adm2_df.dropna(subset=["yield"])
+    before  = len(adm2_df)
+    adm2_df = adm2_df[adm2_df[feature_cols].notna().all(axis=1)].reset_index(drop=True)
+    if before != len(adm2_df):
+        print(f"  Dropped {before - len(adm2_df):,} county-years with incomplete "
+              f"season-block coverage")
+
+    print(
+        f"Agro features      : {len(feature_cols)} columns "
+        f"({len(whole_cols)} whole-window + {len(block_cols)} sub-seasonal over "
+        f"{season_blocks} x {SEASON_BLOCK_DAYS}d blocks); "
+        f"{len(adm2_df):,} county-year pairs"
+    )
     return adm2_df, feature_cols
 
 
@@ -1074,6 +1441,10 @@ def load_and_prepare(
     phenology_suffix: str | None = None,
     phenology_lookback_years: int = 1,
     climate_vars: list | None = None,
+    season_blocks: int = SEASON_BLOCKS_DEFAULT,
+    gdd_base: float = GDD_BASE_C,
+    edd_threshold: float = EDD_THRESHOLD_C,
+    gdd_preseason_days: int = GDD_PRESEASON_DAYS,
 ) -> tuple[pd.DataFrame, list]:
     """Full pipeline: load → merge → window → featurise.
 
@@ -1096,7 +1467,15 @@ def load_and_prepare(
 
     climate_vars restricts which daily weather variables are featurised
     (default: all of WEATHER_VARS), so feature-space ablations can run e.g.
-    temperature + precipitation only.
+    temperature + precipitation only. It does not apply to feature_mode "agro",
+    whose feature list is fixed by construction.
+
+    feature_mode "agro" replaces the generic mean/std block with the curated
+    agronomic set built by build_agro_features: corn growing degree days,
+    extreme degree days above edd_threshold, season mean tasmax/tasmin,
+    whole-window humidity statistics, and per-season-block precipitation and
+    humidity statistics. season_blocks / gdd_base / edd_threshold /
+    gdd_preseason_days are forwarded to it.
     """
     climate_vars = resolve_climate_vars(climate_vars)
 
@@ -1117,6 +1496,15 @@ def load_and_prepare(
     if feature_mode == "aggregated":
         adm2_df, weather_cols = aggregate_daily(daily_df, weather_vars=climate_vars)
         adm2_df, feature_cols = build_features(adm2_df, weather_cols)
+    elif feature_mode == "agro":
+        adm2_df, feature_cols = build_agro_features(
+            daily_df,
+            preseason_buffer=preseason_buffer,
+            season_blocks=season_blocks,
+            gdd_base=gdd_base,
+            edd_threshold=edd_threshold,
+            gdd_preseason_days=gdd_preseason_days,
+        )
     else:
         adm2_df, feature_cols = build_timeseries_features(
             daily_df, weather_vars=climate_vars)

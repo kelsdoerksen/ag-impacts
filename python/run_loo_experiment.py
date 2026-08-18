@@ -52,12 +52,19 @@ from sklearn.metrics import root_mean_squared_error
 from models import YieldModel, SUPPORTED_MODELS
 from data_loader import (
     ANOMALY_TARGETS,
+    EDD_THRESHOLD_C,
     FEATURE_MODES,
+    GDD_BASE_C,
+    GDD_PRESEASON_DAYS,
+    SEASON_BLOCKS_DEFAULT,
+    SEASON_BLOCK_DAYS,
     SUPPORTED_CROPS,
     TARGET_OPTIONS,
     WEATHER_VARS,
     CountyBaseline,
     STATIC_COVARS,
+    WITHIN_COUNTY_MODES,
+    WithinCountyScaler,
     draw_seed,
     history_leak_mask,
     load_and_prepare,
@@ -153,6 +160,9 @@ def build_config_key(args, climate_vars, study_start, study_end):
         "postharvest_buffer": args.postharvest_buffer,
         "study_start":        study_start,
         "study_end":          study_end,
+        "within_county_features": args.within_county_features,
+        "anomaly_detrend":    bool(args.anomaly_detrend),
+        "min_trend_years":    args.min_trend_years if args.anomaly_detrend else None,
         "yield_history":      bool(args.yield_history),
         "yield_history_base": args.yield_history_base,
         "yield_history_len":  args.yield_history_len,
@@ -173,6 +183,16 @@ def build_config_key(args, climate_vars, study_start, study_end):
         "sample_counties":    args.sample_counties,
         "sample_seed":        args.sample_seed,
     }
+    if args.feature_mode == "agro":
+        # These define the agro feature space, so they belong in the arm — but
+        # only when that mode is active, or the hash would churn for every
+        # tabular run whenever an agro default moves.
+        key["agro"] = {
+            "season_blocks":      args.season_blocks,
+            "gdd_base":           args.gdd_base,
+            "edd_threshold":      args.edd_threshold,
+            "gdd_preseason_days": args.gdd_preseason_days,
+        }
     if args.model_type == "tst":
         # Model capacity / optimisation settings change the arm, but only the
         # tst path reads them — including them for tabular runs would churn the
@@ -343,6 +363,10 @@ def parse_args():
         help=(
             "'aggregated': mean/std/sum per variable over the seasonal window. "
             "'timeseries': full daily values (Nov 1 – Nov 1) as individual features. "
+            "'agro': curated agronomic set over the seasonal window — corn GDD, "
+            "extreme degree days, season mean tasmax/tasmin, whole-window "
+            "humidity stats, and per-season-block precipitation/humidity stats. "
+            "Ignores --climate_vars (its variable list is fixed). "
             "Default: aggregated."
         ),
     )
@@ -367,6 +391,35 @@ def parse_args():
             "years only and invert predictions back to kg/ha, so RMSE stays "
             "comparable to a --target yield run. Default: yield."
         ),
+    )
+    parser.add_argument(
+        "--within_county_features", type=str, choices=WITHIN_COUNTY_MODES,
+        default="none",
+        help="Re-express each feature as a deviation from that county's own "
+             "training-period normal, fit per fold on training rows only. "
+             "'center' subtracts the county mean; 'zscore' also divides by the "
+             "county's sd. Seasonal climate aggregates are mostly descriptions "
+             "of WHERE a county is (between-county variance share: 0.93 for "
+             "season tasmax/tasmin, 0.89 for GDD/EDD), so without this a tree "
+             "model can identify the county and predict its long-run mean "
+             "yield — which scores well on absolute yield while having no "
+             "anomaly skill. Tabular models only. Default: none.",
+    )
+    parser.add_argument(
+        "--anomaly_detrend", action="store_true",
+        help="Fit the county baseline as a per-county LINE in year instead of a "
+             "flat mean. CONUS maize carries a ~+140 kg/ha/yr technology trend "
+             "that a climate-only model cannot predict under LOO (it does not "
+             "know which year it is forecasting), so a flat baseline leaves that "
+             "bias in the anomaly and it swamps the weather signal. Affects both "
+             "the --target yield_anomaly/yield_zscore transform and the "
+             "climatology null that every run is scored against.",
+    )
+    parser.add_argument(
+        "--min_trend_years", type=int, default=8,
+        help="Minimum distinct training years a county needs before its own "
+             "trend line is fit under --anomaly_detrend; thinner counties get a "
+             "flat mean. Default: 8.",
     )
     parser.add_argument(
         "--baseline_metric", action="store_true", default=True,
@@ -537,6 +590,33 @@ def parse_args():
                              "behaviour for comparison.")
 
     # ── PatchTST hyperparameters (only used when --model_type tst) ──
+    agro = parser.add_argument_group("Agronomic feature options (--feature_mode agro)")
+    agro.add_argument(
+        "--season_blocks", type=int, default=SEASON_BLOCKS_DEFAULT,
+        help="Number of 30-day blocks, measured from the window start, that "
+             "precipitation and humidity are summarised over. The last block "
+             "absorbs the remaining days of the window. Default: "
+             f"{SEASON_BLOCKS_DEFAULT} (240 days, which every CONUS corn "
+             "window covers).",
+    )
+    agro.add_argument(
+        "--gdd_base", type=float, default=GDD_BASE_C,
+        help="Lower base temperature in C subtracted from mean daily air "
+             f"temperature to accumulate growing degree days. Default: {GDD_BASE_C} "
+             "(corn).",
+    )
+    agro.add_argument(
+        "--edd_threshold", type=float, default=EDD_THRESHOLD_C,
+        help="Temperature in C above which daily tasmax counts toward extreme "
+             f"degree days. Default: {EDD_THRESHOLD_C}.",
+    )
+    agro.add_argument(
+        "--gdd_preseason_days", type=int, default=GDD_PRESEASON_DAYS,
+        help="Days before plant_start_doy at which GDD accumulation begins. "
+             f"Default: {GDD_PRESEASON_DAYS}. Must be <= --preseason_buffer or "
+             "the sum is truncated at the window start.",
+    )
+
     tst = parser.add_argument_group("PatchTST options (--model_type tst)")
     tst.add_argument("--patch_length", type=int,   default=16,
                      help="Patch size in days (e.g. 16 ≈ 2 weeks).")
@@ -562,18 +642,28 @@ def parse_args():
     return parser.parse_args()
 
 
-def _fit_fold_baseline(args, tr_ids, tr_y):
+def _fit_fold_baseline(args, tr_ids, tr_y, tr_years=None):
     """County climatology for one fold, fit on training rows only.
 
     Returns None when --target is not an anomaly target and no baseline metric
     was requested, so the ordinary paths pay nothing.
+
+    With --anomaly_detrend the baseline is a per-county line in year rather than
+    a flat mean, which strips the technology trend a climate-only model cannot
+    predict under LOO. tr_years must then be supplied.
     """
     if args.target not in ANOMALY_TARGETS and not args.baseline_metric:
         return None
-    return CountyBaseline().fit(tr_ids, tr_y)
+    detrend = bool(getattr(args, "anomaly_detrend", False))
+    if detrend and tr_years is None:
+        raise ValueError("--anomaly_detrend needs training years")
+    return CountyBaseline(
+        detrend=detrend,
+        min_trend_years=getattr(args, "min_trend_years", 8),
+    ).fit(tr_ids, tr_y, years=tr_years)
 
 
-def _baseline_scores(baseline, te_ids, y_true, y_pred, standardize):
+def _baseline_scores(baseline, te_ids, y_true, y_pred, standardize, te_years=None):
     """Score this fold against county climatology, and in anomaly space.
 
     Two numbers that absolute-yield RMSE cannot give you:
@@ -584,14 +674,18 @@ def _baseline_scores(baseline, te_ids, y_true, y_pred, standardize):
     """
     if baseline is None:
         return {}
-    base_pred = baseline.inverse(te_ids, np.zeros(len(y_true)), standardize=False)
+    base_pred = baseline.inverse(te_ids, np.zeros(len(y_true)), standardize=False,
+                                 years=te_years)
     base_rmse = float(np.sqrt(np.mean((base_pred - y_true) ** 2)))
     model_rmse = float(np.sqrt(np.mean((y_pred - y_true) ** 2)))
 
-    a_true = baseline.transform(te_ids, y_true, standardize)
-    a_pred = baseline.transform(te_ids, y_pred, standardize)
+    a_true = baseline.transform(te_ids, y_true, standardize, years=te_years)
+    a_pred = baseline.transform(te_ids, y_pred, standardize, years=te_years)
     ss_tot = float(np.sum((a_true - a_true.mean()) ** 2))
     return {
+        "baseline_detrended": bool(baseline.detrend),
+        "baseline_counties_flat_fallback": int(baseline.n_flat),
+        "baseline_counties_pooled_fallback": int(baseline.n_fallback),
         "baseline_climatology_rmse": base_rmse,
         "skill_vs_climatology_pct": (float(100 * (1 - model_rmse / base_rmse))
                                      if base_rmse > 0 else None),
@@ -798,23 +892,44 @@ def run_fold(adm2_df, feature_cols, all_years, fold_col, fold_value, fold_label,
         X_tr[lag_cols]  = hist
         X_tr[mask_cols] = hmask
 
+    # Within-county feature standardisation: re-express every feature as a
+    # deviation from that county's own training-period normal, so the model
+    # cannot use a feature's between-county level as a county identifier. Fit on
+    # training rows only, for the same no-leak reason as the target baseline.
+    # The yield_lagmask columns stay untouched — they are 0/1 validity flags.
+    wc_mode = getattr(args_ns, "within_county_features", "none")
+    n_unseen_counties = None
+    if wc_mode != "none":
+        scaler = WithinCountyScaler(mode=wc_mode, skip_cols=mask_cols).fit(
+            X_tr, adm2_df.loc[train_mask, "adm2_id"].to_numpy())
+        X_tr = scaler.transform(X_tr, adm2_df.loc[train_mask, "adm2_id"].to_numpy())
+        X_te = scaler.transform(X_te, adm2_df.loc[test_mask,  "adm2_id"].to_numpy())
+        n_unseen_counties = scaler.n_unseen
+
     # Anomaly targets: fit the county baseline on this fold's training rows,
     # train on the anomaly, and invert the predictions back to kg/ha so every
     # metric and CSV downstream stays in yield units.
     tr_ids   = adm2_df.loc[train_mask, "adm2_id"].to_numpy()
     te_ids   = meta_te["adm2_id"].to_numpy()
-    baseline = _fit_fold_baseline(args_ns, tr_ids, y_tr.to_numpy())
+    # Target years, not hindcast_start: the trend lives in the calendar year the
+    # yield was harvested. The offset is constant under a fixed --forecast_year,
+    # so this only matters for readability of the fitted slope.
+    tr_years = (adm2_df.loc[train_mask, "hindcast_start"].to_numpy()
+                + args_ns.forecast_year)
+    te_years = meta_te["hindcast_start"].to_numpy() + args_ns.forecast_year
+    baseline = _fit_fold_baseline(args_ns, tr_ids, y_tr.to_numpy(), tr_years)
     standardize = args_ns.target == "yield_zscore"
 
     y_fit = y_tr
     if args_ns.target in ANOMALY_TARGETS:
-        y_fit = baseline.transform(tr_ids, y_tr.to_numpy(), standardize)
+        y_fit = baseline.transform(tr_ids, y_tr.to_numpy(), standardize,
+                                   years=tr_years)
 
     model = YieldModel(model_type, random_state=seed)
     model.fit(X_tr, y_fit)
     y_pred = model.predict(X_te)
     if args_ns.target in ANOMALY_TARGETS:
-        y_pred = baseline.inverse(te_ids, y_pred, standardize)
+        y_pred = baseline.inverse(te_ids, y_pred, standardize, years=te_years)
 
     extra_meta = {
         "feature_importances": (
@@ -822,9 +937,12 @@ def run_fold(adm2_df, feature_cols, all_years, fold_col, fold_value, fold_label,
             if model.feature_importances_ is not None else None
         ),
         "history_entries_masked": n_hist_masked,
+        "within_county_features": wc_mode,
+        "within_county_unseen_test_counties": n_unseen_counties,
         "target": args_ns.target,
         "seed": seed,
-        **_baseline_scores(baseline, te_ids, y_te.to_numpy(), y_pred, standardize),
+        **_baseline_scores(baseline, te_ids, y_te.to_numpy(), y_pred, standardize,
+                           te_years=te_years),
     }
     train_years = sorted(adm2_df.loc[train_mask, "hindcast_start"].unique().tolist())
     test_years  = sorted(adm2_df.loc[test_mask,  "hindcast_start"].unique().tolist())
@@ -922,9 +1040,16 @@ def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_valu
     # the anomaly; predictions are inverted to kg/ha before scoring.
     tr_ids   = sample_meta.loc[train_mask, "adm2_id"].to_numpy()
     te_ids   = meta_te["adm2_id"].to_numpy()
+    tr_years = (sample_meta.loc[train_mask, "hindcast_start"].to_numpy()
+                + args.forecast_year)
+    te_years = meta_te["hindcast_start"].to_numpy() + args.forecast_year
+    ev_ids   = (sample_meta.loc[val_mask, "adm2_id"].to_numpy() if has_val else None)
+    ev_years = ((sample_meta.loc[val_mask, "hindcast_start"].to_numpy()
+                 + args.forecast_year) if has_val else None)
     y_true_orig = np.asarray(val_tgts, dtype=float).reshape(-1)
     baseline    = _fit_fold_baseline(args, tr_ids,
-                                     np.asarray(train_tgts, dtype=float).reshape(-1))
+                                     np.asarray(train_tgts, dtype=float).reshape(-1),
+                                     tr_years)
     standardize = args.target == "yield_zscore"
 
     eval_seqs = sequences[val_mask] if has_val else None
@@ -933,13 +1058,14 @@ def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_valu
     fit_train, fit_val, fit_eval = train_tgts, val_tgts, eval_tgts
     if args.target in ANOMALY_TARGETS:
         fit_train = baseline.transform(tr_ids, np.asarray(train_tgts).reshape(-1),
-                                       standardize).reshape(-1, 1).astype(np.float32)
-        fit_val   = baseline.transform(te_ids, y_true_orig, standardize).reshape(-1, 1).astype(np.float32)
+                                       standardize,
+                                       years=tr_years).reshape(-1, 1).astype(np.float32)
+        fit_val   = baseline.transform(te_ids, y_true_orig, standardize,
+                                       years=te_years).reshape(-1, 1).astype(np.float32)
         if has_val:
             fit_eval = baseline.transform(
-                sample_meta.loc[val_mask, "adm2_id"].to_numpy(),
-                np.asarray(eval_tgts, dtype=float).reshape(-1),
-                standardize).reshape(-1, 1).astype(np.float32)
+                ev_ids, np.asarray(eval_tgts, dtype=float).reshape(-1),
+                standardize, years=ev_years).reshape(-1, 1).astype(np.float32)
 
     static_kwargs = {}
     if static_arr is not None:
@@ -972,7 +1098,7 @@ def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_valu
     )
 
     if args.target in ANOMALY_TARGETS:
-        y_pred = baseline.inverse(te_ids, y_pred, standardize)
+        y_pred = baseline.inverse(te_ids, y_pred, standardize, years=te_years)
 
     extra_meta = {
         "seed":         seed,
@@ -980,7 +1106,8 @@ def run_fold_tst(sequences, targets, sample_meta, all_years, fold_col, fold_valu
         "val_years": val_years or None,
         "n_val": int(val_mask.sum()),
         **_baseline_scores(baseline, te_ids, y_true_orig,
-                           np.asarray(y_pred).reshape(-1), standardize),
+                           np.asarray(y_pred).reshape(-1), standardize,
+                           te_years=te_years),
         "patch_length": args.patch_length,
         "patch_stride": args.patch_stride,
         "d_model":      args.d_model,
@@ -1106,6 +1233,12 @@ def main():
             f"--target {args.target!r} is not valid for tabular model "
             f"{args.model_type!r}. Choose from {TABULAR_TARGETS}."
         )
+    if args.within_county_features != "none" and args.model_type == "tst":
+        raise SystemExit(
+            "--within_county_features is implemented for the tabular models only. "
+            "The tst path feeds raw daily sequences, where the equivalent is a "
+            "per-county per-channel normalisation of the sequence itself."
+        )
     if args.cv_scheme == "cell" and not args.cell_lookup:
         raise ValueError(
             "--cv_scheme cell requires --cell_lookup (county→climate-cell parquet "
@@ -1187,10 +1320,24 @@ def main():
     print(f"Model           : {args.model_type}")
     print(f"Feature mode    : {args.feature_mode}")
     print(f"Target          : {args.target}")
-    print(f"Climate vars    : {','.join(climate_vars)}")
+    if args.feature_mode == "agro":
+        print(f"Agro features   : GDD base {args.gdd_base:g}C from "
+              f"{args.gdd_preseason_days}d pre-plant; EDD/hot-day threshold "
+              f"{args.edd_threshold:g}C; {args.season_blocks} x "
+              f"{SEASON_BLOCK_DAYS}d season blocks  (--climate_vars ignored)")
+    else:
+        print(f"Climate vars    : {','.join(climate_vars)}")
     if args.yield_history:
         print(f"Yield history   : on  (leak guard: "
               f"{'OFF — training sees held-out labels' if args.allow_history_leakage else 'on'})")
+    print(f"Feature scaling : "
+          + ("raw (between-county level visible to the model)"
+             if args.within_county_features == "none"
+             else f"within-county {args.within_county_features} "
+                  "(county identity removed)"))
+    print(f"Baseline        : per-county "
+          + (f"linear trend (>= {args.min_trend_years} yrs, else flat mean)"
+             if args.anomaly_detrend else "flat mean  (--anomaly_detrend to detrend)"))
     print(f"CV scheme       : {args.cv_scheme}"
           + (f"  (lookup: {args.cell_lookup})" if args.cv_scheme == "cell" else ""))
     if args.use_phenology:
@@ -1275,6 +1422,10 @@ def main():
             phenology_suffix=args.phenology_suffix,
             phenology_lookback_years=args.phenology_lookback_years,
             climate_vars=climate_vars,
+            season_blocks=args.season_blocks,
+            gdd_base=args.gdd_base,
+            edd_threshold=args.edd_threshold,
+            gdd_preseason_days=args.gdd_preseason_days,
         )
         county_meta = adm2_df[["adm2_id", "adm2", "adm1"]].drop_duplicates("adm2_id")
 
@@ -1399,6 +1550,13 @@ def main():
         "study_end":          study_end,
         "model_type":         args.model_type,
         "feature_mode":       args.feature_mode,
+        "within_county_features": args.within_county_features,
+        "anomaly_detrend":    args.anomaly_detrend,
+        "min_trend_years":    args.min_trend_years,
+        "season_blocks":      args.season_blocks,
+        "gdd_base":           args.gdd_base,
+        "edd_threshold":      args.edd_threshold,
+        "gdd_preseason_days": args.gdd_preseason_days,
         "cv_scheme":          args.cv_scheme,
         "cell_lookup":        args.cell_lookup,
         "use_phenology":      args.use_phenology,
