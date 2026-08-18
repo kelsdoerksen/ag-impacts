@@ -43,9 +43,10 @@ Features produced
     pr_m{MM}_{stat}      Precipitation per calendar month MM of the yield year
                          over the buffer window, for stat in
                          sum / mean / min / max / var.
-    season_days_obs      Days of daily data actually inside the season window.
-    season_days_missing  Days of the requested season window with no data.
     gdd_per_day          gdd_sum / season_days_obs.
+
+season_days_obs and season_days_missing are carried on the returned frame as
+diagnostics but are deliberately NOT features — see build_agro_features.
 
 Truncated seasons
 -----------------
@@ -57,13 +58,15 @@ median of ~33 days.
 
 That matters because degree days and season precipitation are *cumulative*: an
 unobserved tail biases them low, and by an amount that tracks the county's
-harvest date rather than its weather. Rather than silently accumulate over
-whatever days exist, this module reports the shortfall (see `describe`) and
-emits season_days_obs, season_days_missing and gdd_per_day alongside the totals,
-so the truncation is an input the model can condition on instead of a hidden
-confound. In practice the lost tail is early-winter, when maize GDD is near
-zero over most of the corn belt, but it is not zero in the South and it does
-carry real November rainfall.
+harvest date rather than its weather. This module reports the shortfall on
+every run (see `describe`) rather than accumulating silently. In practice the
+lost tail is early-winter, when maize GDD is near zero over most of the corn
+belt, but it is not zero in the South and it does carry real November rainfall.
+
+Note that the shortfall is a per-county constant here, not a per-year one: the
+crop calendar is time-invariant in this dataset and the daily series always ends
+on the same date. That is why season_days_obs / season_days_missing are
+diagnostics rather than features.
 
 Ragged month coverage
 ---------------------
@@ -347,7 +350,18 @@ def build_agro_features(
                                    gdd_base, gdd_method, edd_threshold,
                                    want_temp, want_precip)
 
-    feature_cols = [c for c in out.columns if c not in ("adm2_id", "hindcast_start")]
+    # season_days_obs / season_days_missing are kept on the frame as diagnostics
+    # but are NOT features: this dataset's crop calendar is time-invariant per
+    # county and the daily series always ends on the same date, so both are
+    # constants per county — deterministic functions of plant_doy and
+    # harvest_end_doy, which are already in the feature set. Measured on
+    # 1990-2004 CONUS maize, 100% of their variance is between counties, i.e.
+    # they carry county identity and no weather at all. Against an anomaly
+    # target, where the county baseline has already been removed, such a column
+    # can only supply overfitting surface.
+    diagnostic_cols = ["season_days_obs", "season_days_missing"]
+    feature_cols = [c for c in out.columns
+                    if c not in ("adm2_id", "hindcast_start", *diagnostic_cols)]
 
     short = out["season_days_missing"]
     info = {
@@ -403,9 +417,9 @@ def describe(info: dict) -> str:
             f"{info['postharvest_buffer']}d (median "
             f"{info['truncated_days_median']:.0f} days short, max "
             f"{info['truncated_days_max']}) — the daily climate series stops "
-            f"there. Cumulative gdd_sum / pr_season_sum are truncated by that "
-            f"much; season_days_missing and gdd_per_day are included as "
-            f"features so the model can see it."
+            f"there, so cumulative gdd_sum / pr_season_sum are truncated by "
+            f"that much. The shortfall is a per-county constant, so it shifts "
+            f"each county's level rather than varying year to year."
         )
     if info.get("monthly_precip"):
         cov  = info["monthly_coverage"]
