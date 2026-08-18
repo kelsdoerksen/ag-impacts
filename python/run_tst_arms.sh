@@ -16,6 +16,11 @@
 #            this window and is structurally unpredictable under LOO (the model
 #            cannot know which year it is forecasting). Without it, a quarter of
 #            the target being predicted is guaranteed noise.
+#            Set TARGET=yield to run the absolute-yield family instead; both
+#            keep --anomaly_detrend so the two are scored against the SAME
+#            (detrended) climatology null and their r_anom / R2anom columns
+#            stay comparable. Under --target yield the flag only changes that
+#            scoring null, not what the model learns.
 #   seed   : 42 on every arm, matching the XGB side.
 #
 # Soil moisture is deliberately excluded: its phenology parquet starts at
@@ -24,12 +29,20 @@
 #
 # Requires code at commit 23202d5 or newer (git pull first).
 # Usage:  DATA_DIR=... RESULTS_DIR=... bash run_tst_arms.sh
+#         DATA_DIR=... RESULTS_DIR=... TARGET=yield bash run_tst_arms.sh
+#
+# NOTE ON COST: --study_years sets which years are HELD OUT as folds; it does
+# not restrict training data. load_and_prepare loads every available year, so
+# each fold trains on ~69,700 county-years spanning 1981-2023, not the 21
+# study years. 21 folds x 100 epochs on that is substantial on one GPU —
+# check your time budget before launching both target families.
 # NB: no `set -u` — conda's activation scripts reference unbound vars.
 set -o pipefail
 
 DATA_DIR="${DATA_DIR:?set DATA_DIR to the processed-data dir on this machine}"
 RESULTS_DIR="${RESULTS_DIR:?set RESULTS_DIR to where results should be written}"
-LOG_DIR="${RESULTS_DIR}/_tst_arm_logs"
+TARGET="${TARGET:-yield_zscore}"
+LOG_DIR="${RESULTS_DIR}/_tst_arm_logs_${TARGET}"
 mkdir -p "${LOG_DIR}"
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
@@ -42,7 +55,7 @@ COMMON=(--study_years 2002 2022
         --model_type tst
         --crop corn
         --aoi CONUS
-        --target yield_zscore
+        --target "${TARGET}"
         --anomaly_detrend
         --seed 42
         --epochs 100
@@ -80,7 +93,7 @@ run_arm D_yhist5                                "${YH[@]}"
 run_arm F_ndvi_yhist5 --use_phenology ndvi      "${YH[@]}"
 run_arm E_full        --use_phenology ndvi,fpar "${YH[@]}"
 
-echo "=== [$(date '+%F %H:%M:%S')] ALL ARMS COMPLETE ==="
+echo "=== [$(date '+%F %H:%M:%S')] ALL ARMS COMPLETE (target=${TARGET}) ==="
 echo
 echo "Copy these back for comparison (the whole run dirs, not just the logs):"
 ls -d "${RESULTS_DIR}"/loo_corn_tst_*2002_2022*/ 2>/dev/null
