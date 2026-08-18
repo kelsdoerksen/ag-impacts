@@ -160,6 +160,7 @@ def build_config_key(args, climate_vars, study_start, study_end):
         "postharvest_buffer": args.postharvest_buffer,
         "study_start":        study_start,
         "study_end":          study_end,
+        "train_all_years":    bool(args.train_all_years),
         "within_county_features": args.within_county_features,
         "anomaly_detrend":    bool(args.anomaly_detrend),
         "min_trend_years":    args.min_trend_years if args.anomaly_detrend else None,
@@ -391,6 +392,17 @@ def parse_args():
             "years only and invert predictions back to kg/ha, so RMSE stays "
             "comparable to a --target yield run. Default: yield."
         ),
+    )
+    parser.add_argument(
+        "--train_all_years", action="store_true",
+        help="Train on EVERY hindcast year present in the data dir rather than "
+             "only --study_years. Off by default: --study_years now selects the "
+             "training pool as well as the held-out folds, so the tabular and "
+             "tst paths see identical data. Previously the tabular path loaded "
+             "all years while the tst path loaded only the study years, giving "
+             "the tabular models ~2x the training rows and making a "
+             "tst-vs-tabular comparison unfair. Held-out years are excluded from "
+             "training either way, so this is not a leakage switch.",
     )
     parser.add_argument(
         "--within_county_features", type=str, choices=WITHIN_COUNTY_MODES,
@@ -1207,6 +1219,10 @@ def main():
     args = parse_args()
     study_start, study_end = args.study_years
     all_years = list(range(study_start, study_end + 1))
+    # Which hindcast years are LOADED. None = every year in the data dir. By
+    # default this equals the study window, so both model paths train on the
+    # same data; --train_all_years restores the old tabular-only wider pool.
+    train_years = None if args.train_all_years else all_years
 
     # Validate target/model compatibility before any expensive data loading.
     if args.model_type == "tst" and args.target not in TST_TARGETS:
@@ -1330,6 +1346,10 @@ def main():
     if args.yield_history:
         print(f"Yield history   : on  (leak guard: "
               f"{'OFF — training sees held-out labels' if args.allow_history_leakage else 'on'})")
+    print(f"Training pool   : "
+          + ("every hindcast year in the data dir (--train_all_years)"
+             if args.train_all_years
+             else f"s{study_start}-s{study_end} only, matching --study_years"))
     print(f"Feature scaling : "
           + ("raw (between-county level visible to the model)"
              if args.within_county_features == "none"
@@ -1357,7 +1377,7 @@ def main():
         from tst_implementation import phenology_channel_cols
         daily_df = load_climate_crop_data(
             data_dir=args.data_dir,
-            hindcast_years=all_years,
+            hindcast_years=train_years,
             crop=args.crop,
             climate_model=args.climate_model,
             ens_member=args.ens_member,
@@ -1406,6 +1426,7 @@ def main():
         adm2_df, feature_cols = load_and_prepare(
             crop=args.crop,
             data_dir=args.data_dir,
+            hindcast_years=train_years,
             feature_mode=args.feature_mode,
             climate_model=args.climate_model,
             ens_member=args.ens_member,
@@ -1550,6 +1571,7 @@ def main():
         "study_end":          study_end,
         "model_type":         args.model_type,
         "feature_mode":       args.feature_mode,
+        "train_all_years":    args.train_all_years,
         "within_county_features": args.within_county_features,
         "anomaly_detrend":    args.anomaly_detrend,
         "min_trend_years":    args.min_trend_years,
