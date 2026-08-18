@@ -4,8 +4,14 @@
 #
 #   window : s2002-s2022  (FY1 -> target years 2003-2023)
 #   crop   : corn, CONUS, all counties
-#   target : yield (absolute). Nulls are recomputed from loo_all_errors.csv
-#            afterwards, so no --anomaly_detrend is needed here.
+#   target : yield_zscore — the model predicts (yield - county mean)/county sd,
+#            with the baseline fit per fold on TRAINING rows only and the
+#            prediction inverted back to kg/ha before scoring, so RMSE stays in
+#            yield units and comparable to a --target yield run.
+#            NOTE: predicting z=0 for every row reproduces the county-mean null
+#            exactly, so that null is the FLOOR here, not an achievement.
+#            The baseline is a flat per-county mean (no trend term); the
+#            --anomaly_detrend option is not in the pushed code.
 #   seed   : 42 on every arm, matching the XGB side.
 #
 # Soil moisture is deliberately excluded: its phenology parquet starts at
@@ -32,7 +38,7 @@ COMMON=(--study_years 2002 2022
         --model_type tst
         --crop corn
         --aoi CONUS
-        --target yield
+        --target yield_zscore
         --seed 42
         --epochs 100
         --lr 0.001)
@@ -52,10 +58,22 @@ run_arm () {           # run_arm <name> <extra args...>
   fi
 }
 
+# The arms form a 3 x 2 grid: {no phenology, NDVI, NDVI+fPAR} crossed with
+# {no yield history, 5yr yield history}. That makes every effect separable —
+# phenology at fixed history, and history at fixed phenology.
+#
+#                      no yield history      + 5yr yield history
+#   no phenology       A_climate             D_yhist5
+#   NDVI               B_ndvi                F_ndvi_yhist5
+#   NDVI + fPAR        C_ndvi_fpar           E_full
+YH=(--yield_history --yield_history_len 5)
+
 run_arm A_climate
 run_arm B_ndvi        --use_phenology ndvi
 run_arm C_ndvi_fpar   --use_phenology ndvi,fpar
-run_arm D_yhist5      --yield_history --yield_history_len 5
+run_arm D_yhist5                                "${YH[@]}"
+run_arm F_ndvi_yhist5 --use_phenology ndvi      "${YH[@]}"
+run_arm E_full        --use_phenology ndvi,fpar "${YH[@]}"
 
 echo "=== [$(date '+%F %H:%M:%S')] ALL ARMS COMPLETE ==="
 echo
