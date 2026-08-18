@@ -49,7 +49,8 @@ import pandas as pd
 from datetime import datetime
 from sklearn.metrics import root_mean_squared_error
 
-from models import YieldModel, SUPPORTED_MODELS
+import agro_features
+from models import YieldModel, SUPPORTED_MODELS, NAN_TOLERANT_MODELS
 from data_loader import (
     ANOMALY_TARGETS,
     FEATURE_MODES,
@@ -100,6 +101,44 @@ def _parse_phenology_arg(s: str) -> list:
     return vars_
 
 
+def _parse_months_arg(s: str) -> list:
+    """Parse a --monthly_precip_months value: '3-11' or '3,4,5,6' (or mixed)."""
+    months = []
+    for tok in (t.strip() for t in s.split(",")):
+        if not tok:
+            continue
+        if "-" in tok.lstrip("-"):
+            lo, hi = tok.split("-", 1)
+            rng = range(int(lo), int(hi) + 1)
+        else:
+            rng = [int(tok)]
+        for m in rng:
+            if not 1 <= m <= 12:
+                raise argparse.ArgumentTypeError(
+                    f"Month {m} out of range; --monthly_precip_months takes 1-12."
+                )
+            if m not in months:
+                months.append(m)
+    if not months:
+        raise argparse.ArgumentTypeError(
+            "--monthly_precip_months must name at least one month.")
+    return sorted(months)
+
+
+def _parse_monthly_stats_arg(s: str) -> list:
+    """Parse a comma-separated --monthly_precip_stats value (e.g. 'sum,mean')."""
+    toks = [t.strip() for t in s.split(",") if t.strip()]
+    bad  = [t for t in toks if t not in agro_features.MONTHLY_STATS]
+    if bad:
+        raise argparse.ArgumentTypeError(
+            f"Unknown monthly statistic(s) {bad}. "
+            f"Choices: {agro_features.MONTHLY_STATS}")
+    if not toks:
+        raise argparse.ArgumentTypeError(
+            "--monthly_precip_stats must name at least one statistic.")
+    return [s for s in agro_features.MONTHLY_STATS if s in toks]
+
+
 def _parse_static_arg(s: str) -> list:
     """Parse a comma-separated --static_covars value (e.g. 'latlon')."""
     toks = [v.strip() for v in s.split(",") if v.strip()]
@@ -125,6 +164,28 @@ ALL_TARGETS     = TARGET_OPTIONS + ["log_yield"] + ANOMALY_TARGETS
 # ──────────────────────────────────────────────────────────────────────────────
 # Run identity: config fingerprint + diagnostics
 # ──────────────────────────────────────────────────────────────────────────────
+
+def agro_settings(args) -> dict:
+    """The --agro_features knobs, as kwargs for agro_features.build_agro_features.
+
+    Also used verbatim in the config fingerprint, so two runs whose degree-day
+    base or month selection differ are correctly treated as different arms
+    rather than pooled as seed replicates.
+    """
+    return {
+        "postharvest_buffer":    args.postharvest_buffer,
+        "gdd_base":              args.gdd_base,
+        "gdd_method":            args.gdd_method,
+        "edd_threshold":         args.edd_threshold,
+        "monthly_precip":        bool(args.monthly_precip),
+        "monthly_precip_months": (list(args.monthly_precip_months)
+                                  if args.monthly_precip_months else None),
+        "monthly_precip_stats":  (list(args.monthly_precip_stats)
+                                  if args.monthly_precip_stats else None),
+        "monthly_min_coverage":  args.monthly_min_coverage,
+        "monthly_min_days":      args.monthly_min_days,
+    }
+
 
 def build_config_key(args, climate_vars, study_start, study_end):
     """Everything that defines this experiment arm, EXCEPT the seed.
@@ -164,6 +225,7 @@ def build_config_key(args, climate_vars, study_start, study_end):
         "phenology_lag_years": args.phenology_lag_years,
         "phenology_lookback_years": args.phenology_lookback_years,
         "cv_scheme":          args.cv_scheme,
+        "agro_features":      bool(args.agro_features),
         # basename only: the same lookup at a different path on another machine
         # is still the same configuration.
         "cell_lookup":        (os.path.basename(args.cell_lookup)
@@ -173,6 +235,9 @@ def build_config_key(args, climate_vars, study_start, study_end):
         "sample_counties":    args.sample_counties,
         "sample_seed":        args.sample_seed,
     }
+    if args.agro_features:
+        # Only hashed when the block is on, so existing runs keep their hash.
+        key["agro"] = agro_settings(args)
     if args.model_type == "tst":
         # Model capacity / optimisation settings change the arm, but only the
         # tst path reads them — including them for tabular runs would churn the
@@ -513,6 +578,62 @@ def parse_args():
                              "county-year must have all n seasons covered, so the "
                              "usable period shrinks (NDVI starts 2001, so a 4-year "
                              "lookback needs target year 2006+, i.e. FY1 s2005+).")
+
+    # ── agronomic (crop-calendar) features, tabular aggregated mode only ──
+    agro = parser.add_argument_group(
+        "Agronomic features (--feature_mode aggregated, tabular models)")
+    agro.add_argument("--agro_features", action="store_true",
+                      help="Add crop-calendar features on top of the window "
+                           "aggregates (off by default): growing degree days "
+                           "and extreme degree days accumulated from planting "
+                           "through harvest_end + --postharvest_buffer, "
+                           "cumulative season precipitation, and per-month "
+                           "precipitation sum/mean/min/max/variance. See "
+                           "agro_features.py for the exact windows.")
+    agro.add_argument("--gdd_base", type=float, default=agro_features.GDD_BASE_C,
+                      help="GDD lower threshold in °C, subtracted from the daily "
+                           "mean of tasmax/tasmin. Default 10 (50 °F, maize).")
+    agro.add_argument("--gdd_method", type=str, choices=agro_features.GDD_METHODS,
+                      default="plain",
+                      help="'plain' (default): GDD = max(0, (tasmax+tasmin)/2 - "
+                           "--gdd_base). 'capped': the textbook maize variant, "
+                           "clipping tasmax down to 30 °C and tasmin up to 10 °C "
+                           "first, so extreme heat stops adding development.")
+    agro.add_argument("--edd_threshold", type=float,
+                      default=agro_features.EDD_THRESHOLD_C,
+                      help="Extreme-degree-day threshold in °C on daily tasmax "
+                           "(default 30). Emits both the count of days above it "
+                           "and the summed degrees above it over the season.")
+    agro.add_argument("--no_monthly_precip", dest="monthly_precip",
+                      action="store_false", default=True,
+                      help="Skip the per-month precipitation statistics and keep "
+                           "only the degree-day and season-total features.")
+    agro.add_argument("--monthly_precip_months", type=_parse_months_arg,
+                      default=None, metavar="MONTHS",
+                      help="Calendar months to emit precipitation statistics for, "
+                           "e.g. '3-11' or '4,5,6,7'. Default: chosen from the "
+                           "data by coverage (see --monthly_min_coverage).")
+    agro.add_argument("--monthly_precip_stats", type=_parse_monthly_stats_arg,
+                      default=None, metavar="STATS",
+                      help="Which per-month precipitation statistics to emit "
+                           f"(default: all of {','.join(agro_features.MONTHLY_STATS)}). "
+                           "Worth trimming: monthly 'min' is exactly 0 for "
+                           "78-98%% of CONUS maize county-years — almost every "
+                           "month has a dry day — so it carries close to no "
+                           "signal while adding one column per month.")
+    agro.add_argument("--monthly_min_days", type=int, default=20,
+                      help="A month's statistics are only computed for a "
+                           "county-year when at least this many of its days fall "
+                           "inside the seasonal window, so a two-day sliver of "
+                           "October never masquerades as a monthly mean. "
+                           "Default: 20.")
+    agro.add_argument("--monthly_min_coverage", type=float, default=0.95,
+                      help="Keep a month only when at least this fraction of "
+                           "county-years clear --monthly_min_days for it. "
+                           "Default: 0.95. Crop calendars vary by county, so on "
+                           "CONUS maize a lower threshold buys extra shoulder "
+                           "months (Mar/Oct/Nov) at the cost of NaNs — which "
+                           "only --model_type xgb can keep.")
 
     # ── cross-validation scheme ──
     parser.add_argument("--cv_scheme", type=str, choices=["year", "cell"], default="year",
@@ -1106,6 +1227,20 @@ def main():
             f"--target {args.target!r} is not valid for tabular model "
             f"{args.model_type!r}. Choose from {TABULAR_TARGETS}."
         )
+    if args.agro_features:
+        if args.model_type == "tst":
+            raise SystemExit(
+                "--agro_features is a tabular feature block; --model_type tst "
+                "consumes raw daily sequences and would gain nothing from it. "
+                "Use --model_type xgb (or rf/gbm) with --feature_mode aggregated."
+            )
+        if args.feature_mode != "aggregated":
+            raise SystemExit(
+                f"--agro_features requires --feature_mode aggregated, got "
+                f"{args.feature_mode!r}. Timeseries mode loads a Nov 1 – Nov 1 "
+                f"window, which truncates the tail of a typical maize season, so "
+                f"degree-day totals computed from it would be wrong."
+            )
     if args.cv_scheme == "cell" and not args.cell_lookup:
         raise ValueError(
             "--cv_scheme cell requires --cell_lookup (county→climate-cell parquet "
@@ -1147,9 +1282,10 @@ def main():
     hist_tag  = "_yhist" if args.yield_history else ""
     if args.yield_history and args.yield_history_len:
         hist_tag += f"{args.yield_history_len}"
+    agro_tag  = "_agro" if args.agro_features else ""
     exp_id  = (
         f"loo_{args.crop}_{args.model_type}_{args.feature_mode}_{args.target}"
-        f"{clim_tag}{hist_tag}{pheno_tag}{cv_tag}"
+        f"{clim_tag}{hist_tag}{agro_tag}{pheno_tag}{cv_tag}"
         f"_{study_start}_{study_end}_cfg-{cfg_hash}_seed{seed}"
         f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     )
@@ -1188,6 +1324,10 @@ def main():
     print(f"Feature mode    : {args.feature_mode}")
     print(f"Target          : {args.target}")
     print(f"Climate vars    : {','.join(climate_vars)}")
+    if args.agro_features:
+        print(f"Agro features   : on  (GDD base {args.gdd_base:g}°C "
+              f"{args.gdd_method}, EDD > {args.edd_threshold:g}°C, monthly precip "
+              f"{'on' if args.monthly_precip else 'off'})")
     if args.yield_history:
         print(f"Yield history   : on  (leak guard: "
               f"{'OFF — training sees held-out labels' if args.allow_history_leakage else 'on'})")
@@ -1275,6 +1415,11 @@ def main():
             phenology_suffix=args.phenology_suffix,
             phenology_lookback_years=args.phenology_lookback_years,
             climate_vars=climate_vars,
+            agro=agro_settings(args) if args.agro_features else None,
+            # xgboost learns a default split direction for NaN, so county-years
+            # whose crop calendar misses one of the emitted months can stay in
+            # the study instead of being dropped.
+            allow_nan_features=args.model_type in NAN_TOLERANT_MODELS,
         )
         county_meta = adm2_df[["adm2_id", "adm2", "adm1"]].drop_duplicates("adm2_id")
 
@@ -1395,6 +1540,8 @@ def main():
         "phenology_lookback_years": args.phenology_lookback_years,
         "preseason_buffer":   args.preseason_buffer,
         "postharvest_buffer": args.postharvest_buffer,
+        "agro_features":      bool(args.agro_features),
+        "agro":               agro_settings(args) if args.agro_features else None,
         "study_start":        study_start,
         "study_end":          study_end,
         "model_type":         args.model_type,

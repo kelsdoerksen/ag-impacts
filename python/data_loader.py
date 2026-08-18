@@ -24,6 +24,14 @@ timeseries
     Missing days are forward-filled then backward-filled within each
     county-year so no NaN values remain in the feature block.
 
+Optional feature blocks (aggregated mode)
+-----------------------------------------
+agro=<settings dict>
+    Crop-calendar features from agro_features.build_agro_features: growing
+    degree days and extreme degree days accumulated from planting through
+    harvest_end + postharvest_buffer, cumulative season precipitation, and
+    per-calendar-month precipitation statistics.
+
 Public API
 ----------
 load_and_prepare(...)      → (adm2_df, feature_cols)   ready for sklearn
@@ -44,6 +52,8 @@ import secrets
 
 import numpy as np
 import pandas as pd
+
+import agro_features
 
 # Upper bound for drawn seeds: numpy's legacy seed API and sklearn's
 # random_state both cap at 2**32-1, and torch/transformers accept anything in
@@ -1074,6 +1084,8 @@ def load_and_prepare(
     phenology_suffix: str | None = None,
     phenology_lookback_years: int = 1,
     climate_vars: list | None = None,
+    agro: dict | None = None,
+    allow_nan_features: bool = False,
 ) -> tuple[pd.DataFrame, list]:
     """Full pipeline: load → merge → window → featurise.
 
@@ -1097,6 +1109,17 @@ def load_and_prepare(
     climate_vars restricts which daily weather variables are featurised
     (default: all of WEATHER_VARS), so feature-space ablations can run e.g.
     temperature + precipitation only.
+
+    agro (aggregated mode only) is a settings dict — see agro_features.
+    build_agro_features — that adds crop-calendar features on top of the window
+    aggregates: growing degree days and extreme degree days accumulated from
+    planting through harvest_end + postharvest_buffer, cumulative season
+    precipitation, and per-calendar-month precipitation statistics.
+
+    allow_nan_features keeps rows whose per-month precipitation statistics are
+    NaN because that month falls outside their crop calendar. Only pass it for
+    a model that handles missing values natively (xgboost does; sklearn's RF and
+    GBM do not) — otherwise those county-years are dropped as usual.
     """
     climate_vars = resolve_climate_vars(climate_vars)
 
@@ -1121,6 +1144,19 @@ def load_and_prepare(
         adm2_df, feature_cols = build_timeseries_features(
             daily_df, weather_vars=climate_vars)
 
+    if agro:
+        if feature_mode != "aggregated":
+            raise ValueError(
+                "Agronomic features require --feature_mode aggregated. In "
+                "timeseries mode the daily window runs Nov 1 – Nov 1, which cuts "
+                "off the tail of a typical maize season (median harvest_end + 14 "
+                "= Dec 1 on CONUS), so degree-day totals would be silently "
+                "truncated."
+            )
+        adm2_df, agro_cols = _append_agro_features(
+            adm2_df, daily_df, agro, climate_vars, allow_nan_features)
+        feature_cols = feature_cols + agro_cols
+
     if yield_history:
         adm2_df, hist_cols = _append_yield_history_features(
             adm2_df, data_dir, crop, aoi, forecast_year, yield_history_base,
@@ -1135,6 +1171,54 @@ def load_and_prepare(
         feature_cols = feature_cols + pheno_cols
 
     return adm2_df, feature_cols
+
+
+def _append_agro_features(
+    adm2_df: pd.DataFrame,
+    daily_df: pd.DataFrame,
+    agro: dict,
+    climate_vars: list,
+    allow_nan_features: bool = False,
+) -> tuple[pd.DataFrame, list]:
+    """Append the crop-calendar feature block to an aggregated frame.
+
+    The block is keyed by (adm2_id, hindcast_start), the same key the window
+    aggregates use, so it is a straight left join. Degree-day and season-total
+    columns are defined for every county-year and any NaN there means the daily
+    series had a gap over that season — those rows are always dropped. The
+    per-month precipitation columns are legitimately NaN when a month sits
+    outside a county's crop calendar; those rows are kept only when the model
+    can consume NaN (see allow_nan_features).
+    """
+    agro_df, agro_cols, info = agro_features.build_agro_features(
+        daily_df, climate_vars=climate_vars, **agro)
+    print(agro_features.describe(info))
+
+    df = adm2_df.merge(agro_df, on=["adm2_id", "hindcast_start"], how="left")
+
+    monthly_cols = [c for c in info.get("monthly_cols", []) if c in agro_cols]
+    season_cols  = [c for c in agro_cols if c not in monthly_cols]
+
+    before = len(df)
+    df = df[df[season_cols].notna().all(axis=1)].copy()
+    if len(df) < before:
+        print(f"Agronomic feats : dropped {before - len(df)} row(s) with an "
+              f"incomplete season window")
+
+    if monthly_cols:
+        n_nan = int(df[monthly_cols].isna().any(axis=1).sum())
+        if allow_nan_features:
+            print(f"Agronomic feats : {n_nan} row(s) keep NaN monthly precip "
+                  f"(month outside their crop calendar) — model handles missing "
+                  f"values natively")
+        elif n_nan:
+            df = df[df[monthly_cols].notna().all(axis=1)].copy()
+            print(f"Agronomic feats : dropped {n_nan} row(s) with a monthly "
+                  f"precip gap (use --model_type xgb to keep them as NaN)")
+
+    df = df.reset_index(drop=True)
+    print(f"Agronomic feats : +{len(agro_cols)} features, {len(df)} samples remain")
+    return df, agro_cols
 
 
 def _append_yield_history_features(

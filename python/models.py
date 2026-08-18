@@ -13,6 +13,12 @@ from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 
 SUPPORTED_MODELS = ["rf", "gbm", "xgb"]
 
+# Models that accept NaN in X and learn a default split direction for it.
+# sklearn's RandomForestRegressor and GradientBoostingRegressor both reject
+# NaN, so feature blocks with legitimate gaps (e.g. per-month precipitation for
+# a month outside a county's crop calendar) can only be kept for these.
+NAN_TOLERANT_MODELS = ["xgb"]
+
 
 class YieldModel:
     def __init__(self, model_type: str, random_state: int = 42):
