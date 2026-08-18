@@ -10,8 +10,12 @@
 #            yield units and comparable to a --target yield run.
 #            NOTE: predicting z=0 for every row reproduces the county-mean null
 #            exactly, so that null is the FLOOR here, not an achievement.
-#            The baseline is a flat per-county mean (no trend term); the
-#            --anomaly_detrend option is not in the pushed code.
+#            --anomaly_detrend makes that baseline a per-county LINE in year
+#            rather than a flat mean. CONUS maize carries a ~+127 kg/ha/yr
+#            technology trend which is ~24% of flat-mean anomaly variance on
+#            this window and is structurally unpredictable under LOO (the model
+#            cannot know which year it is forecasting). Without it, a quarter of
+#            the target being predicted is guaranteed noise.
 #   seed   : 42 on every arm, matching the XGB side.
 #
 # Soil moisture is deliberately excluded: its phenology parquet starts at
@@ -39,6 +43,7 @@ COMMON=(--study_years 2002 2022
         --crop corn
         --aoi CONUS
         --target yield_zscore
+        --anomaly_detrend
         --seed 42
         --epochs 100
         --lr 0.001)
