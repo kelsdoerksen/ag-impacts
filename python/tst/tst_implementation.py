@@ -1081,8 +1081,7 @@ def train_predict_patchtst(
         learning_rate=tc["lr"],
         # Only select checkpoints when there is a genuine validation split to
         # select on. Without one we take the final epoch rather than peeking at
-        # the test fold.I want to change focus to the tabular dataset and run an xgb because I think I am overfitting on my tst model as it stands. I want to run a loo experiment with an xgb over CONUS. I want to use Growing Degree Days of corn, which for corn Corn growing degree days (GDD) are calculated by subtracting the plant's
-        #   lower base or threshold temperature of 50 °F (10 °C) from the average daily air temperature in °F or °C. I also want to get the number of extreme degree days (where the temperature is over 30degrees) during my crop calendar buffer I have.
+        # the test fold.
         eval_strategy="epoch" if eval_dataset is not None else "no",
         save_strategy="epoch" if eval_dataset is not None else "no",
         load_best_model_at_end=eval_dataset is not None,
