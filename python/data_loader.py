@@ -333,24 +333,28 @@ def climate_name_candidates(climate_model: str, ens_member: str, aoi: str,
     only for CONUS, so other AOIs cannot resolve to it.
     """
     fy = forecast_year
+    # Most specific first: AOI + forecast-year tag + s-year + ensemble member.
+    # That is the canonical form ML-sample-gen.R now writes for every AOI and
+    # forecast year; the rest are older variants kept readable so existing
+    # folders do not have to be renamed.
+    names = [
+        f"climate_{aoi}_{climate_model}_fy{fy}_s{year}-{ens_member}.parquet",
+        f"climate_{aoi}_{climate_model}_fy{fy}_s{year}.parquet",
+    ]
     if fy == 1:
-        names = [
+        # The FY1 series predates the fy token, so those spellings are FY1-only.
+        names += [
             f"climate_{aoi}_{climate_model}_s{year}-{ens_member}.parquet",
-            f"climate_{aoi}_{climate_model}_fy1_s{year}.parquet",
             f"climate_{aoi}_{climate_model}_s{year}.parquet",
         ]
-        if _is_conus(aoi):
+    if _is_conus(aoi):
+        # The original CONUS series carries no AOI token at all.
+        names.append(f"climate_{climate_model}_fy{fy}_s{year}.parquet")
+        if fy == 1:
             names += [
                 f"climate_{climate_model}_s{year}-{ens_member}.parquet",
                 f"climate_{climate_model}_s{year}.parquet",
             ]
-    else:
-        names = [
-            f"climate_{aoi}_{climate_model}_fy{fy}_s{year}.parquet",
-            f"climate_{aoi}_{climate_model}_fy{fy}_s{year}-{ens_member}.parquet",
-        ]
-        if _is_conus(aoi):
-            names.append(f"climate_{climate_model}_fy{fy}_s{year}.parquet")
     return names
 
 
