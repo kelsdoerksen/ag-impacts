@@ -97,6 +97,8 @@ era5_keep_hourly <- FALSE
 }
 
 .args       <- commandArgs(trailingOnly = TRUE)
+.check_only <- "--check" %in% .args
+.args       <- setdiff(.args, "--check")
 era5_source <- .take_flag("source", era5_source)
 .out_flag   <- .take_flag("out", "")
 if (length(.args)) era5_years <- .parse_years(.args)
@@ -297,6 +299,30 @@ era5_preflight <- function() {
               length(era5_years), 0.08 * length(era5_years) + 1.6, era5_out_dir))
 }
 
+# --check: everything the real run depends on, proved in seconds. Preflight
+# covers configuration; this adds one live fetch, because a well-formed
+# ~/.cdsapirc still says nothing about whether the token is valid, the licence
+# is accepted, or the machine can reach the service.
+era5_check <- function() {
+  era5_preflight()
+
+  if (era5_source == "cds") {
+    cat("Live CDS request (1 variable, 1 hour, 1x1 degree) ... ")
+    f <- cds_probe()
+    cat(sprintf("OK, %.1f KB\n", file.size(f) / 1024))
+    unlink(f)
+  } else {
+    cat("Live ARCO read (1 variable, 1 hour) ... ")
+    ds <- open_era5()
+    ds <- crop_to_aoi(ds[["2m_temperature"]]$sel(
+      time = py$slice("2000-06-01T00", "2000-06-01T00"))$to_dataset(), "test")
+    v <- ds[["2m_temperature"]]$values
+    cat(sprintf("OK, mean %.1f K\n", mean(v)))
+  }
+
+  cat("\nAll checks passed. Ready to run.\n")
+}
+
 era5_main <- function() {
   era5_preflight()
 
@@ -332,4 +358,6 @@ era5_main <- function() {
   cat("\nAll years processed.\n")
 }
 
-if (sys.nframe() == 0L) era5_main()
+if (sys.nframe() == 0L) {
+  if (.check_only) era5_check() else era5_main()
+}

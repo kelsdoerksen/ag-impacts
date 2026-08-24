@@ -16,42 +16,74 @@ Two files:
 
 ---
 
-## 1. R packages
+## 1-2. R and Python
+
+Two routes. On a **shared machine, use conda** — `install.packages()` writes to
+a personal R library, which is shared by everyone using the same account, so
+installing or upgrading there is visible to other people. A conda env is not.
+
+### Route A — conda env (recommended on shared machines)
+
+Self-contained: its own R, its own Python, its own GDAL. No `sudo`, no system
+`-dev` packages, no effect on anyone else.
+
+```sh
+conda env create -f environment-r.yml
+conda activate agimpacts-r
+conda env config vars set RETICULATE_PYTHON=$CONDA_PREFIX/bin/python
+conda env config vars set R_LIBS_USER=$CONDA_PREFIX/lib/R/library
+conda deactivate && conda activate agimpacts-r     # apply the variables
+```
+
+`R_LIBS_USER` matters on a **shared account**. R appends a per-user library
+(`~/R/x86_64-*-library/4.x`) to its search path, and on a shared login that
+directory belongs to everyone: an `install.packages()` there upgrades packages
+for every user of the account, and an interrupted one can leave a package
+half-replaced for them too. Pinning `R_LIBS_USER` into the env keeps both
+reading and writing inside the environment.
+
+Confirm the isolation held — every path printed should be inside the env:
+
+```sh
+Rscript -e 'print(.libPaths())'
+```
+
+`era5.R` reads `RETICULATE_PYTHON`, so nothing in the code needs changing.
+Setting it as an env config var means it travels with the environment and you
+cannot forget it. With the env active, `Rscript` is the env's R and its library
+path is inside the env, so the system R and its user library are bypassed
+entirely.
+
+### Route B — system R (fine on a machine you own)
 
 ```r
 install.packages(c("reticulate", "terra", "sf", "dplyr", "tidyr", "arrow"))
 ```
 
-On Linux, `terra` and `sf` build from source and need GDAL/GEOS/PROJ headers.
-If `gdal-config --version` prints nothing, install them first:
-
-```sh
-sudo apt install libgdal-dev libgeos-dev libproj-dev libudunits2-dev   # Debian/Ubuntu
-```
-
-If you are not root, or R itself came from conda (`which R` points inside a
-conda tree), install the geo stack through conda instead — mixing a conda R
-with CRAN source builds of `terra`/`sf` is a reliable way to lose an afternoon:
-
-```sh
-conda install -c conda-forge r-terra r-sf r-reticulate r-arrow r-dplyr r-tidyr
-```
-
-## 2. Python environment
-
-`era5.R` calls Python through reticulate (R has no good reader for cloud Zarr).
-
 ```r
 library(reticulate)
-virtualenv_create("r-reticulate", python = "/usr/bin/python3")  # 3.10-3.13 all fine
+virtualenv_create("r-reticulate", python = "/usr/bin/python3")
 virtualenv_install("r-reticulate",
   c("numpy", "xarray", "gcsfs", "zarr", "netCDF4", "dask", "cdsapi"))
 ```
 
-Pass `python =` explicitly on a machine where conda is active, so the venv is
-built from a known interpreter rather than whatever `(base)` happens to expose.
-`era5.R` requires this venv by name (`use_virtualenv("r-reticulate", required =
-TRUE)`), so it will not silently fall back to a different Python.
+On Linux, `terra`/`sf` build from source and need GDAL/GEOS/PROJ headers
+(`sudo apt install libgdal-dev libgeos-dev libproj-dev libudunits2-dev`).
+Run `conda deactivate` first if conda is active — system R picking up conda's
+libraries while building against system headers is a common source of link
+errors. Pass `python =` explicitly for the same reason.
+
+### Selecting the Python
+
+`era5.R` resolves it in this order, all with `required = TRUE` so a missing
+environment is an error rather than a silent fall back to a Python without
+xarray:
+
+| Setting | Effect |
+|---|---|
+| `RETICULATE_PYTHON=/path/to/bin/python` | use that interpreter |
+| `ERA5_CONDA_ENV=agimpacts-r` | use that conda env by name |
+| *(neither)* | the `r-reticulate` virtualenv |
 
 ### Checking what a machine already has
 
@@ -60,9 +92,44 @@ Rscript -e 'cat(R.version.string, "\n"); cat("libPaths:", .libPaths()[1], "\n");
 for (p in c("reticulate","terra","sf","dplyr","tidyr","arrow"))
   cat(sprintf("  %-11s %s\n", p, requireNamespace(p, quietly = TRUE)))'
 which R; which python3; python3 --version
-ls -d ~/.virtualenvs/r-reticulate 2>/dev/null || echo "(no r-reticulate venv)"
-ls -l ~/.cdsapirc 2>/dev/null || echo "(no ~/.cdsapirc)"
 gdal-config --version 2>/dev/null || echo "(no gdal-config)"
+```
+
+An interrupted `install.packages()` can leave `00LOCK-<pkg>` directories that
+block later installs, and occasionally a half-replaced package. A
+`00LOCK-<pkg>` holds R's backup of the *previous* version, so check what is
+broken before deleting anything.
+
+This reports and changes nothing. If a package does need restoring it prints
+the exact command, with the real package name already filled in:
+
+```sh
+Rscript -e '
+lib <- .libPaths()[1]
+cat("library:", lib, "\n")
+locks <- list.files(lib, pattern = "^00LOCK")
+cat("locks:", if (length(locks)) paste(locks, collapse=", ") else "none", "\n")
+broken <- character(0)
+for (p in c("reticulate","terra","sf","dplyr","tidyr","arrow","Rcpp","vctrs","rlang","cli")) {
+  ok <- requireNamespace(p, quietly = TRUE)
+  cat(sprintf("  %-12s %s\n", p, ok)); if (!ok) broken <- c(broken, p)
+}
+if (!length(broken)) {
+  cat("Nothing broken.\n")
+} else for (p in broken) {
+  src <- file.path(lib, paste0("00LOCK-", p), p)
+  if (dir.exists(src))
+    cat(sprintf("restore: file.copy(\"%s\", \"%s\", recursive=TRUE)\n", src, lib))
+  else
+    cat(sprintf("reinstall: install.packages(\"%s\")\n", p))
+}'
+```
+
+Once everything loads, clear the locks:
+
+```sh
+Rscript -e 'unlink(list.files(.libPaths()[1], pattern = "^00LOCK", full.names = TRUE),
+                   recursive = TRUE)'
 ```
 
 ## 3. CDS credentials
@@ -134,8 +201,8 @@ git clone <repo> && cd ag-impacts          # or git pull
 export AGIMPACTS_ROOT=/data/AgImpacts
 export ERA5_OUT_DIR=/data/era5_out
 
-# 2. confirm the config is sane -- takes seconds, no downloads
-Rscript -e 'e <- new.env(); source("R/era5-sample-gen.R", local = e); e$era5_preflight()'
+# 2. verify everything -- seconds, includes one live fetch
+Rscript R/era5-sample-gen.R --check
 
 # 3. run it detached, overnight
 nohup Rscript R/era5-sample-gen.R 1981-2025 > era5_conus.log 2>&1 &
@@ -144,11 +211,19 @@ nohup Rscript R/era5-sample-gen.R 1981-2025 > era5_conus.log 2>&1 &
 tail -f era5_conus.log
 ```
 
-Step 2 checks that both input files exist, that the output directory is
-writable (by writing to it, not just by looking), and that `~/.cdsapirc` has
-both a `url:` and a `key:` line. It prints `Preflight OK` and a disk estimate.
-The same checks run automatically at the start of the real job, so a
-misconfigured run fails in seconds rather than partway through the night.
+`--check` verifies, in this order:
+
+1. both input files exist (naming the missing one, and the `AGIMPACTS_ROOT` it
+   came from)
+2. the output directory is writable — by writing to it, not just by looking, so
+   a read-only mount is caught
+3. `~/.cdsapirc` has both a `url:` and a `key:` line
+4. **one live request** to CDS — which is the only thing that can prove the
+   token is valid, the licence is accepted, and the machine can reach the
+   service. A well-formed credentials file proves none of those.
+
+Steps 1–3 also run automatically at the start of every real run, so a
+misconfigured job dies in seconds rather than partway through the night.
 
 ### All the forms
 
@@ -158,6 +233,7 @@ Rscript R/era5-sample-gen.R 2001 2002 2005             # specific years
 Rscript R/era5-sample-gen.R 1981-2025                  # a range
 Rscript R/era5-sample-gen.R --out=/data/era5 1981-2025 # explicit output dir
 Rscript R/era5-sample-gen.R --source=arco 2000         # no-account fallback
+Rscript R/era5-sample-gen.R --check                    # verify setup, fetch nothing
 ```
 
 Years already written are skipped, so re-running after an interruption picks up

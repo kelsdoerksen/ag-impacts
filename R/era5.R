@@ -15,7 +15,26 @@
 
 library(reticulate)
 library(terra)
-use_virtualenv("r-reticulate", required = TRUE)
+
+# Which Python reticulate should use. The default is the "r-reticulate"
+# virtualenv, but on a shared machine it is usually better to put R and Python
+# in one self-contained conda environment, so both are selectable without
+# editing this file:
+#   RETICULATE_PYTHON=/path/to/env/bin/python   any interpreter, conda or not
+#   ERA5_CONDA_ENV=agimpacts-r                  a conda env by name
+# required = TRUE throughout, so a missing environment is an error rather than a
+# silent fall back to some other Python that lacks xarray/gcsfs.
+local({
+  py_path  <- Sys.getenv("RETICULATE_PYTHON")
+  conda_nm <- Sys.getenv("ERA5_CONDA_ENV")
+  if (nzchar(py_path)) {
+    use_python(py_path, required = TRUE)
+  } else if (nzchar(conda_nm)) {
+    use_condaenv(conda_nm, required = TRUE)
+  } else {
+    use_virtualenv("r-reticulate", required = TRUE)
+  }
+})
 
 # Avoids a hard crash on macOS when R and numpy each try to initialize their
 # own OpenMP runtime.
@@ -270,6 +289,22 @@ cds_month_nc <- function(aoi, year, month, cache_dir, verbose = TRUE) {
   if (!dir.exists(dirname(dest))) dir.create(dirname(dest), recursive = TRUE)
   file.rename(tmp, dest)
   dest
+}
+
+# The smallest real request there is: one variable, one hour, a 1x1 degree box.
+# Proves credentials, licence acceptance and connectivity together in a few
+# seconds, which is the cheap way to find out that something is wrong -- the
+# alternative is discovering it an hour into an unattended run.
+cds_probe <- function(target = tempfile(fileext = ".nc")) {
+  cdsapi$Client()$retrieve(CDS_DATASET, list(
+    product_type    = "reanalysis",
+    variable        = list("2m_temperature"),
+    year = "2000", month = "06", day = list("01"), time = list("12:00"),
+    area            = c(12.9, -2.1, 11.9, -1.1),
+    data_format     = "netcdf",
+    download_format = "unarchived"), target)
+  if (!file.exists(target)) stop("CDS probe returned no file")
+  target
 }
 
 # Open a month downloaded by cds_month_nc() in the same shape the ARCO path

@@ -1,0 +1,40 @@
+# Self-contained environment for the R side of the pipeline (ML-sample-gen.R,
+# era5.R, era5-sample-gen.R). R and Python live in the same env on purpose:
+# era5.R drives Python through reticulate, and keeping both here means nothing
+# depends on the machine's system R, its shared user library, or system GDAL.
+#
+# That isolation is the point on a shared box -- installing into a personal R
+# library is fine on a single-user machine, but on a shared account it is
+# visible to everyone using it.
+#
+#   conda env create -f environment-r.yml
+#   conda activate agimpacts-r
+#   conda env config vars set RETICULATE_PYTHON=$CONDA_PREFIX/bin/python
+#   conda deactivate && conda activate agimpacts-r     # apply the variable
+#
+# era5.R reads RETICULATE_PYTHON, so no code change is needed to point it here.
+# (ERA5_CONDA_ENV=agimpacts-r works too, if you prefer naming the env.)
+name: agimpacts-r
+channels:
+  - conda-forge
+dependencies:
+  # --- R and the packages the scripts load ---
+  - r-base>=4.3
+  - r-reticulate
+  - r-terra          # pulls conda-forge GDAL/GEOS/PROJ, so no system -dev packages
+  - r-sf
+  - r-dplyr
+  - r-tidyr
+  - r-arrow          # parquet output
+  - r-ncdf4          # EC-Earth3 NetCDF reads in ML-sample-gen.R
+
+  # --- Python, driven from R via reticulate ---
+  - python>=3.10,<3.14
+  - numpy
+  - xarray
+  - dask             # concurrent chunk reads on the ARCO path
+  - netcdf4          # reads the CDS month files
+  - cdsapi           # the CDS (server-side subsetting) source
+  - gcsfs            # the ARCO-ERA5 source
+  - zarr
+  - certifi          # CA bundle; era5.R points OpenSSL at it
