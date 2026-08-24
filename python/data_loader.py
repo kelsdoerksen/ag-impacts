@@ -514,9 +514,15 @@ def climate_dir(data_dir: str, climate_model: str, forecast_year: int = 1) -> st
 
     FY1 lives in {data_dir}/{climate_model}/; later forecast years get their own
     {data_dir}/FY{n}/ folder.
+
+    FY0 is the observed (reanalysis) case -- ERA5 has no initialization year and
+    no lead time, so hindcast_start is the target year itself. There is only ever
+    one such product per source, so it shares the {climate_model} folder rather
+    than getting an FY0/ of its own.
     """
     return os.path.join(
-        data_dir, climate_model if forecast_year == 1 else f"FY{forecast_year}")
+        data_dir,
+        climate_model if forecast_year in (0, 1) else f"FY{forecast_year}")
 
 
 def climate_name_candidates(climate_model: str, ens_member: str, aoi: str,

@@ -479,13 +479,16 @@ def parse_args():
                         help="Climate model subdir/file prefix. Default: EC-Earth3.")
     parser.add_argument("--ens_member", type=str, default="r1i4p1f1",
                         help="Ensemble member tag in climate filenames. Default: r1i4p1f1.")
-    parser.add_argument("--forecast_year", type=int, default=1, choices=[1, 2],
+    parser.add_argument("--forecast_year", type=int, default=1, choices=[0, 1, 2],
                         help="Which hindcast lead-year climate product to use. "
                              "1 (default): standard product in {data_dir}/{climate_model}/ "
                              "forecasting hindcast_start+1. 2: the FY2 product in "
                              "{data_dir}/FY2/ forecasting hindcast_start+2 (initialised "
-                             "~2 years ahead). --study_years is always in hindcast_start "
-                             "(s-year) terms; the target/yield year is s + forecast_year.")
+                             "~2 years ahead). 0: observed reanalysis (ERA5), which has no "
+                             "lead time, so the s-year is the target year and the files sit "
+                             "alongside FY1 in {data_dir}/{climate_model}/. --study_years is "
+                             "always in hindcast_start (s-year) terms; the target/yield year "
+                             "is s + forecast_year.")
     parser.add_argument("--climate_vars", type=parse_climate_vars, default=None,
                         metavar="VARS",
                         help="Comma-separated daily climate variables to use "

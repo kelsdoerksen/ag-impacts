@@ -1131,10 +1131,12 @@ def parse_args() -> argparse.Namespace:
                    help="Crop name matching crop_<name>_CONUS.parquet.")
     p.add_argument("--climate_model", type=str, default="EC-Earth3")
     p.add_argument("--ens_member",    type=str, default="r1i4p1f1")
-    p.add_argument("--forecast_year", type=int, default=1, choices=[1, 2],
+    p.add_argument("--forecast_year", type=int, default=1, choices=[0, 1, 2],
                    help="Hindcast lead-year climate product. 1 (default): standard "
                         "product in {data_dir}/{climate_model}/ forecasting s+1. "
                         "2: the FY2 product in {data_dir}/FY2/ forecasting s+2. "
+                        "0: observed reanalysis (ERA5), no lead time, s-year is the "
+                        "target year, filed alongside FY1. "
                         "Year args stay in hindcast_start (s-year) terms.")
     p.add_argument("--aoi",           type=str, default="CONUS",
                    help="Area-of-interest tag in the crop filename "

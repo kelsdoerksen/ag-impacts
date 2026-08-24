@@ -41,12 +41,18 @@ nc_versions  <- c("v20250108", "v20210910")
 nc_read_attempts <- 5L
 nc_read_backoff  <- c(5, 15, 30, 60)
 
-harv_tif   <- "/Users/kdoerkse/Documents/UCT/AgImpacts/CroplandPastureArea2000_Geotiff/cropland2000_area.tif"
-county_shp <- "/Users/kdoerkse/Documents/UCT/AgImpacts/us_county_2020_shapefile/cb_2020_us_county_20m.shp"
-nuts_gpkg  <- "/Users/kdoerkse/Documents/UCT/AgImpacts/NUTS_RG_60M_2024_3035.gpkg"
-cybench_poly_dir <- "/Users/kdoerkse/Documents/UCT/AgImpacts/cy-bench/polygons"
-proc_root  <- "/Users/kdoerkse/Documents/UCT/AgImpacts"
-out_dir    <- "/Users/kdoerkse/Documents/UCT/AgImpacts/CONUS_processed_data/EC-Earth3"
+# Root of the local data tree. Everything below is derived from it, so moving
+# this project to another machine is one environment variable rather than an
+# edit in six places:
+#   export AGIMPACTS_ROOT=/path/to/AgImpacts        (macOS / Linux)
+#   setx AGIMPACTS_ROOT C:\\path\\to\\AgImpacts           (Windows, then reopen)
+proc_root  <- Sys.getenv("AGIMPACTS_ROOT", "/Users/kdoerkse/Documents/UCT/AgImpacts")
+
+harv_tif   <- file.path(proc_root, "CroplandPastureArea2000_Geotiff", "cropland2000_area.tif")
+county_shp <- file.path(proc_root, "us_county_2020_shapefile", "cb_2020_us_county_20m.shp")
+nuts_gpkg  <- file.path(proc_root, "NUTS_RG_60M_2024_3035.gpkg")
+cybench_poly_dir <- file.path(proc_root, "cy-bench", "polygons")
+out_dir    <- file.path(proc_root, "CONUS_processed_data", "EC-Earth3")
 
 # ===== COUNTRY CONFIG =====
 # Each country defines:
@@ -284,7 +290,7 @@ arrays_to_rast <- function(d) {
 # Load one forecast year of the s{hstart} run (see nc_path for the lead-year layout).
 load_temperature_data <- function(day_data_dir, hindcast_start_year, region_vect,
                                    climate_model, member = "r1i4p1f1",
-                                   nc_version = "v20210910", fy = forecast_year) {
+                                   fy = forecast_year) {
   load_one <- function(var) {
     arrays_to_rast(read_nc_region(nc_path(var, hindcast_start_year, fy), var))
   }
@@ -302,7 +308,7 @@ load_temperature_data <- function(day_data_dir, hindcast_start_year, region_vect
 
 load_precip_data_daily <- function(day_data_dir, hindcast_start_year, region_vect,
                                     climate_model, member = "r1i4p1f1",
-                                    nc_version = "v20210910", fy = forecast_year) {
+                                    fy = forecast_year) {
   pr <- arrays_to_rast(read_nc_region(nc_path("pr", hindcast_start_year, fy), "pr"))
 
   cat("\n=== PR daily ===\n")
@@ -312,7 +318,7 @@ load_precip_data_daily <- function(day_data_dir, hindcast_start_year, region_vec
 
 load_hursmin_data <- function(day_data_dir, hindcast_start_year, region_vect,
                                climate_model, member = "r1i4p1f1",
-                               nc_version = "v20210910", fy = forecast_year) {
+                               fy = forecast_year) {
   f <- nc_path("hursmin", hindcast_start_year, fy)
   hursmin <- arrays_to_rast(read_nc_region(f, "hursmin"))
 
@@ -413,7 +419,16 @@ extract_daily_by_county <- function(masked_raster, var_name, regions,
     # geometry each day. Same grid as harv_frac_r so cell indices are valid.
     cell_vals <- terra::extract(masked_raster[[i]], harv_extracted$cell)[, 1]
 
-    county_wmeans <- tapply(seq_len(length(cell_vals)), harv_extracted$ID, function(idx) {
+    # Group by a factor with one level per admin unit, not by the raw IDs.
+    # tapply on the raw IDs returns one element per ID *present in the data*, so
+    # an admin unit with no extracted cells would shorten the result and
+    # misalign it against the regions$adm2 columns below. (In practice
+    # data.frame() catches that with "arguments imply differing number of rows"
+    # unless the lengths happen to divide evenly — this makes it impossible
+    # rather than merely loud, and yields NA for an empty unit.)
+    id_f <- factor(harv_extracted$ID, levels = seq_len(nrow(regions)))
+    county_wmeans <- tapply(seq_len(length(cell_vals)), id_f, function(idx) {
+      if (is.null(idx)) return(NA_real_)
       v    <- cell_vals[idx]
       w    <- harv_extracted$combined_weight[idx]
       keep <- !is.na(v) & !is.na(w) & w > 0
@@ -488,16 +503,31 @@ for (hindcast_start in hindcast_start_yrs) {
   cat("experiment     =", nc_experiment(hindcast_start), "\n")
   cat("========================================\n\n")
 
-  # Two naming conventions are already in use, and data_loader.py globs for both:
-  # the FY1 CONUS series is climate_{model}_s{hstart}-{member}.parquet inside a
-  # {model}/ folder, everything else is climate_{aoi}_{model}_fy{n}_s{hstart}.parquet.
-  # Match whichever applies so new years join the existing series.
-  out_file <- file.path(out_dir, if (forecast_year == 1 && country %in% c("CONUS", "usa")) {
-    sprintf("climate_%s_s%d-%s.parquet", climate_model, hindcast_start, member)
-  } else {
-    sprintf("climate_%s_%s_fy%d_s%d.parquet",
-            country, climate_model, forecast_year, hindcast_start)
-  })
+  # One naming convention for everything written from here on:
+  #   climate_{aoi}_{model}_fy{n}_s{hstart}-{member}.parquet
+  # AOI, forecast year, initialization year and ensemble member are all in the
+  # name, so a shared folder is unambiguous. data_loader.py tries this first.
+  #
+  # The original CONUS FY1 series was written without the AOI or fy token
+  # (climate_{model}_s{hstart}-{member}.parquet). Those are still readable, so
+  # existing files need no renaming — but a year already produced under the old
+  # name is treated as done, since regenerating it would mean hours of
+  # re-reading the SMB share for a byte-identical result.
+  aoi_tag  <- if (country %in% c("CONUS", "usa")) "CONUS" else country
+  out_file <- file.path(out_dir, sprintf("climate_%s_%s_fy%d_s%d-%s.parquet",
+                                         aoi_tag, climate_model, forecast_year,
+                                         hindcast_start, member))
+
+  legacy_names <- c(
+    sprintf("climate_%s_s%d-%s.parquet", climate_model, hindcast_start, member),
+    sprintf("climate_%s_%s_fy%d_s%d.parquet", aoi_tag, climate_model,
+            forecast_year, hindcast_start)
+  )
+  existing <- legacy_names[file.exists(file.path(out_dir, legacy_names))]
+  if (length(existing)) {
+    cat("Output already exists under an older name, skipping:", existing[1], "\n")
+    next
+  }
 
   if (file.exists(out_file)) {
     cat("Output already exists, skipping:", basename(out_file), "\n")
@@ -507,11 +537,11 @@ for (hindcast_start in hindcast_start_yrs) {
   # ----- Load climate data for this hindcast year -----
 
   temp     <- load_temperature_data(day_data_dir, hindcast_start, region$vect,
-                                     climate_model, member, nc_version, forecast_year)
+                                     climate_model, member, forecast_year)
   pr_raw   <- load_precip_data_daily(day_data_dir, hindcast_start, region$vect,
-                                      climate_model, member, nc_version, forecast_year)
+                                      climate_model, member, forecast_year)
   hurs_raw <- load_hursmin_data(day_data_dir, hindcast_start, region$vect,
-                                 climate_model, member, nc_version, forecast_year)
+                                 climate_model, member, forecast_year)
 
   # ----- Apply cropland mask -----
 
