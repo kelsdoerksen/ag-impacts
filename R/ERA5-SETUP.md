@@ -22,15 +22,47 @@ Two files:
 install.packages(c("reticulate", "terra", "sf", "dplyr", "tidyr", "arrow"))
 ```
 
+On Linux, `terra` and `sf` build from source and need GDAL/GEOS/PROJ headers.
+If `gdal-config --version` prints nothing, install them first:
+
+```sh
+sudo apt install libgdal-dev libgeos-dev libproj-dev libudunits2-dev   # Debian/Ubuntu
+```
+
+If you are not root, or R itself came from conda (`which R` points inside a
+conda tree), install the geo stack through conda instead — mixing a conda R
+with CRAN source builds of `terra`/`sf` is a reliable way to lose an afternoon:
+
+```sh
+conda install -c conda-forge r-terra r-sf r-reticulate r-arrow r-dplyr r-tidyr
+```
+
 ## 2. Python environment
 
 `era5.R` calls Python through reticulate (R has no good reader for cloud Zarr).
 
 ```r
 library(reticulate)
-virtualenv_create("r-reticulate", python = "3.11")   # 3.10-3.13 all fine
+virtualenv_create("r-reticulate", python = "/usr/bin/python3")  # 3.10-3.13 all fine
 virtualenv_install("r-reticulate",
   c("numpy", "xarray", "gcsfs", "zarr", "netCDF4", "dask", "cdsapi"))
+```
+
+Pass `python =` explicitly on a machine where conda is active, so the venv is
+built from a known interpreter rather than whatever `(base)` happens to expose.
+`era5.R` requires this venv by name (`use_virtualenv("r-reticulate", required =
+TRUE)`), so it will not silently fall back to a different Python.
+
+### Checking what a machine already has
+
+```sh
+Rscript -e 'cat(R.version.string, "\n"); cat("libPaths:", .libPaths()[1], "\n");
+for (p in c("reticulate","terra","sf","dplyr","tidyr","arrow"))
+  cat(sprintf("  %-11s %s\n", p, requireNamespace(p, quietly = TRUE)))'
+which R; which python3; python3 --version
+ls -d ~/.virtualenvs/r-reticulate 2>/dev/null || echo "(no r-reticulate venv)"
+ls -l ~/.cdsapirc 2>/dev/null || echo "(no ~/.cdsapirc)"
+gdal-config --version 2>/dev/null || echo "(no gdal-config)"
 ```
 
 ## 3. CDS credentials
@@ -45,6 +77,10 @@ ERA5 comes from the Copernicus Climate Data Store, which subsets server-side.
    url: https://cds.climate.copernicus.eu/api
    key: <your-token>
    ```
+
+   The token is per-account, not per-machine — the same one works everywhere,
+   but the file itself does not travel with the repo, so each machine needs its
+   own copy. `chmod 600 ~/.cdsapirc` on a shared server.
 
 3. **Accept the licence**, or every request fails with a 403:
    <https://cds.climate.copernicus.eu/datasets/reanalysis-era5-single-levels?tab=download#manage-licences>
