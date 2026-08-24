@@ -67,40 +67,67 @@ problem shows up as `401`.
 
 ## 4. Data files and paths
 
-All paths derive from one root, overridable by environment variable:
+Two independent knobs, so inputs and outputs can live in different places:
 
-```sh
-export AGIMPACTS_ROOT=/path/to/AgImpacts        # macOS / Linux
-setx AGIMPACTS_ROOT C:\path\to\AgImpacts        # Windows, then reopen the shell
-```
+| Variable | Controls | Default |
+|---|---|---|
+| `AGIMPACTS_ROOT` | where the **inputs** are read from | `/Users/kdoerkse/Documents/UCT/AgImpacts` |
+| `ERA5_OUT_DIR` | where the **output** is written | `{AGIMPACTS_ROOT}/CONUS_processed_data/ERA5` |
 
-The ERA5 path needs exactly two inputs under that root:
+`AGIMPACTS_ROOT` alone moves the whole tree. Set `ERA5_OUT_DIR` as well when the
+inputs sit on a shared/read-only volume and the output belongs somewhere with
+room. `--out=` on the command line overrides both.
+
+The ERA5 path needs exactly two inputs under `AGIMPACTS_ROOT`:
 
 | Path | Used for |
 |---|---|
 | `CroplandPastureArea2000_Geotiff/cropland2000_area.tif` | cropland-area weights |
 | `us_county_2020_shapefile/cb_2020_us_county_20m.shp` | CONUS county boundaries |
 
-Output goes to `CONUS_processed_data/ERA5/`.
+Copy those two from the Mac (or re-download them) — nothing else is required.
 
 ## 5. Running
 
-```sh
-Rscript R/era5-sample-gen.R 2000                    # one year
-Rscript R/era5-sample-gen.R 2001 2002 2005          # specific years
-Rscript R/era5-sample-gen.R 1981-2025               # a range
-Rscript R/era5-sample-gen.R --source=arco 2000      # no-account fallback
-```
-
-Overnight, detached, with a log:
+### Lab PC, start to finish
 
 ```sh
+git clone <repo> && cd ag-impacts          # or git pull
+
+# 1. point at the data (inputs and output separately)
+export AGIMPACTS_ROOT=/data/AgImpacts
+export ERA5_OUT_DIR=/data/era5_out
+
+# 2. confirm the config is sane -- takes seconds, no downloads
+Rscript -e 'e <- new.env(); source("R/era5-sample-gen.R", local = e); e$era5_preflight()'
+
+# 3. run it detached, overnight
 nohup Rscript R/era5-sample-gen.R 1981-2025 > era5_conus.log 2>&1 &
+
+# 4. watch
 tail -f era5_conus.log
 ```
 
+Step 2 checks that both input files exist, that the output directory is
+writable (by writing to it, not just by looking), and that `~/.cdsapirc` has
+both a `url:` and a `key:` line. It prints `Preflight OK` and a disk estimate.
+The same checks run automatically at the start of the real job, so a
+misconfigured run fails in seconds rather than partway through the night.
+
+### All the forms
+
+```sh
+Rscript R/era5-sample-gen.R 2000                       # one year
+Rscript R/era5-sample-gen.R 2001 2002 2005             # specific years
+Rscript R/era5-sample-gen.R 1981-2025                  # a range
+Rscript R/era5-sample-gen.R --out=/data/era5 1981-2025 # explicit output dir
+Rscript R/era5-sample-gen.R --source=arco 2000         # no-account fallback
+```
+
 Years already written are skipped, so re-running after an interruption picks up
-where it stopped.
+where it stopped. On Windows use `setx AGIMPACTS_ROOT C:\path\to\AgImpacts`
+(then reopen the shell); `nohup ... &` becomes `Start-Process` or just a
+detached terminal.
 
 ## 6. Caches and disk
 

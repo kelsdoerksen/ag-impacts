@@ -88,19 +88,36 @@ era5_keep_hourly <- FALSE
   }))))
 }
 
-.args <- commandArgs(trailingOnly = TRUE)
-.src  <- grep("^--source=", .args, value = TRUE)
-if (length(.src)) {
-  era5_source <- sub("^--source=", "", .src[1])
-  .args <- setdiff(.args, .src)
+# Pull "--flag=value" off the argument list, leaving the years behind.
+.take_flag <- function(flag, default) {
+  hit <- grep(paste0("^--", flag, "="), .args, value = TRUE)
+  if (!length(hit)) return(default)
+  .args <<- setdiff(.args, hit)
+  sub(paste0("^--", flag, "="), "", hit[1])
 }
+
+.args       <- commandArgs(trailingOnly = TRUE)
+era5_source <- .take_flag("source", era5_source)
+.out_flag   <- .take_flag("out", "")
 if (length(.args)) era5_years <- .parse_years(.args)
 
 if (!era5_source %in% c("cds", "arco")) {
   stop("--source must be 'cds' or 'arco', got '", era5_source, "'")
 }
 
-era5_out_dir   <- file.path(proc_root, "CONUS_processed_data", era5_model)
+# Where everything is written. Three ways to set it, most specific first, so an
+# overnight run can be pointed at a scratch disk without touching the file:
+#   Rscript R/era5-sample-gen.R --out=/data/era5 1981-2025
+#   ERA5_OUT_DIR=/data/era5 Rscript R/era5-sample-gen.R 1981-2025
+#   (default) {AGIMPACTS_ROOT}/CONUS_processed_data/ERA5
+# AGIMPACTS_ROOT alone moves the whole tree, inputs included; ERA5_OUT_DIR moves
+# only the output, which is what you want when the inputs live on a shared
+# volume and the output belongs somewhere with room.
+era5_out_dir <- if (nzchar(.out_flag)) {
+  .out_flag
+} else {
+  Sys.getenv("ERA5_OUT_DIR", file.path(proc_root, "CONUS_processed_data", era5_model))
+}
 era5_cache_dir <- file.path(era5_out_dir, "daily_grids")
 era5_cds_dir   <- file.path(era5_out_dir, "cds_nc")
 
@@ -228,14 +245,66 @@ era5_year_to_parquet <- function(year, statics, out_dir) {
 
 # ===== MAIN =====
 
+# Fail before the first download rather than hours in. Everything checked here
+# is something that would otherwise surface as an obscure error partway through
+# an unattended overnight run.
+era5_preflight <- function() {
+  problems <- character(0)
+
+  for (f in c(harv_tif = harv_tif, county_shp = county_shp)) {
+    if (!file.exists(f)) {
+      problems <- c(problems, sprintf("missing input: %s", f))
+    }
+  }
+  if (length(problems)) {
+    problems <- c(problems,
+      sprintf("  (paths derive from AGIMPACTS_ROOT, currently %s)", proc_root))
+  }
+
+  # Writability, checked by actually writing -- dir.exists() says nothing about
+  # permission, and a read-only mount is a normal way for this to go wrong.
+  if (!dir.exists(era5_out_dir)) {
+    ok <- dir.create(era5_out_dir, recursive = TRUE, showWarnings = FALSE)
+    if (!ok) problems <- c(problems, sprintf("cannot create output dir: %s", era5_out_dir))
+  }
+  if (dir.exists(era5_out_dir)) {
+    probe <- file.path(era5_out_dir, ".write_probe")
+    ok <- tryCatch({ writeLines("x", probe); unlink(probe); TRUE }, error = function(e) FALSE)
+    if (!ok) problems <- c(problems, sprintf("output dir is not writable: %s", era5_out_dir))
+  }
+
+  # CDS credentials: a missing or malformed ~/.cdsapirc only shows up on the
+  # first retrieve, which is after the boundaries and weights have been built.
+  if (era5_source == "cds") {
+    rc <- Sys.getenv("CDSAPI_RC", path.expand("~/.cdsapirc"))
+    if (!file.exists(rc) && !nzchar(Sys.getenv("CDSAPI_KEY"))) {
+      problems <- c(problems, sprintf("no CDS credentials: %s not found", rc))
+    } else if (file.exists(rc)) {
+      rc_txt <- readLines(rc, warn = FALSE)
+      if (!any(grepl("^\\s*url\\s*:", rc_txt)) || !any(grepl("^\\s*key\\s*:", rc_txt))) {
+        problems <- c(problems, sprintf("%s needs both a 'url:' and a 'key:' line", rc))
+      }
+    }
+  }
+
+  if (length(problems)) {
+    stop("preflight failed:\n  ", paste(problems, collapse = "\n  "), call. = FALSE)
+  }
+
+  # Rough disk guidance rather than a hard gate -- the requirement depends on
+  # how many years are already done, which is awkward to predict exactly.
+  cat(sprintf("Preflight OK. %d year(s) to do; budget ~%.1f GB in %s\n",
+              length(era5_years), 0.08 * length(era5_years) + 1.6, era5_out_dir))
+}
+
 era5_main <- function() {
+  era5_preflight()
+
   cat("\nERA5 -> admin-2 samples\n")
   cat("  AOI:        ", era5_aoi, "(", era5_aoi_tag, ")\n")
   cat("  Years:      ", paste(era5_years, collapse = ", "), "\n")
   cat("  Source:     ", era5_source, "\n")
   cat("  Output dir: ", era5_out_dir, "\n\n")
-
-  if (!dir.exists(era5_out_dir)) dir.create(era5_out_dir, recursive = TRUE)
 
   region <- load_us_boundaries(county_shp)
   cat("Admin units (adm2):", nrow(region$sf), "\n")
