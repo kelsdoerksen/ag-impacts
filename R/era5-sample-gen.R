@@ -82,10 +82,26 @@ era5_keep_hourly <- FALSE
 # Years may be given as single years or as ranges, so a long series does not
 # have to be spelled out: `1990-2020` and `1990:2020` both work.
 .parse_years <- function(x) {
-  sort(unique(unlist(lapply(x, function(a) {
-    p <- strsplit(a, "[-:]")[[1]]
-    if (length(p) == 2) seq(as.integer(p[1]), as.integer(p[2])) else as.integer(p)
+  # Parse first and complain at the top level of this function -- raising from
+  # inside the lapply buries the message under R's "error in evaluating the
+  # argument" chain, which is exactly when you least want to read one.
+  parts <- lapply(x, function(a) suppressWarnings(as.integer(strsplit(a, "[-:]")[[1]])))
+  bad_args <- x[vapply(parts, anyNA, logical(1))]
+  if (length(bad_args)) {
+    stop("cannot read a year from: ", paste(bad_args, collapse = ", "), call. = FALSE)
+  }
+
+  y <- sort(unique(unlist(lapply(parts, function(p) {
+    if (length(p) == 2) seq(p[1], p[2]) else p
   }))))
+  # Catch a typo before it becomes an overnight run that quietly does nothing,
+  # or one that asks CDS for years ERA5 does not cover.
+  bad <- y[y < 1940 | y > as.integer(format(Sys.Date(), "%Y"))]
+  if (length(bad)) {
+    stop("year(s) out of range for ERA5 (1940-present): ",
+         paste(bad, collapse = ", "), call. = FALSE)
+  }
+  y
 }
 
 # Pull "--flag=value" off the argument list, leaving the years behind.
@@ -144,7 +160,8 @@ era5_year_rasters <- function(aoi, year, cache_dir) {
 
   if (all(file.exists(paths))) {
     cached <- lapply(paths, rast)
-    if (all(vapply(cached, nlyr, integer(1)) == length(dates))) {
+    # numeric(1), not integer(1): terra::nlyr() returns a double.
+    if (all(vapply(cached, nlyr, numeric(1)) == length(dates))) {
       cat("Using cached daily grids for", year, "in", cache_dir, "\n")
       return(lapply(cached, function(r) { time(r) <- dates; r }))
     }
