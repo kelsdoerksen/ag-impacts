@@ -64,8 +64,27 @@ library(arrow)
 
 # ===== CONFIG =====
 
-era5_aoi      <- "conus"    # key into era5.R's AOI_BOUNDS
-era5_aoi_tag  <- "CONUS"    # AOI token in the output filename
+# Areas of interest. Each names the bounding box in era5.R's AOI_BOUNDS, the
+# files it needs on disk, and how to load its admin-2 units -- the loaders come
+# from ML-sample-gen.R, so the boundary handling is shared with the EC-Earth3
+# path rather than reimplemented here.
+#
+# The key is also the AOI token in output filenames and the {key}_processed_data
+# folder name, matching the convention the EC-Earth3 runs already use.
+ERA5_AOIS <- list(
+  CONUS = list(
+    era5_key = "conus",
+    inputs   = function() c(harv_tif, county_shp),
+    loader   = function() load_us_boundaries(county_shp)
+  ),
+  ZM = list(
+    era5_key = "zambia",
+    inputs   = function() c(harv_tif, file.path(cybench_poly_dir, "ZM", "ZM.shp")),
+    loader   = function() load_cybench_boundaries(file.path(cybench_poly_dir, "ZM", "ZM.shp"))
+  )
+)
+
+era5_aoi_tag  <- "CONUS"    # which ERA5_AOIS entry to run; --aoi= overrides
 era5_model    <- "ERA5"     # climate_model token
 era5_member   <- "obs"      # ensemble-member token; ERA5 is observed, so there is one
 era5_years    <- 2000
@@ -112,16 +131,24 @@ era5_keep_hourly <- FALSE
   sub(paste0("^--", flag, "="), "", hit[1])
 }
 
-.args       <- commandArgs(trailingOnly = TRUE)
-.check_only <- "--check" %in% .args
-.args       <- setdiff(.args, "--check")
-era5_source <- .take_flag("source", era5_source)
-.out_flag   <- .take_flag("out", "")
+.args        <- commandArgs(trailingOnly = TRUE)
+.check_only  <- "--check" %in% .args
+.args        <- setdiff(.args, "--check")
+era5_source  <- .take_flag("source", era5_source)
+era5_aoi_tag <- .take_flag("aoi", era5_aoi_tag)
+.out_flag    <- .take_flag("out", "")
 if (length(.args)) era5_years <- .parse_years(.args)
 
 if (!era5_source %in% c("cds", "arco")) {
   stop("--source must be 'cds' or 'arco', got '", era5_source, "'")
 }
+if (!era5_aoi_tag %in% names(ERA5_AOIS)) {
+  stop("--aoi must be one of: ", paste(names(ERA5_AOIS), collapse = ", "),
+       "; got '", era5_aoi_tag, "'")
+}
+
+era5_cfg <- ERA5_AOIS[[era5_aoi_tag]]
+era5_aoi <- era5_cfg$era5_key
 
 # Where everything is written. Three ways to set it, most specific first, so an
 # overnight run can be pointed at a scratch disk without touching the file:
@@ -134,7 +161,8 @@ if (!era5_source %in% c("cds", "arco")) {
 era5_out_dir <- if (nzchar(.out_flag)) {
   .out_flag
 } else {
-  Sys.getenv("ERA5_OUT_DIR", file.path(proc_root, "CONUS_processed_data", era5_model))
+  Sys.getenv("ERA5_OUT_DIR",
+             file.path(proc_root, paste0(era5_aoi_tag, "_processed_data"), era5_model))
 }
 era5_cache_dir <- file.path(era5_out_dir, "daily_grids")
 era5_cds_dir   <- file.path(era5_out_dir, "cds_nc")
@@ -270,7 +298,7 @@ era5_year_to_parquet <- function(year, statics, out_dir) {
 era5_preflight <- function() {
   problems <- character(0)
 
-  for (f in c(harv_tif = harv_tif, county_shp = county_shp)) {
+  for (f in era5_cfg$inputs()) {
     if (!file.exists(f)) {
       problems <- c(problems, sprintf("missing input: %s", f))
     }
@@ -310,10 +338,15 @@ era5_preflight <- function() {
     stop("preflight failed:\n  ", paste(problems, collapse = "\n  "), call. = FALSE)
   }
 
-  # Rough disk guidance rather than a hard gate -- the requirement depends on
-  # how many years are already done, which is awkward to predict exactly.
-  cat(sprintf("Preflight OK. %d year(s) to do; budget ~%.1f GB in %s\n",
-              length(era5_years), 0.08 * length(era5_years) + 1.6, era5_out_dir))
+  # Rough disk guidance rather than a hard gate. Scaled off the AOI's actual cell
+  # count, because the same year costs ~70 MB for CONUS and ~6 MB for a country
+  # the size of Zambia -- a CONUS-shaped estimate is wildly wrong for small AOIs.
+  box   <- AOI_BOUNDS[[era5_aoi]]
+  ncell <- ((box$lon_max - box$lon_min) / 0.25) * ((box$lat_max - box$lat_min) / 0.25)
+  # 4 variables x 366 days x float32, halved for DEFLATE (measured ~2x on real fields).
+  gb_yr <- 4 * 366 * ncell * 4 / 2 / 1073741824
+  cat(sprintf("Preflight OK. %d year(s), %.0f grid cells; ~%.0f MB/year of daily grids, ~%.1f GB total in %s\n",
+              length(era5_years), ncell, gb_yr * 1024, gb_yr * length(era5_years), era5_out_dir))
 }
 
 # --check: everything the real run depends on, proved in seconds. Preflight
@@ -344,12 +377,12 @@ era5_main <- function() {
   era5_preflight()
 
   cat("\nERA5 -> admin-2 samples\n")
-  cat("  AOI:        ", era5_aoi, "(", era5_aoi_tag, ")\n")
+  cat("  AOI:        ", era5_aoi_tag, "(bbox", era5_aoi, ")\n")
   cat("  Years:      ", paste(era5_years, collapse = ", "), "\n")
   cat("  Source:     ", era5_source, "\n")
   cat("  Output dir: ", era5_out_dir, "\n\n")
 
-  region <- load_us_boundaries(county_shp)
+  region <- era5_cfg$loader()
   cat("Admin units (adm2):", nrow(region$sf), "\n")
 
   # The cropland weights are tied to the climate grid, so they are built from an

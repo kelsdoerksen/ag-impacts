@@ -71,6 +71,9 @@ AOI_BOUNDS <- list(
   conus        = list(lat_min = 24.5,  lat_max = 49.5,  lon_min = -125.0, lon_max = -66.5),
   burkina_faso = list(lat_min = 9.4,   lat_max = 15.1,  lon_min = -5.6,   lon_max = 2.5),
   south_africa = list(lat_min = -35.0, lat_max = -22.0, lon_min = 16.3,   lon_max = 33.0),
+  # cy-bench ZM.shp spans 22.0-33.7E, 18.08-8.26S; padded by ~0.5 deg (two ERA5
+  # cells) so districts on the edge still see full cell overlap when weighted.
+  zambia       = list(lat_min = -18.6, lat_max = -7.8,  lon_min = 21.5,   lon_max = 34.2),
   # ~1x1 degree box around Ouagadougou, Burkina Faso — for quick smoke tests.
   test         = list(lat_min = 11.9,  lat_max = 12.9,  lon_min = -2.1,   lon_max = -1.1)
 )
