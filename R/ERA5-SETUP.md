@@ -4,12 +4,20 @@ Generates the same per-county daily climate parquets as `ML-sample-gen.R`, but
 from observed ERA5 instead of the EC-Earth3 hindcasts. Same schema, same units,
 same cropland-area weighting, so downstream code does not change.
 
-Two files:
+Files:
 
+- `era5-aoi.R` — the AOI registry, the daily-grid cache and the argument
+  helpers, shared by both pipelines below. Not run directly.
 - `era5.R` — pulls hourly ERA5 and reduces it to daily gridded rasters
   (`tasmax`, `tasmin`, `hursmin`, `pr`).
 - `era5-sample-gen.R` — applies the cropland mask and aggregates to admin-2
-  units, writing one parquet per year.
+  units, writing one parquet per year. **Aggregates before any feature is
+  computed** — see §10 for when that is the wrong order.
+- `era5-pixel-store.R` — the same download, stored per pixel instead, with a
+  pixel/admin-2 weight table. Feeds `python/era5_features.py`.
+
+Both pipelines share `{out_dir}/daily_grids`, so a year fetched by one is free
+for the other. Nothing needs re-downloading to switch between them.
 
 **The EC-Earth3 SMB share is not needed.** The ERA5 path never touches
 `/Volumes/CRL_storage`, so the lab PC does not need that mount.
@@ -321,3 +329,157 @@ folder, and `--forecast_year` accepts `0`:
 python python/run_loo_experiment.py --climate_model ERA5 --ens_member obs \
     --forecast_year 0 --aoi CONUS ...
 ```
+
+---
+
+## 10. Per-pixel features (the other pipeline)
+
+### Why
+
+`era5-sample-gen.R` takes the cropland-weighted admin-2 mean of the raw daily
+variables and writes that. Any feature computed from that parquet is therefore a
+feature *of the admin-2 mean*, which is only correct for features linear in the
+inputs. The ones that matter are not:
+
+```
+mean_i( max(0, T_i − Tbase) )  ≠  max(0, mean_i(T_i) − Tbase)
+```
+
+Averaging first flattens the tails, so a unit holding both a cool pixel and a
+hot one loses the heat the hot pixel actually accumulated. Degree days, extreme
+degree days, dry-day counts, VPD and every threshold feature are affected. On a
+Zambian admin-2 unit over one maize season, computing EDD per pixel first gave a
+season total **73% higher** than computing it from the unit mean; GDD moved 1.6%
+the other way. The causal crop-yield literature computes the feature per pixel
+and only then takes the cropland-area-weighted mean, which is what this pipeline
+does.
+
+### The three stages
+
+```sh
+# 1. download + store per pixel  (the expensive, network-bound part)
+Rscript R/era5-pixel-store.R --aoi=ZM 1980-2017
+
+# 2. per-pixel daily features    (cheap, re-runnable, no network)
+python python/era5_features.py --aoi=ZM --years=1980-2017 --stage=features
+
+# 3. cropland-weighted admin-2 aggregate
+python python/era5_features.py --aoi=ZM --years=1980-2017 --stage=aggregate \
+    --reduce=season --crop=maize
+```
+
+Stage 1 is deliberately feature-free, so it can run now and be reused unchanged
+however the feature set evolves. Stages 2 and 3 take seconds to minutes and can
+be re-run as often as the feature list changes.
+
+### Layout under `{out_dir}`
+
+```
+daily_grids/     GeoTIFF download cache, shared with era5-sample-gen.R
+cds_nc/          raw hourly months, discarded per year
+pixel_daily/     era5_pixel_{AOI}_{year}.nc    per-pixel daily cube
+grid/            weights_{AOI}.parquet         pixel × admin-2 × weight
+                 cells_{AOI}.parquet           the pixel set, with lon/lat
+                 grid_{AOI}.json               grid geometry + provenance
+pixel_features/  features_{AOI}_{year}.nc      per-pixel DAILY features
+features_admin2/ features_{AOI}_*.parquet      the final admin-2 table
+```
+
+The cube is NetCDF, not parquet: the data is dense and gridded, so a long table
+would repeat a cell id and a date on ~8.7M rows per CONUS year to hold the same
+numbers, and NetCDF is what xarray opens natively. This is not the netCDF that
+was rejected as too large — that was the raw **hourly** CDS download (~1.2 GB per
+year). A daily, four-variable, float32, deflate-compressed cube is ~50 MB per
+CONUS year and ~10 MB per Zambia year. The weight table stays parquet: it is
+tabular, has no time dimension, and is a join key on the pandas side.
+
+### The weight table
+
+One row per (admin unit, pixel it overlaps), with the two weighting terms kept
+apart so the feature stage can choose:
+
+| column | meaning |
+|---|---|
+| `coverage_frac` | share of the pixel inside the admin polygon (terra exact intersection) |
+| `cropland_frac` | harvested-area fraction of that pixel |
+| `combined_weight` | the product — the cropland-area weight, and what `--weight=cropland` uses |
+
+Built once per AOI, not once per year. `row`/`col` are terra's 1-based grid
+indices and index the cube directly (row 1 = northernmost, matching its
+descending latitude axis); `lon`/`lat` are there to verify that. The grid
+geometry is recorded in `grid_{AOI}.json` and checked against every year, because
+the join is by grid position — a shifted grid would be silently wrong rather
+than loudly broken.
+
+### Features
+
+`python python/era5_features.py --list-features`
+
+| feature | reduce | unit | params |
+|---|---|---|---|
+| `gdd` | sum | °C-day | `tbase=10`, `tcap=30` |
+| `edd` | sum | °C-day | `tcrit=30` |
+| `tavg` | mean | °C | |
+| `vpd` | mean | kPa | |
+| `pr` | sum | mm | |
+| `dry_days` | sum | days | `threshold=1.0` |
+| `hot_days` | sum | days | `threshold=35.0` |
+
+`gdd` and `edd` use the single-sine method — integrating `max(T − threshold, 0)`
+over a sine diurnal cycle between `tasmin` and `tasmax` — which is the standard
+construction in this literature and differs materially from
+`max(mean(tmin,tmax) − threshold, 0)` whenever the threshold falls inside the
+day's range. Override a parameter with `--param gdd.tbase=8`; the values used
+are recorded in the output cube's attributes.
+
+Adding a feature is adding one decorated function in `era5_features.py`. The
+`reduce` field says how stage 3 collapses the daily series over a season — `sum`
+for anything accumulated, `mean` for a state variable.
+
+### Season windows
+
+`--reduce=season` reads the cy-bench crop calendar
+(`crop_calendar_{crop}_{CC}.csv`, columns `sos`/`eos` as day-of-year) and gives
+each admin unit its own window. Zambian maize has `sos` 327 and `eos` 135, so the
+season for harvest year Y starts in Y−1 — handled explicitly, and it means
+stage 2 must have been run for Y−1 as well. `--season=SOS:EOS` applies one fixed
+window to every unit instead.
+
+`--reduce=daily` (the default) skips the temporal reduction and writes one row
+per unit per day, the same shape as the existing climate parquets — the values
+are just features computed per pixel first.
+
+### Running stage 1 on the lab PC
+
+`era5-pixel-store.R` writes the GeoTIFF daily grids *and* the NetCDF cubes, so it
+is the only thing to run there. Point `ERA5_OUT_DIR` at the directory that
+already holds `daily_grids/` for that AOI and every year already downloaded is
+free — it is read from cache, not re-fetched.
+
+```sh
+cd ~/kdoerksen/code/ag-impacts && git pull      # era5-aoi.R is new; needed to run
+conda activate agimpacts-r
+
+export AGIMPACTS_ROOT=/home/crl/kdoerksen/data
+export ERA5_OUT_DIR=/home/crl/kdoerksen/data/era5_zm    # per AOI; era5/ for CONUS
+
+# 1. prove the setup (seconds; includes one live CDS fetch and a boundary load)
+Rscript R/era5-pixel-store.R --aoi=ZM --check
+
+# 2. build the weight table from a year already on disk (no download)
+Rscript R/era5-pixel-store.R --aoi=ZM --grid-only 1980
+
+# 3. the real run, detached
+tmux new -s zm_pixel
+Rscript R/era5-pixel-store.R --aoi=ZM 1980-2017 2>&1 | tee era5_pixel_zm.log
+#   Ctrl-b d to detach; tmux attach -t zm_pixel to come back
+```
+
+Years already written are skipped, so an interrupted run resumes where it
+stopped. Running `era5-sample-gen.R` afterwards costs no extra download — it
+reads the same `daily_grids/` cache.
+
+### Environment
+
+Stages 2 and 3 need `xarray`, `netCDF4`, `pandas`, `numpy`, `pyarrow`. The `ag`
+conda env has all five. `dask` is deliberately not required.

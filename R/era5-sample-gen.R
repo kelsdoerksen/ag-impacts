@@ -36,9 +36,9 @@
 # hour whatever the AOI -- ~50 GB and several hours per CONUS year. For one year
 # either is fine; for a multi-year series that gap is the whole cost of the job.
 
-# Directory holding this file, so the two sources below resolve regardless of
-# the working directory. source() records the path on its own call frame, which
-# covers being sourced; Rscript only reports it in --file=.
+# Directory holding this file, so the shared configuration below resolves
+# regardless of the working directory. source() records the path on its own
+# call frame, which covers being sourced; Rscript only reports it in --file=.
 .this_dir <- local({
   f <- NULL
   for (i in seq_len(sys.nframe())) {
@@ -53,55 +53,13 @@
   if (is.null(f)) getwd() else dirname(normalizePath(f))
 })
 
-source(file.path(.this_dir, "era5.R"))          # era5_daily_rasters()
-# Defines load_us_boundaries(), load_harvested_area_raster() and
-# extract_daily_by_county(). Its own batch loop is behind a sys.nframe() guard,
-# so sourcing it only installs the functions and its config globals.
-source(file.path(.this_dir, "ML-sample-gen.R"))
-
-library(arrow)
+# The AOI registry, the daily-grid cache and the argument helpers -- shared
+# with era5-pixel-store.R, which walks the same download path. Sources era5.R
+# and ML-sample-gen.R in turn.
+source(file.path(.this_dir, "era5-aoi.R"))
 
 
 # ===== CONFIG =====
-
-# Areas of interest. Each names the bounding box in era5.R's AOI_BOUNDS, the
-# files it needs on disk, and how to load its admin-2 units -- the loaders come
-# from ML-sample-gen.R, so the boundary handling is shared with the EC-Earth3
-# path rather than reimplemented here.
-#
-# The key is also the AOI token in output filenames and the {key}_processed_data
-# folder name, matching the convention the EC-Earth3 runs already use.
-ERA5_AOIS <- list(
-  CONUS = list(
-    era5_key = "conus",
-    inputs   = function() c(harv_tif, county_shp),
-    loader   = function() load_us_boundaries(county_shp)
-  )
-)
-
-# Every cy-bench country becomes an AOI automatically, from the same registry
-# era5.R reads for its bounding boxes. Adding a country is a matter of
-# regenerating the registry, not editing this file.
-#
-# They all share one loader: load_cybench_boundaries() (from ML-sample-gen.R)
-# parses the {CC}-A2-{AA}{BB} adm_id scheme every cy-bench shapefile uses.
-local({
-  reg <- file.path(.this_dir, "cybench-aois.json")
-  if (!file.exists(reg) || !requireNamespace("jsonlite", quietly = TRUE)) return(invisible(NULL))
-  entries <- jsonlite::read_json(reg, simplifyVector = FALSE)
-  for (cc in names(entries)) {
-    if (!is.null(ERA5_AOIS[[cc]])) next
-    local({
-      code <- cc
-      rel  <- entries[[code]]$shapefile
-      ERA5_AOIS[[code]] <<- list(
-        era5_key = code,
-        inputs   = function() c(harv_tif, file.path(proc_root, rel)),
-        loader   = function() load_cybench_boundaries(file.path(proc_root, rel))
-      )
-    })
-  }
-})
 
 era5_aoi_tag  <- "CONUS"    # which ERA5_AOIS entry to run; --aoi= overrides
 era5_model    <- "ERA5"     # climate_model token
@@ -117,47 +75,14 @@ era5_source   <- "cds"      # "cds" (server-side subset, queued) or "arco" (no a
 # different sub-daily statistic.
 era5_keep_hourly <- FALSE
 
-# Years may be given as single years or as ranges, so a long series does not
-# have to be spelled out: `1990-2020` and `1990:2020` both work.
-.parse_years <- function(x) {
-  # Parse first and complain at the top level of this function -- raising from
-  # inside the lapply buries the message under R's "error in evaluating the
-  # argument" chain, which is exactly when you least want to read one.
-  parts <- lapply(x, function(a) suppressWarnings(as.integer(strsplit(a, "[-:]")[[1]])))
-  bad_args <- x[vapply(parts, anyNA, logical(1))]
-  if (length(bad_args)) {
-    stop("cannot read a year from: ", paste(bad_args, collapse = ", "), call. = FALSE)
-  }
-
-  y <- sort(unique(unlist(lapply(parts, function(p) {
-    if (length(p) == 2) seq(p[1], p[2]) else p
-  }))))
-  # Catch a typo before it becomes an overnight run that quietly does nothing,
-  # or one that asks CDS for years ERA5 does not cover.
-  bad <- y[y < 1940 | y > as.integer(format(Sys.Date(), "%Y"))]
-  if (length(bad)) {
-    stop("year(s) out of range for ERA5 (1940-present): ",
-         paste(bad, collapse = ", "), call. = FALSE)
-  }
-  y
-}
-
-# Pull "--flag=value" off the argument list, leaving the years behind.
-.take_flag <- function(flag, default) {
-  hit <- grep(paste0("^--", flag, "="), .args, value = TRUE)
-  if (!length(hit)) return(default)
-  .args <<- setdiff(.args, hit)
-  sub(paste0("^--", flag, "="), "", hit[1])
-}
-
 .args        <- commandArgs(trailingOnly = TRUE)
 .check_only  <- "--check" %in% .args
 .list_only   <- "--list-aois" %in% .args
 .args        <- setdiff(.args, c("--check", "--list-aois"))
-era5_source  <- .take_flag("source", era5_source)
-era5_aoi_tag <- .take_flag("aoi", era5_aoi_tag)
-.out_flag    <- .take_flag("out", "")
-if (length(.args)) era5_years <- .parse_years(.args)
+era5_source  <- era5_take_flag("source", era5_source)
+era5_aoi_tag <- era5_take_flag("aoi", era5_aoi_tag)
+.out_flag    <- era5_take_flag("out", "")
+if (length(.args)) era5_years <- era5_parse_years(.args)
 
 if (!era5_source %in% c("cds", "arco")) {
   stop("--source must be 'cds' or 'arco', got '", era5_source, "'")
@@ -170,88 +95,13 @@ if (!era5_aoi_tag %in% names(ERA5_AOIS)) {
 era5_cfg <- ERA5_AOIS[[era5_aoi_tag]]
 era5_aoi <- era5_cfg$era5_key
 
-# Where everything is written. Three ways to set it, most specific first, so an
-# overnight run can be pointed at a scratch disk without touching the file:
-#   Rscript R/era5-sample-gen.R --out=/data/era5 1981-2025
-#   ERA5_OUT_DIR=/data/era5 Rscript R/era5-sample-gen.R 1981-2025
-#   (default) {AGIMPACTS_ROOT}/CONUS_processed_data/ERA5
-# AGIMPACTS_ROOT alone moves the whole tree, inputs included; ERA5_OUT_DIR moves
-# only the output, which is what you want when the inputs live on a shared
-# volume and the output belongs somewhere with room.
-era5_out_dir <- if (nzchar(.out_flag)) {
-  .out_flag
-} else {
-  Sys.getenv("ERA5_OUT_DIR",
-             file.path(proc_root, paste0(era5_aoi_tag, "_processed_data"), era5_model))
-}
+# Where everything is written: --out= beats ERA5_OUT_DIR beats the default
+# {AGIMPACTS_ROOT}/{AOI}_processed_data/ERA5. See era5_resolve_out_dir().
+era5_out_dir <- era5_resolve_out_dir(era5_aoi_tag, .out_flag, era5_model)
 era5_cache_dir <- file.path(era5_out_dir, "daily_grids")
 era5_cds_dir   <- file.path(era5_out_dir, "cds_nc")
 
-ERA5_VARS <- c("tasmax", "tasmin", "hursmin", "pr")
-
-
 # ===== FUNCTIONS =====
-
-# Daily gridded rasters for one year, from the GeoTIFF cache if it is there and
-# from ARCO-ERA5 (slow -- see the header) if it is not.
-#
-# GeoTIFF carries no per-layer time, so it is reattached on read as the calendar
-# year's days. era5_daily_rasters() resamples to "1D" over a whole calendar year,
-# so a complete year is exactly that day sequence; a layer count that disagrees
-# means the cached file is not a whole year and is treated as unusable rather
-# than silently mislabelled.
-era5_year_rasters <- function(aoi, year, cache_dir) {
-  dates <- seq(as.Date(sprintf("%d-01-01", year)),
-               as.Date(sprintf("%d-12-31", year)), by = "day")
-  paths <- file.path(cache_dir, sprintf("era5_%s_%s_%d.tif", ERA5_VARS, era5_aoi_tag, year))
-  names(paths) <- ERA5_VARS
-
-  if (all(file.exists(paths))) {
-    cached <- lapply(paths, rast)
-    # numeric(1), not integer(1): terra::nlyr() returns a double.
-    if (all(vapply(cached, nlyr, numeric(1)) == length(dates))) {
-      cat("Using cached daily grids for", year, "in", cache_dir, "\n")
-      return(lapply(cached, function(r) { time(r) <- dates; r }))
-    }
-    cat("Cached grids for", year, "are not a full year; re-downloading.\n")
-  }
-
-  cat("Fetching ERA5", year, "for AOI", aoi, "via", era5_source,
-      "- one month at a time:\n")
-  t0 <- Sys.time()
-  clim <- era5_daily_rasters(aoi, year, source = era5_source,
-                             cds_cache_dir = era5_cds_dir)
-  cat(sprintf("ERA5 %d downloaded in %.1f min\n", year,
-              as.numeric(difftime(Sys.time(), t0, units = "mins"))))
-
-  if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
-  # DEFLATE with the floating-point predictor is lossless (verified bit-identical
-  # against an uncompressed write) and takes about a third off, which matters
-  # once this is the only copy of the year being kept.
-  for (v in ERA5_VARS) {
-    writeRaster(clim[[v]], paths[[v]], overwrite = TRUE,
-                gdal = c("COMPRESS=DEFLATE", "PREDICTOR=3", "ZLEVEL=6"))
-  }
-  cat("Cached daily grids to", cache_dir, "\n")
-
-  # The hourly months have served their purpose now that the year is reduced and
-  # on disk: they exist so an interrupted year resumes at the month it stopped
-  # on, not as an archive. Dropping them here caps peak usage at roughly one
-  # year rather than accumulating ~1.2 GB per year for the whole series.
-  if (!era5_keep_hourly && era5_source == "cds") {
-    spent <- list.files(era5_cds_dir, full.names = TRUE,
-                        pattern = sprintf("^era5_cds_%s_%d-", aoi, year))
-    if (length(spent)) {
-      freed <- sum(file.size(list.files(spent, recursive = TRUE, full.names = TRUE)),
-                   na.rm = TRUE)
-      unlink(spent, recursive = TRUE)
-      cat(sprintf("Discarded %d hourly month(s) for %d, freeing %.1f GB\n",
-                  length(spent), year, freed / 1073741824))
-    }
-  }
-
-  clim
-}
 
 # One year of ERA5 -> one parquet, same schema and units as ML-sample-gen.R's
 # EC-Earth3 output. `statics` carries the admin units and the cropland weights,
@@ -264,7 +114,9 @@ era5_year_to_parquet <- function(year, statics, out_dir) {
     return(invisible(out_file))
   }
 
-  clim <- era5_year_rasters(era5_aoi, year, era5_cache_dir)
+  clim <- era5_year_rasters(era5_aoi, year, era5_cache_dir,
+                            aoi_tag = era5_aoi_tag, source = era5_source,
+                            cds_dir = era5_cds_dir, keep_hourly = era5_keep_hourly)
 
   # Same cropland mask the EC-Earth3 path applies, on the ERA5 grid.
   masked <- lapply(clim[ERA5_VARS], function(r) r * statics$harv_mask)
@@ -316,44 +168,7 @@ era5_year_to_parquet <- function(year, statics, out_dir) {
 # is something that would otherwise surface as an obscure error partway through
 # an unattended overnight run.
 era5_preflight <- function() {
-  problems <- character(0)
-
-  for (f in era5_cfg$inputs()) {
-    if (!file.exists(f)) {
-      problems <- c(problems, sprintf("missing input: %s", f))
-    }
-  }
-  if (length(problems)) {
-    problems <- c(problems,
-      sprintf("  (paths derive from AGIMPACTS_ROOT, currently %s)", proc_root))
-  }
-
-  # Writability, checked by actually writing -- dir.exists() says nothing about
-  # permission, and a read-only mount is a normal way for this to go wrong.
-  if (!dir.exists(era5_out_dir)) {
-    ok <- dir.create(era5_out_dir, recursive = TRUE, showWarnings = FALSE)
-    if (!ok) problems <- c(problems, sprintf("cannot create output dir: %s", era5_out_dir))
-  }
-  if (dir.exists(era5_out_dir)) {
-    probe <- file.path(era5_out_dir, ".write_probe")
-    ok <- tryCatch({ writeLines("x", probe); unlink(probe); TRUE }, error = function(e) FALSE)
-    if (!ok) problems <- c(problems, sprintf("output dir is not writable: %s", era5_out_dir))
-  }
-
-  # CDS credentials: a missing or malformed ~/.cdsapirc only shows up on the
-  # first retrieve, which is after the boundaries and weights have been built.
-  if (era5_source == "cds") {
-    rc <- Sys.getenv("CDSAPI_RC", path.expand("~/.cdsapirc"))
-    if (!file.exists(rc) && !nzchar(Sys.getenv("CDSAPI_KEY"))) {
-      problems <- c(problems, sprintf("no CDS credentials: %s not found", rc))
-    } else if (file.exists(rc)) {
-      rc_txt <- readLines(rc, warn = FALSE)
-      if (!any(grepl("^\\s*url\\s*:", rc_txt)) || !any(grepl("^\\s*key\\s*:", rc_txt))) {
-        problems <- c(problems, sprintf("%s needs both a 'url:' and a 'key:' line", rc))
-      }
-    }
-  }
-
+  problems <- era5_check_inputs(era5_cfg, era5_out_dir, era5_source)
   if (length(problems)) {
     stop("preflight failed:\n  ", paste(problems, collapse = "\n  "), call. = FALSE)
   }
@@ -439,7 +254,10 @@ era5_main <- function() {
   # times finer, so these weights are not interchangeable with the EC-Earth3
   # run's. The first year is fetched here and reused below from the cache.
   ref_year <- era5_years[1]
-  ref_rast <- era5_year_rasters(era5_aoi, ref_year, era5_cache_dir)$tasmax[[1]]
+  ref_rast <- era5_year_rasters(era5_aoi, ref_year, era5_cache_dir,
+                                aoi_tag = era5_aoi_tag, source = era5_source,
+                                cds_dir = era5_cds_dir,
+                                keep_hourly = era5_keep_hourly)$tasmax[[1]]
 
   harv_frac_r <- load_harvested_area_raster(harv_tif, region$vect, ref_rast)
 
