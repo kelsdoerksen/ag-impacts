@@ -16,6 +16,23 @@
 library(reticulate)
 library(terra)
 
+# Directory holding this file, so the AOI registry resolves regardless of the
+# working directory (source() records the path on its call frame; Rscript only
+# reports it in --file=).
+.era5_dir <- local({
+  f <- NULL
+  for (i in seq_len(sys.nframe())) {
+    ofile <- tryCatch(sys.frame(i)$ofile, error = function(e) NULL)
+    if (!is.null(ofile)) f <- ofile
+  }
+  if (is.null(f)) {
+    a <- commandArgs(trailingOnly = FALSE)
+    m <- sub("^--file=", "", a[grep("^--file=", a)])
+    if (length(m)) f <- m[1]
+  }
+  if (is.null(f)) getwd() else dirname(normalizePath(f))
+})
+
 # Which Python reticulate should use. The default is the "r-reticulate"
 # virtualenv, but on a shared machine it is usually better to put R and Python
 # in one self-contained conda environment, so both are selectable without
@@ -71,9 +88,6 @@ AOI_BOUNDS <- list(
   conus        = list(lat_min = 24.5,  lat_max = 49.5,  lon_min = -125.0, lon_max = -66.5),
   burkina_faso = list(lat_min = 9.4,   lat_max = 15.1,  lon_min = -5.6,   lon_max = 2.5),
   south_africa = list(lat_min = -35.0, lat_max = -22.0, lon_min = 16.3,   lon_max = 33.0),
-  # cy-bench ZM.shp spans 22.0-33.7E, 18.08-8.26S; padded by ~0.5 deg (two ERA5
-  # cells) so districts on the edge still see full cell overlap when weighted.
-  zambia       = list(lat_min = -18.6, lat_max = -7.8,  lon_min = 21.5,   lon_max = 34.2),
   # ~1x1 degree box around Ouagadougou, Burkina Faso — for quick smoke tests.
   test         = list(lat_min = 11.9,  lat_max = 12.9,  lon_min = -2.1,   lon_max = -1.1)
 )
@@ -92,6 +106,31 @@ CDS_SHORT_TO_LONG <- c(t2m = "2m_temperature",
 # ERA5 stores these as running totals since the last timestep rather than
 # instantaneous values, so they need to be summed (not averaged) when
 # resampling to a coarser time step.
+# Every cy-bench country, loaded from R/cybench-aois.json and keyed by its
+# two-letter code (AO, BF, ... ZM). The registry is generated from the polygon
+# shapefiles themselves by tools/build-cybench-aois.R, so the boxes cannot drift
+# from the geometry they are meant to cover -- rebuild it rather than editing
+# boxes by hand. Hand-written AOIs above win on a name clash.
+local({
+  reg <- file.path(.era5_dir, "cybench-aois.json")
+  if (!file.exists(reg)) {
+    warning("cy-bench AOI registry not found at ", reg,
+            "; only the built-in AOIs are available", call. = FALSE)
+    return(invisible(NULL))
+  }
+  if (!requireNamespace("jsonlite", quietly = TRUE)) {
+    warning("jsonlite not installed; cy-bench AOIs unavailable", call. = FALSE)
+    return(invisible(NULL))
+  }
+  entries <- jsonlite::read_json(reg, simplifyVector = FALSE)
+  for (cc in names(entries)) {
+    if (!is.null(AOI_BOUNDS[[cc]])) next
+    b <- entries[[cc]]$bbox
+    AOI_BOUNDS[[cc]] <<- list(lat_min = b$lat_min, lat_max = b$lat_max,
+                              lon_min = b$lon_min, lon_max = b$lon_max)
+  }
+})
+
 ACCUMULATED_VARS <- c(
   "total_precipitation", "large_scale_precipitation", "convective_precipitation",
   "evaporation", "runoff", "surface_runoff", "sub_surface_runoff", "snowfall"

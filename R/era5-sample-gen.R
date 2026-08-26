@@ -76,13 +76,32 @@ ERA5_AOIS <- list(
     era5_key = "conus",
     inputs   = function() c(harv_tif, county_shp),
     loader   = function() load_us_boundaries(county_shp)
-  ),
-  ZM = list(
-    era5_key = "zambia",
-    inputs   = function() c(harv_tif, file.path(cybench_poly_dir, "ZM", "ZM.shp")),
-    loader   = function() load_cybench_boundaries(file.path(cybench_poly_dir, "ZM", "ZM.shp"))
   )
 )
+
+# Every cy-bench country becomes an AOI automatically, from the same registry
+# era5.R reads for its bounding boxes. Adding a country is a matter of
+# regenerating the registry, not editing this file.
+#
+# They all share one loader: load_cybench_boundaries() (from ML-sample-gen.R)
+# parses the {CC}-A2-{AA}{BB} adm_id scheme every cy-bench shapefile uses.
+local({
+  reg <- file.path(.this_dir, "cybench-aois.json")
+  if (!file.exists(reg) || !requireNamespace("jsonlite", quietly = TRUE)) return(invisible(NULL))
+  entries <- jsonlite::read_json(reg, simplifyVector = FALSE)
+  for (cc in names(entries)) {
+    if (!is.null(ERA5_AOIS[[cc]])) next
+    local({
+      code <- cc
+      rel  <- entries[[code]]$shapefile
+      ERA5_AOIS[[code]] <<- list(
+        era5_key = code,
+        inputs   = function() c(harv_tif, file.path(proc_root, rel)),
+        loader   = function() load_cybench_boundaries(file.path(proc_root, rel))
+      )
+    })
+  }
+})
 
 era5_aoi_tag  <- "CONUS"    # which ERA5_AOIS entry to run; --aoi= overrides
 era5_model    <- "ERA5"     # climate_model token
@@ -133,7 +152,8 @@ era5_keep_hourly <- FALSE
 
 .args        <- commandArgs(trailingOnly = TRUE)
 .check_only  <- "--check" %in% .args
-.args        <- setdiff(.args, "--check")
+.list_only   <- "--list-aois" %in% .args
+.args        <- setdiff(.args, c("--check", "--list-aois"))
 era5_source  <- .take_flag("source", era5_source)
 era5_aoi_tag <- .take_flag("aoi", era5_aoi_tag)
 .out_flag    <- .take_flag("out", "")
@@ -349,6 +369,35 @@ era5_preflight <- function() {
               length(era5_years), ncell, gb_yr * 1024, gb_yr * length(era5_years), era5_out_dir))
 }
 
+# --list-aois: what can be run, and what yield data each AOI has to pair with.
+# Reads the registry rather than the loaded AOI table so it can show the crop
+# coverage too, which is usually what decides whether an AOI is worth running.
+era5_list_aois <- function() {
+  reg <- file.path(.this_dir, "cybench-aois.json")
+  cat(sprintf("%-6s %8s %7s  %-28s %s\n",
+              "AOI", "cells", "units", "bbox lon/lat", "crops (years)"))
+  cat(strrep("-", 100), "\n")
+  cat(sprintf("%-6s %8s %7s  %-28s %s\n", "CONUS", "23735", "3108",
+              "US counties (built-in)", "-- EC-Earth3 series AOI"))
+  if (!file.exists(reg) || !requireNamespace("jsonlite", quietly = TRUE)) {
+    cat("(cy-bench registry unavailable)\n"); return(invisible(NULL))
+  }
+  e <- jsonlite::read_json(reg, simplifyVector = FALSE)
+  for (cc in names(e)) {
+    x <- e[[cc]]
+    crops <- paste(vapply(names(x$crops), function(cr) {
+      k <- x$crops[[cr]]
+      sprintf("%s %s %d-%d (%dy, %d units, e.g. %s)", cr, k$admin,
+              k$year_min, k$year_max, k$n_years, k$units,
+              if (is.null(k$adm_id_example)) "?" else k$adm_id_example)
+    }, character(1)), collapse = "; ")
+    cat(sprintf("%-6s %8d %7d  %-28s %s\n", cc, x$grid_cells, x$polygons,
+                sprintf("[%.0f,%.0f] [%.0f,%.0f]", x$bbox$lon_min, x$bbox$lon_max,
+                        x$bbox$lat_min, x$bbox$lat_max), crops))
+  }
+  cat("\nRun one with:  Rscript R/era5-sample-gen.R --aoi=ZM 1980-2017\n")
+}
+
 # --check: everything the real run depends on, proved in seconds. Preflight
 # covers configuration; this adds one live fetch, because a well-formed
 # ~/.cdsapirc still says nothing about whether the token is valid, the licence
@@ -409,5 +458,7 @@ era5_main <- function() {
 }
 
 if (sys.nframe() == 0L) {
-  if (.check_only) era5_check() else era5_main()
+  if (.list_only)        era5_list_aois()
+  else if (.check_only)  era5_check()
+  else                   era5_main()
 }

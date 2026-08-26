@@ -1,4 +1,4 @@
-# Crop Data Generation — CY-Bench AOIs (BF, ET, MG, MW)
+# Crop Data Generation — CY-Bench AOIs (BF, ET, ZM)
 #
 # Companion to crop-data-gen.R, which builds the US/Germany crop parquets from
 # .dta yield files plus SAGE calendar rasters. The cy-bench AOIs ship their own
@@ -30,7 +30,9 @@ library(arrow)
 
 country <- "BF"        # see COUNTRY_CONFIG below
 
-proc_root    <- "/Users/kdoerkse/Documents/UCT/AgImpacts"
+# Same knob as ML-sample-gen.R / era5-sample-gen.R, so one export points the
+# whole R side at the data on a machine that is not the Mac it was written on.
+proc_root    <- Sys.getenv("AGIMPACTS_ROOT", "/Users/kdoerkse/Documents/UCT/AgImpacts")
 cybench_dir  <- file.path(proc_root, "cy-bench", "cybench-data")
 cybench_poly <- file.path(proc_root, "cy-bench", "polygons")
 
@@ -58,6 +60,19 @@ COUNTRY_CONFIG <- list(
     crop       = "corn",
     aoi        = "ET",
     out_dir    = file.path(proc_root, "ET_preprocessed_data")
+  ),
+  # Zambia. Southern hemisphere, so its maize season crosses the new year:
+  # sos ~ DOY 326 (late November), eos ~ DOY 134 (mid-May) of the FOLLOWING
+  # calendar year, i.e. plant_start_doy > harvest_end_doy in the output. The
+  # python loader detects that and opens the seasonal window in yield_year - 1;
+  # nothing needs doing here beyond passing the calendar through unchanged.
+  # Directory matches what era5-sample-gen.R writes for --aoi=ZM.
+  ZM = list(
+    cy_country = "ZM",
+    cy_crop    = "maize",
+    crop       = "corn",
+    aoi        = "ZM",
+    out_dir    = file.path(proc_root, "ZM_processed_data")
   )
 )
 

@@ -1015,6 +1015,11 @@ def load_crop_climate_data(
 
     Aggregated / agro mode window (date-based, year-boundary safe):
         [plant_start_date − preseason_buffer,  harvest_end_date + postharvest_buffer]
+        Where the crop calendar crosses the new year (plant_start_doy >
+        harvest_end_doy, as in southern-hemisphere maize), plant_start_date is
+        anchored in yield_year − 1 and that year's climate is pulled in too, so
+        the window covers the whole season rather than collapsing to nothing.
+        County-seasons the loaded climate does not cover end to end are dropped.
 
     Timeseries mode window:
         [Nov 1 of yield year − 1,  Nov 1 of yield year]
@@ -1080,6 +1085,42 @@ def load_crop_climate_data(
         f"hindcast_start years: {sorted(crop_df['hindcast_start'].unique())}"
     )
 
+    # ---- cross-year seasons ----
+    # A southern-hemisphere season is planted in one calendar year and harvested
+    # in the next (Zambian maize: sos ~ DOY 326, eos ~ DOY 134), so half its
+    # weather sits in a climate file whose own target_year is a year earlier and
+    # would never reach this season's rows. Offer every climate row to the season
+    # ending in the FOLLOWING year as well; the date window below keeps only the
+    # days that genuinely fall inside a season, so the extra candidates cost rows
+    # in the merge and nothing in the result. Gated on the calendar actually
+    # crossing, since for a same-year AOI like CONUS this would double the merge
+    # to no purpose.
+    crosses_new_year = bool(
+        (crop_df["plant_start_doy"] > crop_df["harvest_end_doy"]).any())
+    # Only the observed (FY0) product needs stitching. Its files are calendar
+    # years, so a cross-year season straddles two of them -- but they are two
+    # slices of one continuous reanalysis, so joining them is just reading the
+    # record. A hindcast file is not: s{Y} runs Nov Y -> Oct Y+1, so it already
+    # holds its target season end to end, and reaching into s{Y-1} for a few
+    # extra pre-season days would splice a DIFFERENT initialization's weather
+    # into the same feature row. The pre-season buffer is clipped at the
+    # initialization date instead, which is what the hindcast actually knows.
+    stitch_prev_year = crosses_new_year and forecast_year == 0
+    if stitch_prev_year:
+        print("  Crop calendar crosses the new year (plant_start_doy > "
+              "harvest_end_doy): pairing each season with the previous "
+              "calendar year's observations as well.")
+        climate_df = pd.concat(
+            [climate_df,
+             climate_df.assign(target_year=climate_df["target_year"] + 1)],
+            ignore_index=True,
+        )
+    elif crosses_new_year:
+        print(f"  Crop calendar crosses the new year; forecast year "
+              f"{forecast_year} files span Nov-Oct and already cover the "
+              f"season, so any part of the {preseason_buffer}-day pre-season "
+              f"buffer that falls before the initialization date is clipped.")
+
     # ---- merge ----
     # Match on target_year (not hindcast_start): under FY1 these are equivalent,
     # but under FY2 the climate's hindcast_start is 2 years before the target,
@@ -1092,14 +1133,22 @@ def load_crop_climate_data(
         how="inner",
     )
     merged["yield_year"] = merged["target_year"]
+    # Re-key on the season rather than on the calendar year the climate row came
+    # from. These are the same thing for a same-year season, but a cross-year one
+    # is served by two climate files and every fold, groupby and yield-history
+    # lookup downstream keys on hindcast_start expecting target_year =
+    # hindcast_start + forecast_year — so the November half must carry the
+    # hindcast_start of the season it belongs to, not of the file it came from.
+    merged["hindcast_start"] = merged["target_year"] - forecast_year
 
     # ---- date-based window (year-boundary safe) ----
-    # plant_start_doy and harvest_end_doy are DOYs in the yield year, so we
-    # anchor them to Jan 1 of the yield year before applying buffers.
+    # harvest_end_doy is a DOY in the yield year; plant_start_doy is a DOY in the
+    # yield year too for a same-year season, but in the year BEFORE it when the
+    # calendar crosses the new year. Anchor each end to its own Jan 1.
     yield_yr_jan1 = pd.to_datetime(merged["yield_year"].astype(str) + "-01-01")
 
     if feature_mode in ("aggregated", "agro"):
-        window_start = yield_yr_jan1 + pd.to_timedelta(
+        window_start = _plant_year_jan1(merged) + pd.to_timedelta(
             merged["plant_start_doy"] - preseason_buffer - 1, unit="D"
         )
         window_end = yield_yr_jan1 + pd.to_timedelta(
@@ -1113,8 +1162,36 @@ def load_crop_climate_data(
             merged["yield_year"].astype(str) + "-11-01"
         )
 
-    mask   = (merged["date"] >= window_start) & (merged["date"] <= window_end)
+    merged["_win_start"] = window_start
+    merged["_win_end"]   = window_end
+    mask   = (merged["date"] >= merged["_win_start"]) & (merged["date"] <= merged["_win_end"])
     merged = merged[mask].copy().reset_index(drop=True)
+
+    if stitch_prev_year:
+        # A stitched season needs two climate files, so the first and last
+        # season of any series are half-covered — no planting weather for the
+        # earliest, no grain fill for the latest. Their aggregates would be taken
+        # over a truncated window and arrive looking like ordinary rows, so drop
+        # any county-season the loaded climate does not cover end to end. A
+        # same-year season cannot hit this (its window sits inside the one
+        # calendar year its climate file already covers), and a hindcast season
+        # is clipped at its initialization date by design, so the check belongs
+        # to the stitched case alone rather than to every AOI and product.
+        keys  = ["adm2_id", "hindcast_start"]
+        cover = merged.groupby(keys).agg(
+            first=("date", "min"), last=("date", "max"),
+            want_first=("_win_start", "first"), want_last=("_win_end", "first"))
+        complete = cover.index[(cover["first"] <= cover["want_first"])
+                               & (cover["last"] >= cover["want_last"])]
+        if len(complete) < len(cover):
+            short = cover.drop(index=complete)
+            print(f"  Dropping {len(short)} county-season(s) whose window the "
+                  f"loaded climate does not cover end to end (years: "
+                  f"{sorted(short.index.get_level_values('hindcast_start').unique())})")
+            merged = merged[
+                pd.MultiIndex.from_frame(merged[keys]).isin(complete)
+            ].copy().reset_index(drop=True)
+    merged = merged.drop(columns=["_win_start", "_win_end"])
 
     print(
         f"  After merge + {feature_mode} window: {len(merged):,} rows  "
@@ -1184,6 +1261,20 @@ def build_features(adm2_df: pd.DataFrame, weather_cols: list):
 # Agronomic features ("agro" feature mode)
 # ---------------------------------------------------------------------------
 
+def _plant_year_jan1(df: pd.DataFrame) -> pd.Series:
+    """Jan 1 of the calendar year each row's plant_start_doy is measured in.
+
+    Usually that is the yield year. Where the crop calendar crosses the new year
+    — plant_start_doy after harvest_end_doy, as in southern-hemisphere maize —
+    planting happened in the year BEFORE the harvest, so the DOY is anchored a
+    year earlier. Anchoring both ends to the yield year there would produce a
+    window that ends months before it starts, and silently select no days at all.
+    """
+    plant_year = (df["yield_year"].astype(int)
+                  - (df["plant_start_doy"] > df["harvest_end_doy"]).astype(int))
+    return pd.to_datetime(plant_year.astype(str) + "-01-01")
+
+
 def _window_start_dates(df: pd.DataFrame, preseason_buffer: int) -> pd.Series:
     """Nominal first day of each row's seasonal window.
 
@@ -1191,9 +1282,8 @@ def _window_start_dates(df: pd.DataFrame, preseason_buffer: int) -> pd.Series:
     observed date, so the season-block grid is anchored identically for every
     county-year even where the climate series is short a leading day.
     """
-    jan1 = pd.to_datetime(df["yield_year"].astype(str) + "-01-01")
-    return jan1 + pd.to_timedelta(df["plant_start_doy"] - preseason_buffer - 1,
-                                  unit="D")
+    return _plant_year_jan1(df) + pd.to_timedelta(
+        df["plant_start_doy"] - preseason_buffer - 1, unit="D")
 
 
 def build_agro_features(
@@ -1273,8 +1363,7 @@ def build_agro_features(
     # GDD accumulates only from gdd_preseason_days before the planting window
     # opens, so zero out the earlier part of the window rather than sub-setting
     # rows (keeps one pass over the frame and one groupby).
-    jan1      = pd.to_datetime(df["yield_year"].astype(str) + "-01-01")
-    gdd_start = jan1 + pd.to_timedelta(
+    gdd_start = _plant_year_jan1(df) + pd.to_timedelta(
         df["plant_start_doy"] - gdd_preseason_days - 1, unit="D")
     df["_gdd_day"] = df["_gdd_day"].where(df["date"] >= gdd_start, 0.0)
 

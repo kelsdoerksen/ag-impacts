@@ -1,0 +1,1415 @@
+{
+  "AO": {
+    "country_code": "AO",
+    "shapefile": "cy-bench/polygons/AO/AO.shp",
+    "polygons": 18,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 11.18,
+      "lat_min": -18.54,
+      "lon_max": 24.58,
+      "lat_max": -3.88
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 3186,
+    "crops": {
+      "maize": {
+        "units": 18,
+        "admin": "A1",
+        "adm_id_example": "AO-A1-0001",
+        "year_min": 1997,
+        "year_max": 2017,
+        "n_years": 21,
+        "obs": 378
+      }
+    }
+  },
+  "AR": {
+    "country_code": "AR",
+    "shapefile": "cy-bench/polygons/AR/AR.shp",
+    "polygons": 452,
+    "crs_assumed": false,
+    "id_match_rate": 0.98,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": -74.07,
+      "lat_min": -52.9,
+      "lon_max": -53.14,
+      "lat_max": -21.28
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 10584,
+    "crops": {
+      "maize": {
+        "units": 443,
+        "admin": "native",
+        "adm_id_example": "AR006854",
+        "year_min": 1970,
+        "year_max": 2023,
+        "n_years": 54,
+        "obs": 17115
+      },
+      "wheat": {
+        "units": 382,
+        "admin": "native",
+        "adm_id_example": "AR006854",
+        "year_min": 1970,
+        "year_max": 2024,
+        "n_years": 55,
+        "obs": 13028
+      }
+    }
+  },
+  "AT": {
+    "country_code": "AT",
+    "shapefile": "cy-bench/polygons/AT/AT.shp",
+    "polygons": 9,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 9.03,
+      "lat_min": 45.87,
+      "lon_max": 17.66,
+      "lat_max": 49.52
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 525,
+    "crops": {
+      "maize": {
+        "units": 9,
+        "admin": "native",
+        "adm_id_example": "AT11",
+        "year_min": 1975,
+        "year_max": 2020,
+        "n_years": 46,
+        "obs": 414
+      },
+      "wheat": {
+        "units": 9,
+        "admin": "native",
+        "adm_id_example": "AT11",
+        "year_min": 1995,
+        "year_max": 2020,
+        "n_years": 26,
+        "obs": 171
+      }
+    }
+  },
+  "AU": {
+    "country_code": "AU",
+    "shapefile": "cy-bench/polygons/AU/AU.shp",
+    "polygons": 27,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 96.32,
+      "lat_min": -44.24,
+      "lon_max": 154.14,
+      "lat_max": -9.91
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 31647,
+    "crops": {
+      "wheat": {
+        "units": 27,
+        "admin": "native",
+        "adm_id_example": "AU-111",
+        "year_min": 1990,
+        "year_max": 2024,
+        "n_years": 35,
+        "obs": 747
+      }
+    }
+  },
+  "BE": {
+    "country_code": "BE",
+    "shapefile": "cy-bench/polygons/BE/BE.shp",
+    "polygons": 11,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 2.05,
+      "lat_min": 49,
+      "lon_max": 6.91,
+      "lat_max": 52
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 228,
+    "crops": {
+      "maize": {
+        "units": 11,
+        "admin": "native",
+        "adm_id_example": "BE10",
+        "year_min": 2011,
+        "year_max": 2020,
+        "n_years": 10,
+        "obs": 86
+      },
+      "wheat": {
+        "units": 11,
+        "admin": "native",
+        "adm_id_example": "BE10",
+        "year_min": 2000,
+        "year_max": 2020,
+        "n_years": 21,
+        "obs": 216
+      }
+    }
+  },
+  "BF": {
+    "country_code": "BF",
+    "shapefile": "cy-bench/polygons/BF/BF.shp",
+    "polygons": 45,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": -6.02,
+      "lat_min": 8.9,
+      "lon_max": 2.91,
+      "lat_max": 15.58
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 972,
+    "crops": {
+      "maize": {
+        "units": 45,
+        "admin": "A2",
+        "adm_id_example": "BF-A2-0101",
+        "year_min": 1984,
+        "year_max": 2019,
+        "n_years": 31,
+        "obs": 1187
+      }
+    }
+  },
+  "BG": {
+    "country_code": "BG",
+    "shapefile": "cy-bench/polygons/BG/BG.shp",
+    "polygons": 6,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 21.86,
+      "lat_min": 40.74,
+      "lon_max": 29.11,
+      "lat_max": 44.72
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 464,
+    "crops": {
+      "maize": {
+        "units": 6,
+        "admin": "native",
+        "adm_id_example": "BG31",
+        "year_min": 1991,
+        "year_max": 2020,
+        "n_years": 30,
+        "obs": 180
+      },
+      "wheat": {
+        "units": 6,
+        "admin": "native",
+        "adm_id_example": "BG31",
+        "year_min": 1998,
+        "year_max": 2020,
+        "n_years": 11,
+        "obs": 46
+      }
+    }
+  },
+  "BR": {
+    "country_code": "BR",
+    "shapefile": "cy-bench/polygons/BR/BR.shp",
+    "polygons": 5547,
+    "crs_assumed": true,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": -74.49,
+      "lat_min": -34.25,
+      "lon_max": -31.88,
+      "lat_max": 5.77
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 27200,
+    "crops": {
+      "maize": {
+        "units": 5547,
+        "admin": "native",
+        "adm_id_example": "BR1100015",
+        "year_min": 1975,
+        "year_max": 2023,
+        "n_years": 49,
+        "obs": 230602
+      },
+      "wheat": {
+        "units": 1584,
+        "admin": "native",
+        "adm_id_example": "BR1300805",
+        "year_min": 1974,
+        "year_max": 2022,
+        "n_years": 49,
+        "obs": 39265
+      }
+    }
+  },
+  "CN": {
+    "country_code": "CN",
+    "shapefile": "cy-bench/polygons/CN/CN.shp",
+    "polygons": 31,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 73.06,
+      "lat_min": 17.66,
+      "lon_max": 135.23,
+      "lat_max": 54.03
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 36105,
+    "crops": {
+      "maize": {
+        "units": 31,
+        "admin": "native",
+        "adm_id_example": "CN011",
+        "year_min": 1990,
+        "year_max": 2022,
+        "n_years": 33,
+        "obs": 998
+      },
+      "wheat": {
+        "units": 30,
+        "admin": "native",
+        "adm_id_example": "CN011",
+        "year_min": 1990,
+        "year_max": 2022,
+        "n_years": 33,
+        "obs": 821
+      }
+    }
+  },
+  "CZ": {
+    "country_code": "CZ",
+    "shapefile": "cy-bench/polygons/CZ/CZ.shp",
+    "polygons": 14,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 11.6,
+      "lat_min": 48.05,
+      "lon_max": 19.36,
+      "lat_max": 51.55
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 434,
+    "crops": {
+      "maize": {
+        "units": 14,
+        "admin": "native",
+        "adm_id_example": "CZ010",
+        "year_min": 2005,
+        "year_max": 2020,
+        "n_years": 16,
+        "obs": 216
+      },
+      "wheat": {
+        "units": 14,
+        "admin": "native",
+        "adm_id_example": "CZ010",
+        "year_min": 2000,
+        "year_max": 2020,
+        "n_years": 21,
+        "obs": 294
+      }
+    }
+  },
+  "DE": {
+    "country_code": "DE",
+    "shapefile": "cy-bench/polygons/DE/DE.shp",
+    "polygons": 397,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 5.37,
+      "lat_min": 46.77,
+      "lon_max": 15.53,
+      "lat_max": 55.55
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 1435,
+    "crops": {
+      "maize": {
+        "units": 372,
+        "admin": "native",
+        "adm_id_example": "DE111",
+        "year_min": 1979,
+        "year_max": 2021,
+        "n_years": 43,
+        "obs": 9095
+      },
+      "wheat": {
+        "units": 397,
+        "admin": "native",
+        "adm_id_example": "DE111",
+        "year_min": 1979,
+        "year_max": 2021,
+        "n_years": 43,
+        "obs": 15233
+      }
+    }
+  },
+  "DK": {
+    "country_code": "DK",
+    "shapefile": "cy-bench/polygons/DK/DK.shp",
+    "polygons": 11,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 7.58,
+      "lat_min": 54.06,
+      "lon_max": 15.7,
+      "lat_max": 58.23
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 544,
+    "crops": {
+      "maize": {
+        "units": 7,
+        "admin": "native",
+        "adm_id_example": "DK014",
+        "year_min": 2011,
+        "year_max": 2020,
+        "n_years": 10,
+        "obs": 22
+      },
+      "wheat": {
+        "units": 11,
+        "admin": "native",
+        "adm_id_example": "DK011",
+        "year_min": 2006,
+        "year_max": 2020,
+        "n_years": 15,
+        "obs": 165
+      }
+    }
+  },
+  "EE": {
+    "country_code": "EE",
+    "shapefile": "cy-bench/polygons/EE/EE.shp",
+    "polygons": 5,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 21.27,
+      "lat_min": 57.01,
+      "lon_max": 28.71,
+      "lat_max": 60.17
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 390,
+    "crops": {
+      "maize": {
+        "units": 5,
+        "admin": "native",
+        "adm_id_example": "EE001",
+        "year_min": 2000,
+        "year_max": 2020,
+        "n_years": 21,
+        "obs": 105
+      },
+      "wheat": {
+        "units": 5,
+        "admin": "native",
+        "adm_id_example": "EE001",
+        "year_min": 2004,
+        "year_max": 2020,
+        "n_years": 17,
+        "obs": 85
+      }
+    }
+  },
+  "EL": {
+    "country_code": "EL",
+    "shapefile": "cy-bench/polygons/EL/EL.shp",
+    "polygons": 52,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 18.87,
+      "lat_min": 34.3,
+      "lon_max": 30.15,
+      "lat_max": 42.25
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 1440,
+    "crops": {
+      "maize": {
+        "units": 52,
+        "admin": "native",
+        "adm_id_example": "EL301",
+        "year_min": 2009,
+        "year_max": 2019,
+        "n_years": 11,
+        "obs": 559
+      },
+      "wheat": {
+        "units": 49,
+        "admin": "native",
+        "adm_id_example": "EL301",
+        "year_min": 1998,
+        "year_max": 2019,
+        "n_years": 22,
+        "obs": 992
+      }
+    }
+  },
+  "ES": {
+    "country_code": "ES",
+    "shapefile": "cy-bench/polygons/ES/ES.shp",
+    "polygons": 53,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": -18.51,
+      "lat_min": 27.23,
+      "lon_max": 3.81,
+      "lat_max": 44.28
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 6052,
+    "crops": {
+      "maize": {
+        "units": 53,
+        "admin": "native",
+        "adm_id_example": "ES111",
+        "year_min": 1998,
+        "year_max": 2020,
+        "n_years": 23,
+        "obs": 1146
+      },
+      "wheat": {
+        "units": 46,
+        "admin": "native",
+        "adm_id_example": "ES111",
+        "year_min": 1998,
+        "year_max": 2020,
+        "n_years": 23,
+        "obs": 721
+      }
+    }
+  },
+  "ET": {
+    "country_code": "ET",
+    "shapefile": "cy-bench/polygons/ET/ET.shp",
+    "polygons": 68,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 32.5,
+      "lat_min": 3.01,
+      "lon_max": 46.47,
+      "lat_max": 15.39
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 2800,
+    "crops": {
+      "maize": {
+        "units": 68,
+        "admin": "A2",
+        "adm_id_example": "ET-A2-0101",
+        "year_min": 1999,
+        "year_max": 2020,
+        "n_years": 18,
+        "obs": 1050
+      }
+    }
+  },
+  "FI": {
+    "country_code": "FI",
+    "shapefile": "cy-bench/polygons/FI/FI.shp",
+    "polygons": 19,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 18.83,
+      "lat_min": 59.26,
+      "lon_max": 32.08,
+      "lat_max": 70.59
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 2385,
+    "crops": {
+      "maize": {
+        "units": 19,
+        "admin": "native",
+        "adm_id_example": "FI193",
+        "year_min": 2000,
+        "year_max": 2020,
+        "n_years": 21,
+        "obs": 399
+      },
+      "wheat": {
+        "units": 18,
+        "admin": "native",
+        "adm_id_example": "FI193",
+        "year_min": 2000,
+        "year_max": 2020,
+        "n_years": 21,
+        "obs": 197
+      }
+    }
+  },
+  "FR": {
+    "country_code": "FR",
+    "shapefile": "cy-bench/polygons/FR/FR.shp",
+    "polygons": 95,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": -5.64,
+      "lat_min": 40.86,
+      "lon_max": 10.06,
+      "lat_max": 51.59
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 2709,
+    "crops": {
+      "maize": {
+        "units": 95,
+        "admin": "native",
+        "adm_id_example": "FR102",
+        "year_min": 1989,
+        "year_max": 2020,
+        "n_years": 32,
+        "obs": 3026
+      },
+      "wheat": {
+        "units": 95,
+        "admin": "native",
+        "adm_id_example": "FR102",
+        "year_min": 1989,
+        "year_max": 2020,
+        "n_years": 32,
+        "obs": 2571
+      }
+    }
+  },
+  "HR": {
+    "country_code": "HR",
+    "shapefile": "cy-bench/polygons/HR/HR.shp",
+    "polygons": 2,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 13,
+      "lat_min": 41.91,
+      "lon_max": 19.94,
+      "lat_max": 47.05
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 588,
+    "crops": {
+      "maize": {
+        "units": 2,
+        "admin": "native",
+        "adm_id_example": "HR03",
+        "year_min": 2005,
+        "year_max": 2020,
+        "n_years": 16,
+        "obs": 32
+      },
+      "wheat": {
+        "units": 2,
+        "admin": "native",
+        "adm_id_example": "HR03",
+        "year_min": 2008,
+        "year_max": 2020,
+        "n_years": 13,
+        "obs": 25
+      }
+    }
+  },
+  "HU": {
+    "country_code": "HU",
+    "shapefile": "cy-bench/polygons/HU/HU.shp",
+    "polygons": 20,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 15.61,
+      "lat_min": 45.24,
+      "lon_max": 23.4,
+      "lat_max": 49.08
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 465,
+    "crops": {
+      "maize": {
+        "units": 20,
+        "admin": "native",
+        "adm_id_example": "HU110",
+        "year_min": 1996,
+        "year_max": 2020,
+        "n_years": 25,
+        "obs": 459
+      },
+      "wheat": {
+        "units": 20,
+        "admin": "native",
+        "adm_id_example": "HU110",
+        "year_min": 2002,
+        "year_max": 2020,
+        "n_years": 19,
+        "obs": 318
+      }
+    }
+  },
+  "IE": {
+    "country_code": "IE",
+    "shapefile": "cy-bench/polygons/IE/IE.shp",
+    "polygons": 3,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": -11.12,
+      "lat_min": 50.92,
+      "lon_max": -5.5,
+      "lat_max": 55.87
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 440,
+    "crops": {
+      "maize": {
+        "units": 3,
+        "admin": "native",
+        "adm_id_example": "IE04",
+        "year_min": 2000,
+        "year_max": 2020,
+        "n_years": 21,
+        "obs": 63
+      },
+      "wheat": {
+        "units": 3,
+        "admin": "native",
+        "adm_id_example": "IE04",
+        "year_min": 1990,
+        "year_max": 2020,
+        "n_years": 15,
+        "obs": 41
+      }
+    }
+  },
+  "IN": {
+    "country_code": "IN",
+    "shapefile": "cy-bench/polygons/IN/IN.shp",
+    "polygons": 570,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 67.68,
+      "lat_min": 7.58,
+      "lon_max": 96.52,
+      "lat_max": 33.76
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 12075,
+    "crops": {
+      "maize": {
+        "units": 557,
+        "admin": "native",
+        "adm_id_example": "IN-14-0001",
+        "year_min": 1990,
+        "year_max": 2017,
+        "n_years": 28,
+        "obs": 12075
+      },
+      "wheat": {
+        "units": 520,
+        "admin": "native",
+        "adm_id_example": "IN-14-0001",
+        "year_min": 1990,
+        "year_max": 2017,
+        "n_years": 28,
+        "obs": 11706
+      }
+    }
+  },
+  "IT": {
+    "country_code": "IT",
+    "shapefile": "cy-bench/polygons/IT/IT.shp",
+    "polygons": 105,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 6.13,
+      "lat_min": 36.15,
+      "lon_max": 19.02,
+      "lat_max": 47.59
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 2392,
+    "crops": {
+      "maize": {
+        "units": 103,
+        "admin": "native",
+        "adm_id_example": "ITC11",
+        "year_min": 1995,
+        "year_max": 2020,
+        "n_years": 26,
+        "obs": 2325
+      },
+      "wheat": {
+        "units": 97,
+        "admin": "native",
+        "adm_id_example": "ITC11",
+        "year_min": 1995,
+        "year_max": 2020,
+        "n_years": 26,
+        "obs": 1833
+      }
+    }
+  },
+  "LS": {
+    "country_code": "LS",
+    "shapefile": "cy-bench/polygons/LS/LS.shp",
+    "polygons": 10,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 26.53,
+      "lat_min": -31.17,
+      "lon_max": 29.97,
+      "lat_max": -28.07
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 168,
+    "crops": {
+      "maize": {
+        "units": 10,
+        "admin": "A1",
+        "adm_id_example": "LS-A1-0001",
+        "year_min": 1981,
+        "year_max": 2021,
+        "n_years": 41,
+        "obs": 393
+      }
+    }
+  },
+  "LT": {
+    "country_code": "LT",
+    "shapefile": "cy-bench/polygons/LT/LT.shp",
+    "polygons": 10,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 20.48,
+      "lat_min": 53.4,
+      "lon_max": 27.33,
+      "lat_max": 56.95
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 378,
+    "crops": {
+      "maize": {
+        "units": 10,
+        "admin": "native",
+        "adm_id_example": "LT011",
+        "year_min": 2000,
+        "year_max": 2020,
+        "n_years": 21,
+        "obs": 181
+      },
+      "wheat": {
+        "units": 10,
+        "admin": "native",
+        "adm_id_example": "LT011",
+        "year_min": 2000,
+        "year_max": 2020,
+        "n_years": 21,
+        "obs": 209
+      }
+    }
+  },
+  "LV": {
+    "country_code": "LV",
+    "shapefile": "cy-bench/polygons/LV/LV.shp",
+    "polygons": 6,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 20.47,
+      "lat_min": 55.18,
+      "lon_max": 28.74,
+      "lat_max": 58.58
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 462,
+    "crops": {
+      "maize": {
+        "units": 6,
+        "admin": "native",
+        "adm_id_example": "LV003",
+        "year_min": 2000,
+        "year_max": 2020,
+        "n_years": 21,
+        "obs": 126
+      },
+      "wheat": {
+        "units": 5,
+        "admin": "native",
+        "adm_id_example": "LV003",
+        "year_min": 2000,
+        "year_max": 2018,
+        "n_years": 19,
+        "obs": 95
+      }
+    }
+  },
+  "MG": {
+    "country_code": "MG",
+    "shapefile": "cy-bench/polygons/MG/MG.shp",
+    "polygons": 22,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 42.69,
+      "lat_min": -26.11,
+      "lon_max": 50.99,
+      "lat_max": -11.45
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 1947,
+    "crops": {
+      "maize": {
+        "units": 22,
+        "admin": "A2",
+        "adm_id_example": "MG-A2-0103",
+        "year_min": 1990,
+        "year_max": 2010,
+        "n_years": 19,
+        "obs": 397
+      }
+    }
+  },
+  "ML": {
+    "country_code": "ML",
+    "shapefile": "cy-bench/polygons/ML/ML.shp",
+    "polygons": 27,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": -9.18,
+      "lat_min": 9.66,
+      "lon_max": -3.46,
+      "lat_max": 14.44
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 437,
+    "crops": {
+      "maize": {
+        "units": 27,
+        "admin": "native",
+        "adm_id_example": "ML030122101",
+        "year_min": 1990,
+        "year_max": 2017,
+        "n_years": 28,
+        "obs": 756
+      }
+    }
+  },
+  "MW": {
+    "country_code": "MW",
+    "shapefile": "cy-bench/polygons/MW/MW.shp",
+    "polygons": 28,
+    "crs_assumed": false,
+    "id_match_rate": 0.179,
+    "id_join_ok": false,
+    "bbox": {
+      "lon_min": 32.17,
+      "lat_min": -17.62,
+      "lon_max": 36.42,
+      "lat_max": -8.87
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 595,
+    "crops": {
+      "maize": {
+        "units": 28,
+        "admin": "A2",
+        "adm_id_example": "MW-A2-0101",
+        "year_min": 2018,
+        "year_max": 2023,
+        "n_years": 6,
+        "obs": 100
+      }
+    }
+  },
+  "MX": {
+    "country_code": "MX",
+    "shapefile": "cy-bench/polygons/MX/MX.shp",
+    "polygons": 32,
+    "crs_assumed": false,
+    "id_match_rate": 0.97,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": -118.87,
+      "lat_min": 14.03,
+      "lon_max": -86.21,
+      "lat_max": 33.22
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 10087,
+    "crops": {
+      "maize": {
+        "units": 33,
+        "admin": "native",
+        "adm_id_example": "MX01",
+        "year_min": 2014,
+        "year_max": 2022,
+        "n_years": 4,
+        "obs": 141
+      }
+    }
+  },
+  "MZ": {
+    "country_code": "MZ",
+    "shapefile": "cy-bench/polygons/MZ/MZ.shp",
+    "polygons": 10,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 29.72,
+      "lat_min": -27.37,
+      "lon_max": 41.34,
+      "lat_max": -9.97
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 3220,
+    "crops": {
+      "maize": {
+        "units": 10,
+        "admin": "A1",
+        "adm_id_example": "MZ-A1-0001",
+        "year_min": 1999,
+        "year_max": 2022,
+        "n_years": 22,
+        "obs": 196
+      }
+    }
+  },
+  "NE": {
+    "country_code": "NE",
+    "shapefile": "cy-bench/polygons/NE/NE.shp",
+    "polygons": 42,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": -0.33,
+      "lat_min": 11.2,
+      "lon_max": 14.13,
+      "lat_max": 23.46
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 2842,
+    "crops": {
+      "maize": {
+        "units": 42,
+        "admin": "A2",
+        "adm_id_example": "NE-A2-0104",
+        "year_min": 1980,
+        "year_max": 2021,
+        "n_years": 40,
+        "obs": 567
+      }
+    }
+  },
+  "NL": {
+    "country_code": "NL",
+    "shapefile": "cy-bench/polygons/NL/NL.shp",
+    "polygons": 12,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 2.86,
+      "lat_min": 50.25,
+      "lon_max": 7.72,
+      "lat_max": 54.06
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 285,
+    "crops": {
+      "maize": {
+        "units": 12,
+        "admin": "native",
+        "adm_id_example": "NL11",
+        "year_min": 2008,
+        "year_max": 2020,
+        "n_years": 13,
+        "obs": 129
+      },
+      "wheat": {
+        "units": 12,
+        "admin": "native",
+        "adm_id_example": "NL11",
+        "year_min": 2000,
+        "year_max": 2020,
+        "n_years": 21,
+        "obs": 242
+      }
+    }
+  },
+  "PL": {
+    "country_code": "PL",
+    "shapefile": "cy-bench/polygons/PL/PL.shp",
+    "polygons": 17,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 13.63,
+      "lat_min": 48.5,
+      "lon_max": 24.64,
+      "lat_max": 55.33
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 1188,
+    "crops": {
+      "maize": {
+        "units": 17,
+        "admin": "native",
+        "adm_id_example": "PL21",
+        "year_min": 2003,
+        "year_max": 2020,
+        "n_years": 18,
+        "obs": 301
+      },
+      "wheat": {
+        "units": 17,
+        "admin": "native",
+        "adm_id_example": "PL21",
+        "year_min": 2003,
+        "year_max": 2020,
+        "n_years": 18,
+        "obs": 301
+      }
+    }
+  },
+  "PT": {
+    "country_code": "PT",
+    "shapefile": "cy-bench/polygons/PT/PT.shp",
+    "polygons": 7,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": -31.77,
+      "lat_min": 29.64,
+      "lon_max": -5.7,
+      "lat_max": 42.65
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 5408,
+    "crops": {
+      "maize": {
+        "units": 7,
+        "admin": "native",
+        "adm_id_example": "PT11",
+        "year_min": 1986,
+        "year_max": 2020,
+        "n_years": 35,
+        "obs": 243
+      },
+      "wheat": {
+        "units": 7,
+        "admin": "native",
+        "adm_id_example": "PT11",
+        "year_min": 1986,
+        "year_max": 2020,
+        "n_years": 35,
+        "obs": 216
+      }
+    }
+  },
+  "RO": {
+    "country_code": "RO",
+    "shapefile": "cy-bench/polygons/RO/RO.shp",
+    "polygons": 42,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 19.76,
+      "lat_min": 43.12,
+      "lon_max": 30.2,
+      "lat_max": 48.76
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 966,
+    "crops": {
+      "maize": {
+        "units": 42,
+        "admin": "native",
+        "adm_id_example": "RO111",
+        "year_min": 1998,
+        "year_max": 2020,
+        "n_years": 23,
+        "obs": 946
+      },
+      "wheat": {
+        "units": 40,
+        "admin": "native",
+        "adm_id_example": "RO111",
+        "year_min": 1998,
+        "year_max": 2020,
+        "n_years": 23,
+        "obs": 455
+      }
+    }
+  },
+  "SE": {
+    "country_code": "SE",
+    "shapefile": "cy-bench/polygons/SE/SE.shp",
+    "polygons": 17,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 10.49,
+      "lat_min": 54.84,
+      "lon_max": 20.01,
+      "lat_max": 62.84
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 1216,
+    "crops": {
+      "maize": {
+        "units": 1,
+        "admin": "native",
+        "adm_id_example": "SE224",
+        "year_min": 2007,
+        "year_max": 2020,
+        "n_years": 10,
+        "obs": 10
+      },
+      "wheat": {
+        "units": 17,
+        "admin": "native",
+        "adm_id_example": "SE110",
+        "year_min": 2000,
+        "year_max": 2020,
+        "n_years": 21,
+        "obs": 327
+      }
+    }
+  },
+  "SK": {
+    "country_code": "SK",
+    "shapefile": "cy-bench/polygons/SK/SK.shp",
+    "polygons": 8,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 16.34,
+      "lat_min": 47.23,
+      "lon_max": 23.07,
+      "lat_max": 50.11
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 324,
+    "crops": {
+      "maize": {
+        "units": 8,
+        "admin": "native",
+        "adm_id_example": "SK010",
+        "year_min": 2007,
+        "year_max": 2018,
+        "n_years": 12,
+        "obs": 94
+      },
+      "wheat": {
+        "units": 6,
+        "admin": "native",
+        "adm_id_example": "SK010",
+        "year_min": 2017,
+        "year_max": 2018,
+        "n_years": 2,
+        "obs": 10
+      }
+    }
+  },
+  "SN": {
+    "country_code": "SN",
+    "shapefile": "cy-bench/polygons/SN/SN.shp",
+    "polygons": 41,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": -17.81,
+      "lat_min": 11.81,
+      "lon_max": -10.86,
+      "lat_max": 17.19
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 616,
+    "crops": {
+      "maize": {
+        "units": 41,
+        "admin": "A2",
+        "adm_id_example": "SN-A2-0103",
+        "year_min": 1960,
+        "year_max": 2015,
+        "n_years": 56,
+        "obs": 1440
+      }
+    }
+  },
+  "TD": {
+    "country_code": "TD",
+    "shapefile": "cy-bench/polygons/TD/TD.shp",
+    "polygons": 17,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 12.97,
+      "lat_min": 6.94,
+      "lon_max": 23.49,
+      "lat_max": 17.33
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 1764,
+    "crops": {
+      "maize": {
+        "units": 17,
+        "admin": "A1",
+        "adm_id_example": "TD-A1-0001",
+        "year_min": 1984,
+        "year_max": 2017,
+        "n_years": 31,
+        "obs": 425
+      }
+    }
+  },
+  "US": {
+    "country_code": "US",
+    "shapefile": "cy-bench/polygons/US/US.shp",
+    "polygons": 2720,
+    "crs_assumed": false,
+    "id_match_rate": 0.988,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": -124.98,
+      "lat_min": 25.34,
+      "lon_max": -71.36,
+      "lat_max": 49.88
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 20972,
+    "crops": {
+      "maize": {
+        "units": 2509,
+        "admin": "native",
+        "adm_id_example": "US-01-033",
+        "year_min": 1990,
+        "year_max": 2023,
+        "n_years": 34,
+        "obs": 61703
+      },
+      "wheat": {
+        "units": 2466,
+        "admin": "native",
+        "adm_id_example": "US-01-033",
+        "year_min": 1990,
+        "year_max": 2023,
+        "n_years": 34,
+        "obs": 49602
+      }
+    }
+  },
+  "ZA": {
+    "country_code": "ZA",
+    "shapefile": "cy-bench/polygons/ZA/ZA.shp",
+    "polygons": 9,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 15.96,
+      "lat_min": -47.48,
+      "lon_max": 38.5,
+      "lat_max": -21.63
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 9270,
+    "crops": {
+      "maize": {
+        "units": 9,
+        "admin": "A1",
+        "adm_id_example": "ZA-A1-0001",
+        "year_min": 1987,
+        "year_max": 2022,
+        "n_years": 36,
+        "obs": 316
+      }
+    }
+  },
+  "ZM": {
+    "country_code": "ZM",
+    "shapefile": "cy-bench/polygons/ZM/ZM.shp",
+    "polygons": 71,
+    "crs_assumed": false,
+    "id_match_rate": 1,
+    "id_join_ok": true,
+    "bbox": {
+      "lon_min": 21.5,
+      "lat_min": -18.58,
+      "lon_max": 34.21,
+      "lat_max": -7.75
+    },
+    "crosses_antimeridian": false,
+    "grid_cells": 2193,
+    "crops": {
+      "maize": {
+        "units": 71,
+        "admin": "A2",
+        "adm_id_example": "ZM-A2-0101",
+        "year_min": 1980,
+        "year_max": 2017,
+        "n_years": 34,
+        "obs": 2368
+      }
+    }
+  }
+}

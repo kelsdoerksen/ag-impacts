@@ -27,6 +27,7 @@ dependencies:
   - r-tidyr
   - r-arrow          # parquet output
   - r-ncdf4          # EC-Earth3 NetCDF reads in ML-sample-gen.R
+  - r-jsonlite       # reads R/cybench-aois.json, the AOI registry
   - r-codetools      # not in conda's r-base; without it terra emits ~30 lines of
                      # "not checked for suspicious field assignments" on every
                      # load, which buries the real output in a long run's log
