@@ -45,6 +45,8 @@ import secrets
 import numpy as np
 import pandas as pd
 
+from degree_days import capped_degree_days, degree_days_sine
+
 # Upper bound for drawn seeds: numpy's legacy seed API and sklearn's
 # random_state both cap at 2**32-1, and torch/transformers accept anything in
 # that range, so a 31-bit draw is safe everywhere the seed is threaded.
@@ -68,12 +70,18 @@ FEATURE_MODES   = ["aggregated", "timeseries", "agro"]
 # A deliberately small, physically-motivated feature set for isolating climate
 # skill, in place of the generic mean/std block of "aggregated" mode.
 #
-# Growing degree days use the standard corn formulation: base (lower threshold)
-# temperature 10 C subtracted from the mean daily air temperature, accumulated
-# and floored at zero. Extreme degree days accumulate heat above 30 C, the
-# threshold above which corn yield response turns sharply negative.
+# Growing and extreme degree days both use the single-sine method from
+# degree_days.py -- the day's heat integrated under a sine diurnal cycle between
+# tasmin and tasmax, not read off the daily mean. See that module for why the
+# distinction matters (it is the difference between counting and missing the
+# heat on every day the threshold falls inside the day's range).
+#
+# GDD is capped: heat between GDD_BASE_C and GDD_CAP_C counts toward growth,
+# heat above the cap does not and is charged to EDD instead. That is the
+# piecewise-linear corn response -- gains to ~30 C, losses above it.
 GDD_BASE_C          = 10.0   # corn lower base temperature
 EDD_THRESHOLD_C     = 30.0   # corn extreme-heat threshold
+GDD_CAP_C           = None   # upper bound on beneficial heat; None = EDD_THRESHOLD_C
 GDD_PRESEASON_DAYS  = 14     # GDD accumulation starts this many days pre-plant
 
 # Sub-seasonal features are binned into fixed-length blocks measured from the
@@ -1293,20 +1301,27 @@ def build_agro_features(
     gdd_base: float = GDD_BASE_C,
     edd_threshold: float = EDD_THRESHOLD_C,
     gdd_preseason_days: int = GDD_PRESEASON_DAYS,
+    gdd_cap: float | None = GDD_CAP_C,
 ) -> tuple[pd.DataFrame, list]:
     """Build the curated agronomic feature set, one row per (adm2_id, hindcast_start).
 
     Features (all computed inside the seasonal window the loader already applied,
     i.e. [plant_start − preseason_buffer, harvest_end + postharvest_buffer]):
 
-      Heat accumulation
-        gdd                 Growing degree days: sum of max(Tmean − gdd_base, 0)
-                            over [plant_start − gdd_preseason_days, window end].
-                            Tmean = (tasmax_C + tasmin_C) / 2; gdd_base is the
-                            corn lower threshold, 10 C.
-        edd                 Extreme degree days: sum of max(tasmax_C −
-                            edd_threshold, 0) over the full window — heat load
-                            above 30 C, not just its frequency.
+      Heat accumulation (single-sine; see degree_days.py)
+        gdd                 Growing degree days between gdd_base and gdd_cap,
+                            summed over [plant_start − gdd_preseason_days,
+                            window end]. Each day's value integrates the heat
+                            under a sine diurnal cycle running between tasmin_C
+                            and tasmax_C, so a day whose mean sits below the
+                            base still accumulates the hours that were above it.
+                            Heat beyond gdd_cap stops counting here and is
+                            charged to edd instead. Defaults: base 10 C (corn
+                            lower threshold), cap = edd_threshold.
+        edd                 Extreme degree days above edd_threshold, same
+                            single-sine integral — the heat load above 30 C,
+                            not just its frequency, and not zero merely because
+                            the daily mean happens to land on the threshold.
         days_over_{T}C      Count of days in the window with tasmax_C above the
                             threshold. Reported alongside edd because "number of
                             extreme degree days" is used for both quantities.
@@ -1355,10 +1370,21 @@ def build_agro_features(
     keys = ["adm2_id", "hindcast_start"]
 
     # ---- daily derived quantities ----
-    tmean = (df["tasmax_C"] + df["tasmin_C"]) / 2.0
-    df["_gdd_day"]  = (tmean - gdd_base).clip(lower=0)
-    df["_edd_day"]  = (df["tasmax_C"] - edd_threshold).clip(lower=0)
-    df["_hot_day"]  = (df["tasmax_C"] > edd_threshold).astype(float)
+    # Single-sine degree days, shared with era5_features.py so gdd and edd name
+    # the same quantity in both pipelines. NaN temperatures are carried through
+    # explicitly: numpy comparisons against NaN are False, which would otherwise
+    # turn a missing day into a zero-degree-day one and bias the season sum low.
+    cap    = edd_threshold if gdd_cap is None else gdd_cap
+    tmin_a = df["tasmin_C"].to_numpy(dtype="float64")
+    tmax_a = df["tasmax_C"].to_numpy(dtype="float64")
+    valid  = np.isfinite(tmin_a) & np.isfinite(tmax_a)
+
+    df["_gdd_day"] = np.where(
+        valid, capped_degree_days(tmin_a, tmax_a, gdd_base, cap), np.nan)
+    df["_edd_day"] = np.where(
+        valid, degree_days_sine(tmin_a, tmax_a, edd_threshold), np.nan)
+    df["_hot_day"] = (df["tasmax_C"] > edd_threshold).astype(float).where(
+        df["tasmax_C"].notna())
 
     # GDD accumulates only from gdd_preseason_days before the planting window
     # opens, so zero out the earlier part of the window rather than sub-setting
@@ -1540,6 +1566,7 @@ def load_and_prepare(
     gdd_base: float = GDD_BASE_C,
     edd_threshold: float = EDD_THRESHOLD_C,
     gdd_preseason_days: int = GDD_PRESEASON_DAYS,
+    gdd_cap: float | None = GDD_CAP_C,
 ) -> tuple[pd.DataFrame, list]:
     """Full pipeline: load → merge → window → featurise.
 
@@ -1567,9 +1594,10 @@ def load_and_prepare(
 
     feature_mode "agro" replaces the generic mean/std block with the curated
     agronomic set built by build_agro_features: corn growing degree days,
-    extreme degree days above edd_threshold, season mean tasmax/tasmin,
+    extreme degree days above edd_threshold (both single-sine, see
+    degree_days.py), season mean tasmax/tasmin,
     whole-window humidity statistics, and per-season-block precipitation and
-    humidity statistics. season_blocks / gdd_base / edd_threshold /
+    humidity statistics. season_blocks / gdd_base / edd_threshold / gdd_cap /
     gdd_preseason_days are forwarded to it.
     """
     climate_vars = resolve_climate_vars(climate_vars)
@@ -1599,6 +1627,7 @@ def load_and_prepare(
             gdd_base=gdd_base,
             edd_threshold=edd_threshold,
             gdd_preseason_days=gdd_preseason_days,
+            gdd_cap=gdd_cap,
         )
     else:
         adm2_df, feature_cols = build_timeseries_features(

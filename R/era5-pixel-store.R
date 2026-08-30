@@ -237,6 +237,19 @@ era5_build_grid <- function(cfg, aoi_tag, ref_rast, grid_dir, overwrite = FALSE)
   tot   <- tapply(weights$combined_weight, weights$adm2_id, sum, na.rm = TRUE)
   empty <- names(tot)[is.na(tot) | tot <= 0]
 
+  # An admin unit reaching past the edge of the ERA5 box silently gets only the
+  # pixels that fall inside it. The cy-bench bounding boxes are padded around the
+  # polygons that have yield data, which is not always the whole shapefile
+  # (Ethiopia ships 84 polygons but only 68 have maize), so a unit outside that
+  # subset can sit partly outside the grid. Not necessarily a problem -- usually
+  # it is a unit with no yield to model anyway -- but it should be said out loud
+  # rather than discovered as an oddly low weight sum later.
+  g <- ext(ref_rast)
+  clipped <- vapply(seq_len(nrow(region$sf)), function(i) {
+    e <- ext(region$vect[i])
+    xmin(e) < xmin(g) || xmax(e) > xmax(g) || ymin(e) < ymin(g) || ymax(e) > ymax(g)
+  }, logical(1))
+
   write_parquet(weights, w_path)
   write_parquet(cells,   c_path)
 
@@ -248,6 +261,7 @@ era5_build_grid <- function(cfg, aoi_tag, ref_rast, grid_dir, overwrite = FALSE)
     n_pairs        = nrow(weights),
     n_cells_used   = nrow(cells),
     units_no_crop  = length(empty),
+    units_clipped  = sum(clipped),
     vars           = unname(vapply(ERA5_VARS, function(v) ERA5_UNIT_CONV[[v]]$name, "")),
     var_units      = unname(vapply(ERA5_VARS, function(v) ERA5_UNIT_CONV[[v]]$unit, "")),
     cropland_raster = harv_tif,
@@ -266,11 +280,29 @@ era5_build_grid <- function(cfg, aoi_tag, ref_rast, grid_dir, overwrite = FALSE)
   cat("  distinct pixels:  ", nrow(cells), "of", ncell(ref_rast), "in the AOI grid\n")
   cat("  units with no cropland:", length(empty),
       if (length(empty)) sprintf("(e.g. %s)", paste(head(empty, 5), collapse = ", ")) else "", "\n")
+  if (any(clipped)) {
+    cat(sprintf("  ! %d unit(s) extend past the ERA5 box and are clipped to it: %s\n",
+                sum(clipped),
+                paste(head(as.character(region$sf$adm2_id[clipped]), 5), collapse = ", ")))
+    cat("    (the AOI bbox comes from cybench-aois.json; rebuild it with",
+        "tools/build-cybench-aois.R if these units matter)\n")
+  }
   man
 }
 
 
 # ===== PER-PIXEL DAILY CUBE =====
+
+# Is this a complete cube? Asked through ncdf4 rather than terra/GDAL, so it
+# answers the same way on a machine whose GDAL cannot read netCDF at all.
+era5_nc_is_complete <- function(path, varnames, ndays) {
+  if (!file.exists(path) || !requireNamespace("ncdf4", quietly = TRUE)) return(FALSE)
+  nc <- tryCatch(ncdf4::nc_open(path), error = function(e) NULL)
+  if (is.null(nc)) return(FALSE)
+  on.exit(ncdf4::nc_close(nc), add = TRUE)
+  all(varnames %in% names(nc$var)) &&
+    !is.null(nc$dim[["time"]]) && nc$dim[["time"]]$len == ndays
+}
 
 # One year of daily grids -> one NetCDF cube, in analysis units. The GeoTIFF
 # cache stays in era5.R's raw units (Kelvin, precip flux) because that is what
@@ -306,7 +338,29 @@ era5_write_pixel_year <- function(clim, year, aoi_tag, nc_dir, overwrite = FALSE
   # truncated .nc that looks complete to the skip check above. The .nc extension
   # is kept on the scratch name -- writeCDF picks its driver from it.
   part <- file.path(nc_dir, sprintf(".era5_pixel_%s_%d.part.nc", aoi_tag, year))
-  writeCDF(d, filename = part, overwrite = TRUE, compression = 6)
+
+  # terra::writeCDF() writes the file through ncdf4 and then re-opens it with
+  # sds() purely to build its return value. That read goes through GDAL, which
+  # needs a netCDF/HDF5 driver -- absent from some conda GDAL builds, where it
+  # reports the file it has just written as "not recognized as being in a
+  # supported file format". The write has already succeeded by then, so a
+  # failure here is about the reader, not the file. Verify with ncdf4 (the
+  # library that wrote it, and a hard dependency of writeCDF) rather than
+  # letting a missing GDAL plugin end an overnight run.
+  ok <- tryCatch({
+    writeCDF(d, filename = part, overwrite = TRUE, compression = 6)
+    TRUE
+  }, error = function(e) {
+    if (era5_nc_is_complete(part, names(layers), length(dates))) {
+      cat("(terra could not re-open the file it wrote -- GDAL here has no netCDF\n",
+          "   driver; verified with ncdf4 instead)\n", sep = "")
+      TRUE
+    } else {
+      stop("writeCDF failed for ", basename(out_nc), ": ", conditionMessage(e),
+           call. = FALSE)
+    }
+  })
+  stopifnot(isTRUE(ok))
   file.rename(part, out_nc)
 
   cat(sprintf("Wrote %s  (%d days x %d pixels x %d vars, %.1f MB)\n",

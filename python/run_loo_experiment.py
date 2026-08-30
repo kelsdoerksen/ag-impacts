@@ -192,6 +192,7 @@ def build_config_key(args, climate_vars, study_start, study_end):
             "season_blocks":      args.season_blocks,
             "gdd_base":           args.gdd_base,
             "edd_threshold":      args.edd_threshold,
+            "gdd_cap":            args.gdd_cap,
             "gdd_preseason_days": args.gdd_preseason_days,
         }
     if args.model_type == "tst":
@@ -624,6 +625,15 @@ def parse_args():
         "--edd_threshold", type=float, default=EDD_THRESHOLD_C,
         help="Temperature in C above which daily tasmax counts toward extreme "
              f"degree days. Default: {EDD_THRESHOLD_C}.",
+    )
+    agro.add_argument(
+        "--gdd_cap", type=float, default=None,
+        help="Upper bound in C on heat that counts toward growing degree days. "
+             "Heat above it stops accumulating in gdd and is charged to edd "
+             "instead, which is the piecewise-linear corn response rather than "
+             "an unbounded one that would credit a 40 C day as maximally good. "
+             "Default: --edd_threshold, so the two partition the day's heat "
+             "with no gap or overlap.",
     )
     agro.add_argument(
         "--gdd_preseason_days", type=int, default=GDD_PRESEASON_DAYS,
@@ -1340,8 +1350,9 @@ def main():
     print(f"Feature mode    : {args.feature_mode}")
     print(f"Target          : {args.target}")
     if args.feature_mode == "agro":
-        print(f"Agro features   : GDD base {args.gdd_base:g}C from "
-              f"{args.gdd_preseason_days}d pre-plant; EDD/hot-day threshold "
+        print(f"Agro features   : single-sine GDD {args.gdd_base:g}-"
+              f"{(args.gdd_cap if args.gdd_cap is not None else args.edd_threshold):g}C "
+              f"from {args.gdd_preseason_days}d pre-plant; EDD/hot-day threshold "
               f"{args.edd_threshold:g}C; {args.season_blocks} x "
               f"{SEASON_BLOCK_DAYS}d season blocks  (--climate_vars ignored)")
     else:
@@ -1450,6 +1461,7 @@ def main():
             gdd_base=args.gdd_base,
             edd_threshold=args.edd_threshold,
             gdd_preseason_days=args.gdd_preseason_days,
+            gdd_cap=args.gdd_cap,
         )
         county_meta = adm2_df[["adm2_id", "adm2", "adm1"]].drop_duplicates("adm2_id")
 
@@ -1581,6 +1593,7 @@ def main():
         "season_blocks":      args.season_blocks,
         "gdd_base":           args.gdd_base,
         "edd_threshold":      args.edd_threshold,
+        "gdd_cap":            args.gdd_cap,
         "gdd_preseason_days": args.gdd_preseason_days,
         "cv_scheme":          args.cv_scheme,
         "cell_lookup":        args.cell_lookup,

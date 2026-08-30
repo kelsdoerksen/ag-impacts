@@ -1,39 +1,6 @@
 #!/usr/bin/env python3
 """Per-pixel ERA5 features, then the cropland-weighted admin-2 aggregate.
 
-WHY THE ORDER MATTERS
-
-R/era5-sample-gen.R aggregates first: it writes the cropland-weighted admin-2
-mean of the raw daily variables, so anything computed from that parquet is a
-feature *of the admin-2 mean*. That is only correct for features linear in the
-inputs, and the interesting ones are not::
-
-    mean_i( max(0, T_i - Tbase) )  !=  max(0, mean_i(T_i) - Tbase)
-
-Averaging first clips the tails, so a unit holding both a cool and a hot pixel
-loses the heat the hot pixel actually accumulated. Degree days, extreme degree
-days, dry-day counts, VPD and every threshold feature are affected, which is why
-the causal crop literature computes the feature per pixel and only then takes
-the cropland-area-weighted mean. This script is stages 2 and 3 of that::
-
-    1. R/era5-pixel-store.R      daily grids -> per-pixel daily cube (NetCDF)
-                                             -> pixel/admin-2 weights (parquet)
-    2. this script --stage=features    cube -> per-pixel DAILY features
-    3. this script --stage=aggregate   features + weights -> admin-2 parquet
-
-Stage 2 stays per-pixel and daily. It does not collapse time, because the
-temporal window is an admin-2 property (a crop calendar's sowing and harvest
-dates differ by unit), so the season reduction belongs with the aggregation in
-stage 3.
-
-Examples::
-
-    python era5_features.py --aoi=ZM --years=1980-2017 --stage=both
-    python era5_features.py --aoi=ZM --years=1991 --stage=aggregate --reduce=season --crop=maize
-    python era5_features.py --list-features
-    python era5_features.py --aoi=ZM --years=1991 --features=gdd,edd --param gdd.tbase=8
-
-Needs: xarray, netCDF4, pandas, numpy, pyarrow.
 """
 
 from __future__ import annotations
@@ -50,16 +17,34 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-DEFAULT_ROOT = "/Users/kdoerkse/Documents/UCT/AgImpacts"
-# Fills the hindcast columns the EC-Earth3 parquets carry, so an ERA5 feature
-# table is a drop-in for anything already reading those. ERA5 is observed: no
-# initialisation year, no lead time.
-FORECAST_YEAR = 0
+# The single-sine degree-day kernel is shared with data_loader.py's "agro"
+# feature mode, so gdd/edd mean the same thing whichever pipeline produced them.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from degree_days import degree_days_sine  # noqa: E402
 
+DEFAULT_ROOT = "/Users/kdoerkse/Documents/UCT/AgImpacts"
+# Lead time in years: how far ahead of its initialisation a run is being used.
+# An initialised (hindcast) source is labelled by the November it started from,
+# so s{Y} at fy=1 is its first full season and targets harvest year Y+1; the
+# same file kind at fy=2 would be a year-older initialisation aimed at the same
+# harvest, i.e. a harder forecast.
+#
+# An observed product has no initialisation and no lead time, so it gets the
+# degenerate fy=0: the file for 1983 IS 1983. It carries the column purely so an
+# observed feature table drops into code already reading the hindcast schema.
+#
+# Which of the two a source is, is a property of the source rather than a choice
+# to make per run, so it is defaulted here instead of being a flag you have to
+# remember. --forecast-year still overrides (e.g. an fy2 DCPP arm).
+OBSERVED_SOURCES = {"ERA5", "ERA5-Land", "AgERA5", "MERRA2"}
+DEFAULT_FORECAST_YEAR = 0
+
+
+def default_forecast_year(source: str) -> int:
+    """0 for a reanalysis, 1 for an initialised forecast/hindcast run."""
+    return 0 if source in OBSERVED_SOURCES else 1
 
 # ============================== feature registry ==============================
-
-
 class Feature(NamedTuple):
     name: str
     deps: tuple[str, ...]
@@ -71,13 +56,11 @@ class Feature(NamedTuple):
 
 
 REGISTRY: dict[str, Feature] = {}
-
-
 def feature(name, deps, reduce, unit, doc, **defaults):
     """Register a per-pixel daily feature.
 
-    `reduce` is how the daily series collapses to one number per season in
-    stage 3 -- "sum" for anything accumulated (degree days, rainfall, day
+    `reduce` is how the daily series collapses to one number in athe aggregation
+     -- "sum" for anything accumulated (degree days, rainfall, day
     counts), "mean" for a state variable (VPD, mean temperature). Adding a
     feature is adding one function here; nothing else in the pipeline changes.
     """
@@ -87,35 +70,6 @@ def feature(name, deps, reduce, unit, doc, **defaults):
         return fn
 
     return wrap
-
-
-def degree_days_sine(tmin, tmax, threshold):
-    """Degree days above `threshold` for one day, single-sine method.
-
-    Integrates max(T - threshold, 0) over the day, taking the diurnal cycle to
-    be a sine wave running between tmin and tmax. This is the standard
-    construction in the crop-impacts literature (Schlenker & Roberts and
-    descendants) and is meaningfully different from the naive
-    max(mean(tmin, tmax) - threshold, 0) whenever the threshold falls inside the
-    day's range -- which for a heat threshold is exactly the case that matters.
-    """
-    tmin = np.asarray(tmin, dtype="float64")
-    tmax = np.asarray(tmax, dtype="float64")
-    mid = (tmax + tmin) / 2.0
-    amp = (tmax - tmin) / 2.0
-
-    with np.errstate(invalid="ignore", divide="ignore"):
-        ratio = np.clip((threshold - mid) / np.where(amp > 0, amp, np.nan), -1.0, 1.0)
-        theta = np.arcsin(ratio)
-        # Area of the sine above the threshold, for a threshold strictly inside
-        # the day's range.
-        partial = ((mid - threshold) * (np.pi / 2.0 - theta) + amp * np.cos(theta)) / np.pi
-
-    out = np.where(
-        threshold <= tmin, mid - threshold, np.where(threshold >= tmax, 0.0, partial)
-    )
-    # A day with no diurnal range degenerates to a point, not a sine.
-    return np.where(amp <= 0, np.maximum(mid - threshold, 0.0), out)
 
 
 def _dd(ds, threshold):
@@ -196,16 +150,20 @@ def _pr(ds):
     return ds["pr_mm"]
 
 
-@feature(
-    "dry_days",
-    deps=("pr_mm",),
-    reduce="sum",
-    unit="days",
-    threshold=1.0,
-    doc="Days with less than `threshold` mm of rain.",
-)
-def _dry_days(ds, threshold=1.0):
-    return (ds["pr_mm"] < threshold).astype("float32").where(ds["pr_mm"].notnull())
+# Parked until the threshold is settled: 1.0 mm is the WMO "wet day" convention
+# borrowed as-is, and it is not obvious that it is the right cut for maize water
+# stress in any particular AOI. Uncomment to register it again -- nothing else
+# needs changing, and --features dry_days errors as "unknown feature" until then.
+# @feature(
+#     "dry_days",
+#     deps=("pr_mm",),
+#     reduce="sum",
+#     unit="days",
+#     threshold=1.0,
+#     doc="Days with less than `threshold` mm of rain.",
+# )
+# def _dry_days(ds, threshold=1.0):
+#     return (ds["pr_mm"] < threshold).astype("float32").where(ds["pr_mm"].notnull())
 
 
 @feature(
@@ -220,30 +178,59 @@ def _hot_days(ds, threshold=35.0):
     return (ds["tasmax_C"] > threshold).astype("float32").where(ds["tasmax_C"].notnull())
 
 
-DEFAULT_FEATURES = ["gdd", "edd", "tavg", "vpd", "pr", "dry_days", "hot_days"]
+DEFAULT_FEATURES = ["gdd", "edd", "tavg", "vpd", "pr", "hot_days"]
 
 
 # ================================== paths ====================================
 
 
 class Layout:
-    """Where stage 1 put things, and where stages 2 and 3 put theirs."""
+    """Where stage 1 put things, and where stages 2 and 3 put theirs.
 
-    def __init__(self, aoi: str, root: str | None = None, out: str | None = None):
+    One tree per climate source, because the weight table is grid-specific: it
+    encodes cell ids and cropland fractions for one grid, and ERA5's 0.25 deg
+    weights are meaningless on the coarser EC-Earth3 grid. Keeping the sources
+    in sibling directories makes mixing them a missing-file error rather than a
+    silently wrong answer.
+    """
+
+    def __init__(self, aoi: str, root: str | None = None, out: str | None = None,
+                 source: str = "ERA5", forecast_year: int | None = None):
         self.aoi = aoi
+        self.source = source
+        self.forecast_year = (default_forecast_year(source)
+                              if forecast_year is None else forecast_year)
         self.root = Path(root or os.environ.get("AGIMPACTS_ROOT", DEFAULT_ROOT))
-        base = out or os.environ.get("ERA5_OUT_DIR")
-        self.out = Path(base) if base else self.root / f"{aoi}_processed_data" / "ERA5"
+        # ERA5_OUT_DIR is honoured only for ERA5 -- it names one product, and
+        # letting a hindcast run inherit it would drop EC-Earth3 cubes into the
+        # ERA5 tree next to a weight table built on the wrong grid.
+        base = out or (os.environ.get("ERA5_OUT_DIR") if source == "ERA5" else None)
+        self.out = Path(base) if base else self.root / f"{aoi}_processed_data" / source
         self.pixel_daily = self.out / "pixel_daily"
         self.grid = self.out / "grid"
         self.pixel_features = self.out / "pixel_features"
         self.admin2 = self.out / "features_admin2"
 
+    def _year_tag(self, year):
+        # s-prefixed for an initialised run, bare for an observed calendar year.
+        return f"s{year}" if self.forecast_year else f"{year}"
+
     def cube(self, year):
-        return self.pixel_daily / f"era5_pixel_{self.aoi}_{year}.nc"
+        if self.source == "ERA5":
+            # Spelled as R/era5-pixel-store.R writes it; renaming would orphan
+            # cubes already on disk for no gain.
+            return self.pixel_daily / f"era5_pixel_{self.aoi}_{year}.nc"
+        return self.pixel_daily / f"pixel_{self.source}_{self.aoi}_{self._year_tag(year)}.nc"
 
     def features(self, year):
-        return self.pixel_features / f"features_{self.aoi}_{year}.nc"
+        return self.pixel_features / f"features_{self.aoi}_{self._year_tag(year)}.nc"
+
+    @property
+    def stage1_hint(self):
+        """The stage-1 command that produces what a caller just found missing."""
+        if self.source == "ERA5":
+            return f"Rscript R/era5-pixel-store.R --aoi={self.aoi}"
+        return f"Rscript R/dcpp-pixel-store.R --aoi={self.aoi} --model={self.source}"
 
     @property
     def weights(self):
@@ -306,7 +293,7 @@ def stage_features(lay: Layout, years, names, params, overwrite=False):
         if not src.exists():
             raise SystemExit(
                 f"missing per-pixel cube: {src}\n"
-                f"Run: Rscript R/era5-pixel-store.R --aoi={lay.aoi} {year}"
+                f"Run: {lay.stage1_hint} {year}"
             )
         if dst.exists() and not overwrite:
             print(f"  {year}: features exist, skipping ({dst.name})")
@@ -337,7 +324,9 @@ def load_weights(lay: Layout, weighting: str) -> pd.DataFrame:
     if not lay.weights.exists():
         raise SystemExit(
             f"missing weight table: {lay.weights}\n"
-            f"Run: Rscript R/era5-pixel-store.R --aoi={lay.aoi} --grid-only <year>"
+            f"Run: {lay.stage1_hint} --grid-only <year>\n"
+            f"Weights are grid-specific -- a {lay.source} run needs its own, "
+            f"not the ones built for another source."
         )
     w = pd.read_parquet(lay.weights)
     col = WEIGHT_COLUMNS[weighting]
@@ -431,8 +420,8 @@ def aggregate_daily(lay: Layout, year, w, names) -> pd.DataFrame:
     df["doy"] = df["date"].dt.dayofyear
     df["year_month"] = df["date"].dt.strftime("%Y-%m")
     df["hindcast_start"] = year
-    df["forecast_year"] = FORECAST_YEAR
-    df["target_year"] = year
+    df["forecast_year"] = lay.forecast_year
+    df["target_year"] = year + lay.forecast_year
     lead = ["adm2_id", "adm2", "adm1", "hindcast_start", "forecast_year", "target_year",
             "date", "doy", "year_month"]
     return df[lead + names]
@@ -473,6 +462,59 @@ def season_windows(unit_ids, cal, year, fixed=None):
     return out
 
 
+def season_source_years(harvest_year: int, forecast_year: int) -> list[int]:
+    """Source (cube) years a harvest season is drawn from.
+
+    Observed (fy=0): the cubes are calendar years, so a season that crosses the
+    new year straddles two of them and both are read -- they are two slices of
+    one continuous reanalysis.
+
+    Hindcast (fy>=1): the s{Y} run spans Nov Y -> Oct Y+1 and so already holds
+    its target season end to end. Exactly ONE file is read. Reaching into
+    s{Y-1} for a few extra pre-season days would splice a different
+    initialisation's weather into the same feature row, which is not a lead time
+    the forecast ever had.
+    """
+    if forecast_year == 0:
+        return [harvest_year - 1, harvest_year]
+    return [harvest_year - forecast_year]
+
+
+def harvest_year_candidates(source_years, forecast_year: int) -> list[int]:
+    """Harvest years these source years could possibly speak to, covered or not.
+
+    At fy=0 a calendar year can serve its own harvest and (for a cross-year
+    calendar) the next one. At fy>=1 an initialisation speaks to exactly one
+    harvest year, so a source year is never itself a candidate.
+    """
+    have = set(source_years)
+    if forecast_year == 0:
+        return sorted(have | {y + 1 for y in have})
+    return sorted(y + forecast_year for y in have)
+
+
+def harvest_years_from_sources(source_years, forecast_year: int,
+                               crosses_new_year: bool) -> list[int]:
+    """Harvest years fully covered by the source years on hand.
+
+    `--years` always names SOURCE years -- calendar years for an observed
+    product, initialisation years for a hindcast -- because that is what stage 1
+    produced and what stage 2 consumes. Stage 3 derives the harvest years rather
+    than letting one flag mean two different things in two stages.
+    """
+    have = set(source_years)
+    candidates = harvest_year_candidates(source_years, forecast_year)
+    out = []
+    for y in candidates:
+        if forecast_year == 0 and not crosses_new_year:
+            need = {y}                      # a same-year season never reaches back
+        else:
+            need = set(season_source_years(y, forecast_year))
+        if need <= have:
+            out.append(y)
+    return out
+
+
 def aggregate_season(lay: Layout, year, w, names, cal, fixed=None) -> pd.DataFrame:
     """One row per (admin unit, harvest year), accumulated over its own window.
 
@@ -482,9 +524,12 @@ def aggregate_season(lay: Layout, year, w, names, cal, fixed=None) -> pd.DataFra
     them is free -- what is *not* free is that the feature itself was already
     computed per pixel, upstream of both.
     """
-    paths = [lay.features(y) for y in (year - 1, year) if lay.features(y).exists()]
+    wanted = season_source_years(year, lay.forecast_year)
+    paths = [lay.features(y) for y in wanted if lay.features(y).exists()]
     if not paths:
-        raise SystemExit(f"no per-pixel features for {year}; run --stage=features first")
+        raise SystemExit(
+            f"no per-pixel features for harvest year {year} "
+            f"(looked for source year(s) {wanted}); run --stage=features first")
     # Concatenated rather than open_mfdataset()'d: mfdataset pulls in dask, which
     # buys nothing here (each feature is loaded one at a time below) and is one
     # more thing that has to be installed on the lab machine.
@@ -499,7 +544,7 @@ def aggregate_season(lay: Layout, year, w, names, cal, fixed=None) -> pd.DataFra
         windows = season_windows(unit_ids, cal, year, fixed)
 
         wrapping = [u for u, (s, _) in windows.items() if s.year < year]
-        if wrapping and lay.features(year - 1) not in paths:
+        if wrapping and lay.forecast_year == 0 and lay.features(year - 1) not in paths:
             print(f"  ! {len(wrapping)} unit(s) have a season starting in {year - 1}, "
                   f"whose features are missing -- those rows will be truncated.")
 
@@ -529,8 +574,8 @@ def aggregate_season(lay: Layout, year, w, names, cal, fixed=None) -> pd.DataFra
     df["harvest_year"] = year
     df["season_start"] = [windows.get(u, (pd.NaT, pd.NaT))[0] for u in unit_ids]
     df["season_end"] = [windows.get(u, (pd.NaT, pd.NaT))[1] for u in unit_ids]
-    df["hindcast_start"] = year
-    df["forecast_year"] = FORECAST_YEAR
+    df["hindcast_start"] = year - lay.forecast_year
+    df["forecast_year"] = lay.forecast_year
     df["target_year"] = year
     lead = ["adm2_id", "adm2", "adm1", "harvest_year", "hindcast_start", "forecast_year",
             "target_year", "season_start", "season_end"]
@@ -546,6 +591,25 @@ def stage_aggregate(lay, years, names, reduce, weighting, crop, cy_country, seas
     fixed = tuple(float(x) for x in season.split(":")) if season else None
     cal = pd.DataFrame() if fixed else (
         load_crop_calendar(lay, crop, cy_country) if reduce == "season" else pd.DataFrame())
+
+    if reduce == "season":
+        # `years` arrived as SOURCE years; a season is keyed by its harvest year,
+        # and which harvest years those sources can cover depends on the lead
+        # time and on whether the crop calendar crosses the new year.
+        crosses = bool(fixed[0] > fixed[1]) if fixed else bool((cal["sos"] > cal["eos"]).any())
+        harvest_years = harvest_years_from_sources(years, lay.forecast_year, crosses)
+        if not harvest_years:
+            raise SystemExit(
+                f"source years {years[0]}-{years[-1]} cover no complete season at "
+                f"forecast year {lay.forecast_year}"
+                + (" (the calendar crosses the new year, so harvest year Y needs "
+                   "source years Y-1 and Y)" if crosses and not lay.forecast_year else ""))
+        dropped = [y for y in harvest_year_candidates(years, lay.forecast_year)
+                   if y not in harvest_years]
+        print(f"  harvest years {harvest_years[0]}-{harvest_years[-1]} "
+              f"({len(harvest_years)}) from source years {years[0]}-{years[-1]}"
+              + (f"; {len(dropped)} candidate year(s) lack a complete season" if dropped else ""))
+        years = harvest_years
 
     for year in years:
         if reduce == "daily":
@@ -591,7 +655,23 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--aoi", help="AOI tag, matching R/era5-pixel-store.R (e.g. ZM, CONUS)")
-    p.add_argument("--years", help="1980-2017, or 1991,1995")
+    p.add_argument("--source", default="ERA5",
+                   help="climate source: the stage-1 tree to read and the folder "
+                        "under {AOI}_processed_data. ERA5 (default) or a hindcast "
+                        "model such as EC-Earth3. Each source has its own weight "
+                        "table, since those are built on that source's grid.")
+    p.add_argument("--forecast-year", type=int, default=None,
+                   help="Lead time in years -- how far ahead of its initialisation "
+                        "a run is used. Defaults from --source and rarely needs "
+                        "setting: 0 for a reanalysis (the file for 1983 IS 1983), "
+                        "1 for an initialised run (s1982, started Nov 1982, is the "
+                        "first full season ahead and targets harvest 1983). Pass 2 "
+                        "for a longer-lead DCPP arm: s1981 aimed at the same 1983 "
+                        "harvest.")
+    p.add_argument("--years", help="SOURCE years -- calendar years when "
+                        "--forecast-year=0, initialisation (s) years otherwise. "
+                        "1980-2017, or 1991,1995. With --reduce=season the "
+                        "harvest years covered are derived from these.")
     p.add_argument("--stage", choices=["features", "aggregate", "both"], default="both")
     p.add_argument("--features", default=",".join(DEFAULT_FEATURES),
                    help="comma-separated; see --list-features")
@@ -624,13 +704,19 @@ def main(argv=None):
     if unknown:
         p.error(f"unknown feature(s): {unknown}. See --list-features")
 
-    lay = Layout(a.aoi, a.root, a.out)
+    lay = Layout(a.aoi, a.root, a.out, source=a.source,
+                 forecast_year=a.forecast_year)
     years = parse_years(a.years)
     params = parse_params(a.param)
     cy_country = a.cy_country or ("US" if a.aoi == "CONUS" else a.aoi)
 
-    print(f"ERA5 features - AOI {a.aoi}, years {years[0]}-{years[-1]}, "
-          f"features: {','.join(names)}")
+    fy = lay.forecast_year
+    reading = ("observed calendar years; the file for a year IS that year"
+               if fy == 0 else
+               f"initialisation years; s{{Y}} targets harvest year Y+{fy}")
+    print(f"{a.source} features - AOI {a.aoi}, features: {','.join(names)}")
+    print(f"  forecast year {fy} ({reading})")
+    print(f"  --years {years[0]}-{years[-1]} read as {reading.split(';')[0]}")
     print(f"  out: {lay.out}")
 
     if a.stage in ("features", "both"):
