@@ -177,7 +177,13 @@ def score(y_true, y_pred, clim=None):
     )
     if clim is not None:
         a_true, a_pred = y_true - clim, y_pred - clim
-        ss = float(np.sum((a_true - a_true.mean()) ** 2))
+        # Uncentred: the null this is scored against is climatology itself, i.e.
+        # a predicted anomaly of zero. Centring by the sample mean would score
+        # against an oracle that already knew the mean anomaly of the pooled
+        # sample, and a model reproducing climatology exactly would come out
+        # negative instead of zero. Matches _baseline_scores in
+        # run_loo_experiment.py.
+        ss = float(np.sum(a_true ** 2))
         out["r2_anomaly"] = float(1 - np.sum((a_pred - a_true) ** 2) / ss) if ss > 0 else np.nan
         out["corr_anomaly"] = (float(np.corrcoef(a_true, a_pred)[0, 1])
                                if a_pred.std() > 0 else np.nan)

@@ -1685,9 +1685,22 @@ def load_pixel_season_features(
 
     crop_file = os.path.join(data_dir, f"crop_{crop}_{aoi}.parquet")
     if not os.path.exists(crop_file):
+        # This mode reads two directories -- the climate store (resolved above,
+        # possibly via --pixel_features_dir) and --data_dir for the yield table.
+        # Pointing both at the climate store is the easy mistake, and the bare
+        # "not found" gives no hint that they are different things.
+        hint = ""
+        if os.path.abspath(os.path.dirname(paths[0])).startswith(
+                os.path.abspath(data_dir)):
+            hint = (f"\n--data_dir is the AOI processed-data directory holding the "
+                    f"cy-bench yield table, NOT the climate store. It looks like "
+                    f"both are pointing at the same place; pass the climate store "
+                    f"as --pixel_features_dir instead.")
         raise FileNotFoundError(
             f"Crop parquet not found: {crop_file!r}\n"
             f"Available crops for AOI {aoi!r}: {available_crops(data_dir, aoi)}"
+            f"{hint}\n"
+            f"Build it with: Rscript R/crop-data-gen-cybench.R {aoi}"
         )
     crop_df = _read_parquet(crop_file)
     # Same order as the daily path: drop structural zeros on the RAW yield,

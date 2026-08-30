@@ -723,7 +723,18 @@ def _baseline_scores(baseline, te_ids, y_true, y_pred, standardize, te_years=Non
 
     a_true = baseline.transform(te_ids, y_true, standardize, years=te_years)
     a_pred = baseline.transform(te_ids, y_pred, standardize, years=te_years)
-    ss_tot = float(np.sum((a_true - a_true.mean()) ** 2))
+    # Uncentred on purpose. The reference this R2 is measured against is the
+    # county baseline itself, i.e. a predicted anomaly of zero -- that is what
+    # "beat 'predict this county's normal yield'" means, and it is the same null
+    # skill_vs_climatology_pct uses.
+    #
+    # Centring a_true by the fold's own mean would instead measure skill against
+    # an oracle that already knew that year's NATIONAL anomaly, since the fold is
+    # one year. Where a common year effect is large -- 25% of within-district
+    # yield variance for Zambian maize -- the two differ enormously and always in
+    # the same direction: a model that reproduces county climatology exactly,
+    # and so should score 0.000, scored -0.518 under the centred denominator.
+    ss_tot = float(np.sum(a_true ** 2))
     return {
         "baseline_detrended": bool(baseline.detrend),
         "baseline_counties_flat_fallback": int(baseline.n_flat),
@@ -968,7 +979,11 @@ def run_fold(adm2_df, feature_cols, all_years, fold_col, fold_value, fold_label,
                                    years=tr_years)
 
     model = YieldModel(model_type, random_state=seed)
-    model.fit(X_tr, y_fit)
+    # Training years as CV groups: the linear models choose their penalty by
+    # cross-validation, and holding out one ROW would leave ~70 same-year
+    # near-duplicates of it behind, making every penalty look better than it is.
+    # Holding out whole years matches the outer LOO and picks an honest alpha.
+    model.fit(X_tr, y_fit, groups=tr_years)
     y_pred = model.predict(X_te)
     if args_ns.target in ANOMALY_TARGETS:
         y_pred = baseline.inverse(te_ids, y_pred, standardize, years=te_years)
