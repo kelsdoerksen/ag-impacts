@@ -22,7 +22,7 @@ import xarray as xr
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from degree_days import degree_days_sine  # noqa: E402
 
-DEFAULT_ROOT = "/Users/kdoerkse/Documents/UCT/AgImpacts"
+DEFAULT_ROOT = "/Users/kdoerkse/Documents/UCT/AgImpacts" # This is local, need to update this to lab/set via export in lab PC
 # Lead time in years: how far ahead of its initialisation a run is being used.
 # An initialised (hindcast) source is labelled by the November it started from,
 # so s{Y} at fy=1 is its first full season and targets harvest year Y+1; the
@@ -59,7 +59,7 @@ REGISTRY: dict[str, Feature] = {}
 def feature(name, deps, reduce, unit, doc, **defaults):
     """Register a per-pixel daily feature.
 
-    `reduce` is how the daily series collapses to one number in athe aggregation
+    `reduce` is how the daily series collapses to one number in the aggregation
      -- "sum" for anything accumulated (degree days, rainfall, day
     counts), "mean" for a state variable (VPD, mean temperature). Adding a
     feature is adding one function here; nothing else in the pipeline changes.
@@ -86,7 +86,7 @@ def _dd(ds, threshold):
     tbase=10.0,
     tcap=30.0,
     doc="""
-    Growing degree days between tbase and tcap, single-sine. Computed as the
+    Growing degree days between tbase and tcap, single-sine method. Computed as the
     degree days above tbase minus those above tcap, so heat beyond tcap stops
     counting rather than being clipped at the daily mean.
     """,
@@ -102,7 +102,7 @@ def _gdd(ds, tbase=10.0, tcap=30.0):
     unit="degC-day",
     tcrit=30.0,
     doc="""
-    Extreme (killing) degree days above tcrit, single-sine. The damage term
+    Extreme degree days above tcrit, single-sine. The damage term
     paired with gdd in the piecewise-linear yield response; tcrit=29-30 for
     maize, ~32-34 for other crops.
     """,
@@ -129,9 +129,7 @@ def _tavg(ds):
     unit="kPa",
     doc="""
     Daily maximum vapour pressure deficit, from saturation vapour pressure at
-    tasmax (Tetens) and the daily minimum relative humidity. Pairing the day's
-    hottest, driest moments is deliberate -- it is the peak atmospheric demand,
-    not the daily average, that drives stomatal closure.
+    tasmax (Tetens) and the daily minimum relative humidity.
     """,
 )
 def _vpd(ds):
@@ -150,10 +148,9 @@ def _pr(ds):
     return ds["pr_mm"]
 
 
-# Parked until the threshold is settled: 1.0 mm is the WMO "wet day" convention
+# Comment out dry days feature until the threshold is decided: 1.0 mm is the WMO "wet day" convention
 # borrowed as-is, and it is not obvious that it is the right cut for maize water
-# stress in any particular AOI. Uncomment to register it again -- nothing else
-# needs changing, and --features dry_days errors as "unknown feature" until then.
+# stress in any particular AOI. Uncomment to register it again
 # @feature(
 #     "dry_days",
 #     deps=("pr_mm",),
@@ -342,24 +339,67 @@ def load_weights(lay: Layout, weighting: str) -> pd.DataFrame:
     return w
 
 
-def check_grid(ds: xr.Dataset, lay: Layout):
-    """The weights join by grid position, so a shape mismatch is a wrong answer."""
-    if not lay.manifest.exists():
+def check_grid(ds: xr.Dataset, lay: Layout, w: pd.DataFrame | None = None):
+    """The weights join by grid POSITION, so a mismatch is a silently wrong answer.
+
+    Shape is the cheap half. The dangerous half is orientation: the weight table
+    holds terra's 1-based row/col with row 1 = northernmost, and pair_values
+    indexes the cube with them directly. If the cube's latitude axis were ever
+    written ascending instead of descending, every row index would address the
+    mirror-image pixel -- same shape, same value range, plausible-looking output,
+    entirely wrong pixel-to-unit assignment. Nothing downstream could detect it.
+
+    The weight table also stores each pixel's lon/lat, so the check is exact
+    rather than a convention we hope both sides kept: index the cube's coordinate
+    axes the way pair_values will and confirm the coordinates that come back are
+    the ones the weights were built from.
+    """
+    if lay.manifest.exists():
+        g = json.loads(lay.manifest.read_text())["grid"]
+        got = (ds.sizes.get("latitude"), ds.sizes.get("longitude"))
+        if got != (g["nrow"], g["ncol"]):
+            raise SystemExit(
+                f"grid mismatch: cube is {got[0]}x{got[1]}, weights were built on "
+                f"{g['nrow']}x{g['ncol']}. Rebuild with "
+                f"'Rscript R/era5-pixel-store.R --aoi={lay.aoi} --grid-only --overwrite <year>'."
+            )
+
+    if w is None or not {"lat", "lon"} <= set(w.columns):
         return
-    g = json.loads(lay.manifest.read_text())["grid"]
-    got = (ds.sizes.get("latitude"), ds.sizes.get("longitude"))
-    if got != (g["nrow"], g["ncol"]):
+    lat = np.asarray(ds["latitude"].values, dtype="float64")
+    lon = np.asarray(ds["longitude"].values, dtype="float64")
+    rows = w["row"].to_numpy() - 1
+    cols = w["col"].to_numpy() - 1
+    if rows.max() >= lat.size or cols.max() >= lon.size:
         raise SystemExit(
-            f"grid mismatch: cube is {got[0]}x{got[1]}, weights were built on "
-            f"{g['nrow']}x{g['ncol']}. Rebuild with "
-            f"'Rscript R/era5-pixel-store.R --aoi={lay.aoi} --grid-only --overwrite <year>'."
+            f"weight table indexes row {rows.max() + 1}/col {cols.max() + 1}, "
+            f"outside the cube's {lat.size}x{lon.size} grid.")
+    # Half a cell: comfortably inside a 0.25 deg grid step, but far tighter than
+    # the whole-grid span a flip would move a pixel by.
+    tol_lat = abs(np.diff(lat)).min() / 2 if lat.size > 1 else 1e-6
+    tol_lon = abs(np.diff(lon)).min() / 2 if lon.size > 1 else 1e-6
+    d_lat = np.abs(lat[rows] - w["lat"].to_numpy())
+    d_lon = np.abs(lon[cols] - w["lon"].to_numpy())
+    if d_lat.max() > tol_lat or d_lon.max() > tol_lon:
+        flipped = np.abs(lat[::-1][rows] - w["lat"].to_numpy()).max() <= tol_lat
+        raise SystemExit(
+            f"grid orientation mismatch: cube latitude is "
+            f"{'ascending' if lat[0] < lat[-1] else 'descending'} "
+            f"({lat[0]:.3f} -> {lat[-1]:.3f}), but the weight table's row indices "
+            f"land up to {d_lat.max():.3f} deg lat / {d_lon.max():.3f} deg lon away "
+            f"from the pixels they name."
+            + ("\nThe latitude axis appears REVERSED relative to the weights -- the "
+               "cube was written ascending where the weight table assumes row 1 = "
+               "northernmost." if flipped else "")
+            + f"\nRebuild the weights on this cube's grid: "
+              f"'Rscript R/era5-pixel-store.R --aoi={lay.aoi} --grid-only --overwrite <year>'."
         )
 
 
 def pair_values(da: xr.DataArray, w: pd.DataFrame) -> np.ndarray:
     """(n_pairs, n_time): the feature at each (admin unit, pixel) pair.
 
-    A pixel straddling two units appears once per unit, which is the point --
+    A pixel straddling two units appears once per unit,
     each unit weights it by its own share of that pixel.
     """
     arr = da.transpose("time", "latitude", "longitude").values
@@ -377,7 +417,7 @@ def weighted_mean_by_unit(vals: np.ndarray, wt: np.ndarray, starts: np.ndarray) 
 
     NaN pixels drop out of both numerator and denominator, so a unit with
     partial coverage is still averaged over what it does have rather than
-    poisoned to NaN.
+    NaN
     """
     wcol = wt[:, None]
     valid = ~np.isnan(vals)
@@ -395,11 +435,11 @@ def aggregate_daily(lay: Layout, year, w, names) -> pd.DataFrame:
     """One row per (admin unit, day): the weighted mean of each daily feature.
 
     Same shape as the existing climate parquets, so this drops straight into
-    anything already consuming those -- but the values are features computed per
-    pixel first, which is the whole point of the rework.
+    anything already consuming those. Values are features computed per
+    pixel first
     """
     with open_nc(lay.features(year)) as ds:
-        check_grid(ds, lay)
+        check_grid(ds, lay, w)
         starts, unit_ids = group_starts(w)
         wt = w["w"].to_numpy()
         dates = pd.to_datetime(ds["time"].values)
@@ -430,10 +470,8 @@ def aggregate_daily(lay: Layout, year, w, names) -> pd.DataFrame:
 def load_crop_calendar(lay: Layout, crop: str, cy_country: str) -> pd.DataFrame:
     """cy-bench sowing/harvest day-of-year, one row per admin unit.
 
-    sos > eos means the season crosses new year (Zambian maize is sown around
-    doy 327 and harvested around doy 135), so the window for harvest year Y
-    starts in Y-1. Handled explicitly below rather than silently producing an
-    empty window.
+    sos > eos means the season crosses new year, so the window for harvest year Y
+    starts in Y-1.
     """
     path = (lay.root / "cy-bench" / "cybench-data" / crop / cy_country
             / f"crop_calendar_{crop}_{cy_country}.csv")
@@ -453,6 +491,12 @@ def season_windows(unit_ids, cal, year, fixed=None):
         elif uid in cal.index:
             sos, eos = float(cal.at[uid, "sos"]), float(cal.at[uid, "eos"])
         else:
+            continue
+        # cy-bench ships a calendar row per unit but not always a filled one;
+        # int(round(nan)) raises, which would take down the whole year for one
+        # bad unit. Skipping matches the "not in cal.index" branch above: the
+        # unit gets no window and drops out with a NaN row.
+        if not (np.isfinite(sos) and np.isfinite(eos)):
             continue
         sos_i, eos_i = int(round(sos)), int(round(eos))
         start_year = year - 1 if sos_i > eos_i else year
@@ -515,6 +559,32 @@ def harvest_years_from_sources(source_years, forecast_year: int,
     return out
 
 
+def season_reduce(block: np.ndarray, how: str) -> np.ndarray:
+    """Collapse each pixel's season window along time, NaN if it is not covered.
+
+    np.nansum is the wrong tool here and quietly so: over an all-NaN slice it
+    returns 0.0, not NaN. A masked pixel would therefore contribute a season
+    total of "no degree days, no rain" to its unit's weighted mean, pulling the
+    unit's value down in exact proportion to that pixel's weight, with nothing
+    NaN anywhere to reveal it. A partially covered window is the same error in
+    smaller print: the sum of 135 of a season's 174 days is not the season
+    total, it is a number that looks like one.
+
+    So an accumulated feature requires EVERY day of its window. ERA5 has no
+    missing days, so a gap means a masked pixel or a window running off the end
+    of the loaded cubes -- both of which should surface as NaN and be dropped,
+    not be averaged in. State variables (means) only need one valid day, since
+    a mean over what is there is still a mean.
+    """
+    valid = ~np.isnan(block)
+    n_valid = valid.sum(axis=1)
+    if how == "sum":
+        return np.where(n_valid == block.shape[1], np.nansum(block, axis=1), np.nan)
+    with np.errstate(invalid="ignore"):
+        totals = np.nansum(block, axis=1)
+    return np.where(n_valid > 0, totals / np.maximum(n_valid, 1), np.nan)
+
+
 def aggregate_season(lay: Layout, year, w, names, cal, fixed=None) -> pd.DataFrame:
     """One row per (admin unit, harvest year), accumulated over its own window.
 
@@ -524,29 +594,50 @@ def aggregate_season(lay: Layout, year, w, names, cal, fixed=None) -> pd.DataFra
     them is free -- what is *not* free is that the feature itself was already
     computed per pixel, upstream of both.
     """
+    starts, unit_ids = group_starts(w)
+    bounds = np.r_[starts, len(w)]
+    wt = w["w"].to_numpy()
+    windows = season_windows(unit_ids, cal, year, fixed)
+    if not windows:
+        raise SystemExit(
+            f"no unit has a usable season window for harvest year {year} -- "
+            f"check the crop calendar covers these adm2_ids.")
+
+    # Which source years the windows actually reach into. At fy=0 a cross-year
+    # calendar needs year-1 as well, but a same-year one does not, and loading a
+    # cube nothing will read doubles the working set for nothing.
     wanted = season_source_years(year, lay.forecast_year)
-    paths = [lay.features(y) for y in wanted if lay.features(y).exists()]
-    if not paths:
+    if lay.forecast_year == 0 and min(s for s, _ in windows.values()).year >= year:
+        wanted = [year]
+    have = [y for y in wanted if lay.features(y).exists()]
+    if not have:
         raise SystemExit(
             f"no per-pixel features for harvest year {year} "
             f"(looked for source year(s) {wanted}); run --stage=features first")
+
     # Concatenated rather than open_mfdataset()'d: mfdataset pulls in dask, which
     # buys nothing here (each feature is loaded one at a time below) and is one
     # more thing that has to be installed on the lab machine.
     with contextlib.ExitStack() as stack:
-        dsets = [stack.enter_context(open_nc(pth)) for pth in paths]
+        dsets = [stack.enter_context(open_nc(lay.features(y))) for y in have]
         ds = xr.concat(dsets, dim="time", data_vars="all", combine_attrs="override") if len(dsets) > 1 else dsets[0]
-        check_grid(ds, lay)
+        check_grid(ds, lay, w)
         times = pd.to_datetime(ds["time"].values)
-        starts, unit_ids = group_starts(w)
-        bounds = np.r_[starts, len(w)]
-        wt = w["w"].to_numpy()
-        windows = season_windows(unit_ids, cal, year, fixed)
 
-        wrapping = [u for u, (s, _) in windows.items() if s.year < year]
-        if wrapping and lay.forecast_year == 0 and lay.features(year - 1) not in paths:
-            print(f"  ! {len(wrapping)} unit(s) have a season starting in {year - 1}, "
-                  f"whose features are missing -- those rows will be truncated.")
+        # A window running off the end of what is loaded used to be warned about
+        # and then silently truncated into a smaller-but-plausible season total.
+        # season_reduce now returns NaN for those rows instead, so the warning
+        # says what actually happens to them.
+        missing = [y for y in wanted if y not in have]
+        covered = (times.min(), times.max())
+        short = [u for u, (s, e) in windows.items() if s < covered[0] or e > covered[1]]
+        if short:
+            raise SystemExit(
+                f"harvest year {year}: {len(short)} unit(s) have a season window "
+                f"outside the loaded days ({covered[0].date()} to {covered[1].date()}); "
+                f"source year(s) {missing} are missing.\n"
+                f"Run --stage=features for {missing or wanted} first, or drop {year} "
+                f"from --years.")
 
         results = {name: np.full(len(unit_ids), np.nan) for name in names}
         for name in names:
@@ -561,7 +652,7 @@ def aggregate_season(lay: Layout, year, w, names, cal, fixed=None) -> pd.DataFra
                     continue
                 block = vals[bounds[gi]:bounds[gi + 1], sel]
                 # Per pixel first: collapse this unit's window along time...
-                per_pixel = (np.nansum if spec.reduce == "sum" else np.nanmean)(block, axis=1)
+                per_pixel = season_reduce(block, spec.reduce)
                 # ...then weight those per-pixel season values by cropland area.
                 pw = wt[bounds[gi]:bounds[gi + 1]]
                 ok = ~np.isnan(per_pixel) & (pw > 0)

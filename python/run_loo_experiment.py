@@ -369,8 +369,25 @@ def parse_args():
             "extreme degree days, season mean tasmax/tasmin, whole-window "
             "humidity stats, and per-season-block precipitation/humidity stats. "
             "Ignores --climate_vars (its variable list is fixed). "
+            "'pixel': read the season features era5_features.py --reduce=season "
+            "already built, which computed each feature PER PIXEL and only then "
+            "took the cropland-weighted admin-2 mean. The three modes above all "
+            "average the climate over the unit first, which is wrong for GDD, "
+            "EDD, VPD and every other threshold feature. Reads "
+            "{data_dir}/{climate_model}/features_admin2/ and ignores every "
+            "feature-building flag (--climate_vars, the agro group, the "
+            "buffers) -- the feature set is fixed when stage 3 runs. "
             "Default: aggregated."
         ),
+    )
+    parser.add_argument(
+        "--pixel_features_dir", type=str, default=None,
+        help="Where --feature_mode pixel looks for the stage-3 season parquets. "
+             "Either the ERA5/DCPP store root or its features_admin2 subdir; "
+             "both are accepted. Only needed when the store lives outside "
+             "{data_dir}/{climate_model}/ — e.g. a lab machine keeping ERA5 on "
+             "a separate disk. ERA5_OUT_DIR is also honoured, matching "
+             "era5_features.py. Default: {data_dir}/{climate_model}/features_admin2.",
     )
     parser.add_argument(
         "--preseason_buffer", type=int, default=60,
@@ -1462,6 +1479,7 @@ def main():
             edd_threshold=args.edd_threshold,
             gdd_preseason_days=args.gdd_preseason_days,
             gdd_cap=args.gdd_cap,
+            pixel_features_dir=args.pixel_features_dir,
         )
         county_meta = adm2_df[["adm2_id", "adm2", "adm1"]].drop_duplicates("adm2_id")
 

@@ -64,7 +64,7 @@ def draw_seed() -> int:
     return secrets.randbelow(SEED_MAX) + 1
 
 WEATHER_VARS    = ["tasmax_C", "tasmin_C", "hursmin", "pr_mm"]
-FEATURE_MODES   = ["aggregated", "timeseries", "agro"]
+FEATURE_MODES   = ["aggregated", "timeseries", "agro", "pixel"]
 
 # ── agronomic ("agro") feature mode ──────────────────────────────────────────
 # A deliberately small, physically-motivated feature set for isolating climate
@@ -1542,6 +1542,192 @@ def build_timeseries_features(
 # Main entry point
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Pixel-first season features (feature_mode "pixel")
+# ---------------------------------------------------------------------------
+#
+# Everything above computes features from admin-2 DAILY means: the climate is
+# averaged over the unit first, and GDD/EDD/VPD are taken of that average. That
+# ordering is wrong for any feature nonlinear in its inputs, because
+#   mean(max(0, T - Tbase))  !=  max(0, mean(T) - Tbase)
+# and averaging first flattens exactly the tails those features exist to
+# measure. R/era5-pixel-store.R + python/era5_features.py fix the ordering by
+# computing each feature per pixel and only then taking the cropland-weighted
+# mean over the unit. Their stage-3 output is already one row per
+# (unit, harvest year) with the features as columns -- a finished design matrix
+# -- so this path does no featurising at all. It reads that table, attaches the
+# yield target and hands the result to the same fold machinery every other
+# feature mode uses.
+
+# cy-bench spells maize; --crop and the crop parquets use the US name. Stage 3
+# tags its filenames with whatever era5_features.py --crop was given, which is
+# the cy-bench spelling.
+CY_CROP_NAMES = {"corn": "maize"}
+
+# Written by aggregate_season() in era5_features.py; everything else in the
+# table is a feature.
+_SEASON_META_COLS = (
+    "adm2_id", "adm2", "adm1", "harvest_year", "hindcast_start",
+    "forecast_year", "target_year", "season_start", "season_end",
+)
+
+
+def pixel_features_dirs(data_dir: str, climate_model: str,
+                        features_dir: str | None = None) -> list:
+    """Candidate stage-3 output directories, in resolution order.
+
+    The default tree is {data_dir}/{climate_model}/features_admin2, matching
+    Layout in era5_features.py. But that Layout also honours its own --out and
+    the ERA5_OUT_DIR environment variable (for ERA5 only), which is how a store
+    kept outside the AOI tree gets built -- so look there too rather than
+    reporting a missing file the user can plainly see on disk.
+    """
+    cands = []
+    if features_dir:
+        # An explicit path may name either the store root or features_admin2
+        # itself; accept both so --pixel_features_dir is hard to get wrong.
+        cands += [features_dir, os.path.join(features_dir, "features_admin2")]
+    env = os.environ.get("ERA5_OUT_DIR") if climate_model == "ERA5" else None
+    if env:
+        cands.append(os.path.join(env, "features_admin2"))
+    cands.append(os.path.join(data_dir, climate_model, "features_admin2"))
+    seen, out = set(), []
+    for c in cands:
+        c = os.path.abspath(c)
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def pixel_features_dir(data_dir: str, climate_model: str,
+                       features_dir: str | None = None) -> str:
+    """First candidate stage-3 directory that exists, else the default."""
+    cands = pixel_features_dirs(data_dir, climate_model, features_dir)
+    for c in cands:
+        if os.path.isdir(c):
+            return c
+    return cands[-1]
+
+
+def find_season_feature_files(data_dir: str, climate_model: str, aoi: str,
+                              crop: str, features_dir: str | None = None
+                              ) -> tuple[list, str | None]:
+    """Stage-3 season parquets for this AOI/crop.
+
+    Tries the crop tag under both spellings, then "fixed" for a run that used
+    era5_features.py --season SOS:EOS instead of a crop calendar.
+    """
+    tags = [crop]
+    if crop in CY_CROP_NAMES:
+        tags.append(CY_CROP_NAMES[crop])
+    tags.append("fixed")
+    for fdir in pixel_features_dirs(data_dir, climate_model, features_dir):
+        for tag in tags:
+            paths = sorted(glob.glob(
+                os.path.join(fdir, f"features_{aoi}_{tag}_season_*.parquet")))
+            if paths:
+                return paths, tag
+    return [], None
+
+
+def load_pixel_season_features(
+    crop: str,
+    data_dir: str,
+    aoi: str,
+    climate_model: str,
+    forecast_year: int,
+    target: str,
+    hindcast_years: list | None = None,
+    features_dir: str | None = None,
+) -> tuple[pd.DataFrame, list]:
+    """Read stage-3 season features and join the yield target onto them.
+
+    Returns (adm2_df, feature_cols) in the same shape as the other feature
+    modes: one row per (adm2_id, hindcast_start) carrying adm2_id, adm2, adm1,
+    hindcast_start, target_year, yield and the feature columns.
+    """
+    paths, tag = find_season_feature_files(
+        data_dir, climate_model, aoi, crop, features_dir)
+    if not paths:
+        looked = pixel_features_dirs(data_dir, climate_model, features_dir)
+        raise FileNotFoundError(
+            f"No pixel-first season features for AOI {aoi!r}, crop {crop!r}.\n"
+            f"Looked in:\n" + "".join(f"  {d}\n" for d in looked) +
+            f"Point --pixel_features_dir (or ERA5_OUT_DIR) at the store, or "
+            f"build it with:\n"
+            f"  Rscript R/era5-pixel-store.R --aoi={aoi} <years>\n"
+            f"  python python/era5_features.py --aoi={aoi} --source={climate_model} "
+            f"--years=<years> --reduce=season "
+            f"--crop={CY_CROP_NAMES.get(crop, crop)}"
+        )
+
+    clim = pd.concat([_read_parquet(pth) for pth in paths], ignore_index=True)
+    feature_cols = [c for c in clim.columns if c not in _SEASON_META_COLS]
+    if not feature_cols:
+        raise ValueError(f"Season features in {paths[0]!r} carry no feature columns.")
+
+    # Stage 3 stamps the lead time it was built at. Silently mixing an FY0
+    # reanalysis with an FY1 hindcast would compare two different experiments,
+    # so make the mismatch loud.
+    stamped = sorted(int(v) for v in clim["forecast_year"].dropna().unique())
+    if stamped != [forecast_year]:
+        raise ValueError(
+            f"Season features were built at forecast year(s) {stamped} but the "
+            f"run asked for {forecast_year}. Pass --forecast_year {stamped[0]} "
+            f"or rebuild stage 3 with --forecast-year {forecast_year}."
+        )
+
+    print(f"  Pixel-first season features: {len(clim):,} rows from {len(paths)} "
+          f"file(s) [{tag}], harvest years "
+          f"{int(clim['target_year'].min())}-{int(clim['target_year'].max())}")
+    print(f"  Features ({len(feature_cols)}): {','.join(feature_cols)}")
+
+    crop_file = os.path.join(data_dir, f"crop_{crop}_{aoi}.parquet")
+    if not os.path.exists(crop_file):
+        raise FileNotFoundError(
+            f"Crop parquet not found: {crop_file!r}\n"
+            f"Available crops for AOI {aoi!r}: {available_crops(data_dir, aoi)}"
+        )
+    crop_df = _read_parquet(crop_file)
+    # Same order as the daily path: drop structural zeros on the RAW yield,
+    # before the target transform turns the column into percent changes that are
+    # legitimately negative (and before pct_change can divide by a zero).
+    crop_df = drop_invalid_yield(crop_df, context=f"{crop}/{aoi}")
+    crop_df = _apply_target(crop_df, target)
+    # Crop yield is keyed by hindcast_start under the FY1 convention, i.e. the
+    # yield for calendar year hindcast_start + 1.
+    crop_df["target_year"] = crop_df["hindcast_start"].astype(int) + 1
+
+    merged = clim.drop(columns=["hindcast_start", "forecast_year"]).merge(
+        crop_df[["adm2_id", "target_year", "yield"]],
+        on=["adm2_id", "target_year"], how="inner")
+    # Re-key to this product's lead time, so folds and --study_years mean the
+    # same thing here as on the daily path.
+    merged["hindcast_start"] = merged["target_year"].astype(int) - forecast_year
+    if hindcast_years:
+        merged = merged[merged["hindcast_start"].isin(hindcast_years)]
+
+    before = len(merged)
+    merged = merged.dropna(subset=["yield"]).dropna(subset=feature_cols)
+    if before != len(merged):
+        print(f"  Dropped {before - len(merged):,} row(s) with a missing target "
+              f"or feature")
+    if merged.empty:
+        raise ValueError(
+            "No rows survived the season-feature/yield merge. Check that the "
+            "harvest years in features_admin2 overlap the crop parquet's "
+            "years and that adm2_id spellings match."
+        )
+
+    lead = ["adm2_id", "adm2", "adm1", "hindcast_start", "target_year", "yield"]
+    out = merged[lead + feature_cols].sort_values(
+        ["adm2_id", "hindcast_start"]).reset_index(drop=True)
+    print(f"  Samples: {len(out):,} over {out['adm2_id'].nunique()} units, "
+          f"years {out['hindcast_start'].min()}-{out['hindcast_start'].max()}")
+    return out, feature_cols
+
+
 def load_and_prepare(
     crop: str,
     data_dir: str,
@@ -1567,6 +1753,7 @@ def load_and_prepare(
     edd_threshold: float = EDD_THRESHOLD_C,
     gdd_preseason_days: int = GDD_PRESEASON_DAYS,
     gdd_cap: float | None = GDD_CAP_C,
+    pixel_features_dir: str | None = None,
 ) -> tuple[pd.DataFrame, list]:
     """Full pipeline: load → merge → window → featurise.
 
@@ -1601,6 +1788,33 @@ def load_and_prepare(
     gdd_preseason_days are forwarded to it.
     """
     climate_vars = resolve_climate_vars(climate_vars)
+
+    # feature_mode "pixel" reads a design matrix that stage 3 already built, so
+    # it skips the daily load and every builder below. Returns early rather than
+    # threading a None daily_df through code that assumes one exists.
+    if feature_mode == "pixel":
+        adm2_df, feature_cols = load_pixel_season_features(
+            crop=crop,
+            data_dir=data_dir,
+            aoi=aoi,
+            climate_model=climate_model,
+            forecast_year=forecast_year,
+            target=target,
+            hindcast_years=hindcast_years,
+            features_dir=pixel_features_dir,
+        )
+        if yield_history:
+            adm2_df, hist_cols = _append_yield_history_features(
+                adm2_df, data_dir, crop, aoi, forecast_year, yield_history_base,
+                max_len=yield_history_len)
+            feature_cols = feature_cols + hist_cols
+        if use_phenology:
+            adm2_df, pheno_cols = _append_phenology_features(
+                adm2_df, data_dir, use_phenology, aoi, forecast_year,
+                phenology_lag_years, phenology_suffix,
+                lookback_years=phenology_lookback_years)
+            feature_cols = feature_cols + pheno_cols
+        return adm2_df, feature_cols
 
     daily_df = load_crop_climate_data(
         crop=crop,
