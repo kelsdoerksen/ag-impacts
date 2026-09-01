@@ -559,7 +559,21 @@ def load_crop_calendar(lay: Layout, crop: str, cy_country: str) -> pd.DataFrame:
     path = (lay.root / "cy-bench" / "cybench-data" / crop / cy_country
             / f"crop_calendar_{crop}_{cy_country}.csv")
     if not path.exists():
-        raise SystemExit(f"no crop calendar at {path}\nUse --season=SOS:EOS for a fixed window.")
+        # The calendar hangs off --root (the DATA root: crop parquets and
+        # cy-bench), not --out (the climate store). Those are usually different
+        # directories on a shared machine, and --root falling back to a
+        # developer's laptop path is not something the bare filename reveals.
+        via = ("--root" if os.environ.get("AGIMPACTS_ROOT") is None
+               else "$AGIMPACTS_ROOT")
+        raise SystemExit(
+            f"no crop calendar at {path}\n"
+            f"  root = {lay.root}  (from {via})\n"
+            f"Set the DATA root -- where cy-bench and the crop parquets live, "
+            f"not the climate store passed to --out:\n"
+            f"  export AGIMPACTS_ROOT=/path/to/AgImpacts\n"
+            f"  # or: --root /path/to/AgImpacts\n"
+            f"Find it with: find / -name 'crop_calendar_{crop}_{cy_country}.csv' 2>/dev/null\n"
+            f"Or bypass the calendar entirely with --season=SOS:EOS.")
     cal = pd.read_csv(path)
     cal = cal.rename(columns={"adm_id": "adm2_id"})[["adm2_id", "sos", "eos"]]
     return cal.set_index("adm2_id")
@@ -1053,7 +1067,16 @@ def main(argv=None):
     print(f"{a.source} features - AOI {a.aoi}, features: {','.join(names)}")
     print(f"  forecast year {fy} ({reading})")
     print(f"  --years {years[0]}-{years[-1]} read as {reading.split(';')[0]}")
+    print(f"  root: {lay.root}"
+          + ("" if lay.root.exists() else "   <-- DOES NOT EXIST"))
     print(f"  out: {lay.out}")
+    if not lay.root.exists() and a.reduce in ("season", "blocks") and not a.season:
+        # Stage 2 can take a long time; failing on a missing calendar only after
+        # it finishes wastes all of it.
+        print(f"  ! --root does not exist, and --reduce={a.reduce} needs the "
+              f"cy-bench crop calendar under it.\n"
+              f"    Set AGIMPACTS_ROOT or --root to the data root before this "
+              f"reaches stage 3.")
 
     if a.stage in ("features", "both"):
         print("\nStage 2: per-pixel daily features")
