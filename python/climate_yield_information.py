@@ -2,11 +2,8 @@
 """How much does climate tell us about yield change?
 
 This is not a forecasting script. run_loo_experiment.py answers "can a model
-predict a year it has never seen"; that conflates two different things whenever
-the effective sample size is small, and here it is small: the signal that
-climate can move is a largely NATIONAL year effect, so the number of independent
-realisations is the number of YEARS (~33), not the number of district-years
-(~2,300). A genuine climate-yield relationship can sit inside a model that
+predict a year it has never seen".
+A genuine climate-yield relationship can sit inside a model that
 forecasts worse than a constant, because estimation noise swamps it. Measuring
 the relationship and its precision directly is a different job from scoring a
 forecast, and it is the one this script does.
@@ -255,6 +252,20 @@ def panel_regression(df: pd.DataFrame, feats: list, share: float):
     print("  district's mean, so this is a pure within-district (year-to-year)")
     print("  relationship -- no cross-sectional 'hot districts yield less'.")
 
+    n_clu = df["target_year"].nunique()
+    if len(feats) + 1 >= n_clu:
+        # The cluster-robust "meat" matrix is a sum of n_clu outer products, so
+        # its rank is at most n_clu. With more parameters than year clusters it
+        # is singular: the standard errors below are not identified and the
+        # coefficients are fitting year effects one-for-one. Say so rather than
+        # printing a table of numbers that look like inference.
+        print(f"\n  ! {len(feats)} features against {n_clu} year clusters.")
+        print( "    Cluster-robust standard errors need MORE clusters than")
+        print( "    parameters -- the ones below are not identified, and the")
+        print( "    coefficients are absorbing year effects one-for-one.")
+        print( "    Re-run with --features to subset, e.g. --features 'pr_*'")
+        print( "    to ask which part of the season the rainfall signal sits in.")
+
     d = demean(df, feats + ["yield"], "adm2_id")
     X = np.column_stack([np.ones(len(d))] + [d[f].to_numpy(dtype=float) for f in feats])
     y = d["yield"].to_numpy(dtype=float)
@@ -388,12 +399,29 @@ def main():
     p.add_argument("--climate_model", default="ERA5")
     p.add_argument("--forecast_year", type=int, default=0)
     p.add_argument("--study_years", type=int, nargs=2, metavar=("START", "END"))
+    p.add_argument("--kind", choices=["season", "blocks"], default="season",
+                   help="Which stage-3 store to read. Default: season.")
+    p.add_argument("--features", default=None, metavar="LIST",
+                   help="Comma-separated subset of feature columns, or a prefix "
+                        "with a trailing '*' (e.g. 'pr_*,edd_*'). With --kind "
+                        "blocks the full 42-column set exceeds the 33 year "
+                        "clusters, which makes cluster-robust inference "
+                        "unidentified -- subset to one or two families instead.")
     a = p.parse_args()
 
     df, feats = load_pixel_season_features(
         crop=a.crop, data_dir=a.data_dir, aoi=a.aoi,
         climate_model=a.climate_model, forecast_year=a.forecast_year,
-        target="yield", features_dir=a.pixel_features_dir)
+        target="yield", features_dir=a.pixel_features_dir, kind=a.kind)
+
+    if a.features:
+        want, keep = [w.strip() for w in a.features.split(",") if w.strip()], []
+        for f in feats:
+            if any(f == w or (w.endswith("*") and f.startswith(w[:-1])) for w in want):
+                keep.append(f)
+        if not keep:
+            raise SystemExit(f"--features {a.features!r} matched none of: {feats}")
+        feats = keep
 
     if a.study_years:
         lo, hi = a.study_years
