@@ -64,7 +64,7 @@ def draw_seed() -> int:
     return secrets.randbelow(SEED_MAX) + 1
 
 WEATHER_VARS    = ["tasmax_C", "tasmin_C", "hursmin", "pr_mm"]
-FEATURE_MODES   = ["aggregated", "timeseries", "agro", "pixel"]
+FEATURE_MODES   = ["aggregated", "timeseries", "agro", "pixel", "pixel_blocks"]
 
 # ── agronomic ("agro") feature mode ──────────────────────────────────────────
 # A deliberately small, physically-motivated feature set for isolating climate
@@ -1018,6 +1018,8 @@ def load_crop_climate_data(
     target: str = "yield",
     forecast_year: int = 1,
     aoi: str = "CONUS",
+    climate_source: str = "aggregate",
+    pixel_features_dir: str | None = None,
 ) -> pd.DataFrame:
     """Load and merge climate + crop parquets; apply the appropriate date window.
 
@@ -1051,13 +1053,23 @@ def load_crop_climate_data(
         raise ValueError(f"feature_mode must be one of {FEATURE_MODES}")
 
     # ---- climate ----
-    # Resolved per hindcast year and per AOI, so a folder holding more than one
-    # AOI's series cannot cross-contaminate a run.
-    files = find_climate_files(data_dir, climate_model, ens_member, aoi,
-                               forecast_year, hindcast_years)
-
-    print(f"Loading {len(files)} climate parquet(s) (forecast year {forecast_year})...")
-    climate_df = pd.concat([_read_parquet(f) for f in files], ignore_index=True)
+    if climate_source == "pixel":
+        # Same daily schema, different provenance: area-weighted from per-pixel
+        # values rather than computed on an already-averaged unit. Everything
+        # below -- stitching, the crop merge, the season window, the coverage
+        # guard -- is identical, which is why the switch lives here and not in a
+        # parallel loader that would drift out of step.
+        want = ([y + forecast_year for y in hindcast_years]
+                if hindcast_years else None)
+        climate_df = load_pixel_daily(data_dir, climate_model, aoi,
+                                      pixel_features_dir, want)
+    else:
+        # Resolved per hindcast year and per AOI, so a folder holding more than
+        # one AOI's series cannot cross-contaminate a run.
+        files = find_climate_files(data_dir, climate_model, ens_member, aoi,
+                                   forecast_year, hindcast_years)
+        print(f"Loading {len(files)} climate parquet(s) (forecast year {forecast_year})...")
+        climate_df = pd.concat([_read_parquet(f) for f in files], ignore_index=True)
     climate_df["date"] = pd.to_datetime(climate_df["date"])
     # fastparquet returns integer id columns as float; normalise so downstream
     # merges/folds see a consistent int hindcast_start regardless of read engine.
@@ -1569,6 +1581,7 @@ CY_CROP_NAMES = {"corn": "maize"}
 _SEASON_META_COLS = (
     "adm2_id", "adm2", "adm1", "harvest_year", "hindcast_start",
     "forecast_year", "target_year", "season_start", "season_end",
+    "n_blocks",
 )
 
 
@@ -1611,12 +1624,14 @@ def pixel_features_dir(data_dir: str, climate_model: str,
 
 
 def find_season_feature_files(data_dir: str, climate_model: str, aoi: str,
-                              crop: str, features_dir: str | None = None
-                              ) -> tuple[list, str | None]:
-    """Stage-3 season parquets for this AOI/crop.
+                              crop: str, features_dir: str | None = None,
+                              kind: str = "season") -> tuple[list, str | None]:
+    """Stage-3 parquets for this AOI/crop.
 
-    Tries the crop tag under both spellings, then "fixed" for a run that used
-    era5_features.py --season SOS:EOS instead of a crop calendar.
+    `kind` is "season" (one column per feature, accumulated over the whole
+    growing window) or "blocks" (one column per feature per season-relative
+    window, e.g. pr_m04). Tries the crop tag under both spellings, then "fixed"
+    for a run that used era5_features.py --season SOS:EOS instead of a calendar.
     """
     tags = [crop]
     if crop in CY_CROP_NAMES:
@@ -1625,10 +1640,83 @@ def find_season_feature_files(data_dir: str, climate_model: str, aoi: str,
     for fdir in pixel_features_dirs(data_dir, climate_model, features_dir):
         for tag in tags:
             paths = sorted(glob.glob(
-                os.path.join(fdir, f"features_{aoi}_{tag}_season_*.parquet")))
+                os.path.join(fdir, f"features_{aoi}_{tag}_{kind}_*.parquet")))
             if paths:
                 return paths, tag
     return [], None
+
+
+# The stage-3 daily store names its columns after the FEATURES that produced
+# them (tmax, tmin, hurs, pr -- the identity features in era5_features.py). Every
+# daily consumer here, and the PatchTST path, was written against the raw ERA5
+# column names. Rename on read rather than in era5_features: the feature names
+# are correct on their own side, and a compatibility shim belongs with the code
+# that needs compatibility.
+_RAW_FEATURE_ALIASES = {
+    "tmax": "tasmax_C",
+    "tmin": "tasmin_C",
+    "hurs": "hursmin",
+    "pr":   "pr_mm",
+}
+
+
+def find_pixel_daily_files(data_dir: str, climate_model: str, aoi: str,
+                           features_dir: str | None = None,
+                           years: list | None = None) -> list:
+    """Stage-3 daily parquets (era5_features.py --reduce=daily) for this AOI."""
+    out = []
+    for fdir in pixel_features_dirs(data_dir, climate_model, features_dir):
+        paths = sorted(glob.glob(
+            os.path.join(fdir, f"features_{aoi}_daily_*.parquet")))
+        if paths:
+            out = paths
+            break
+    if years:
+        want = set(int(y) for y in years)
+        # Keep the neighbouring year too: a cross-year season reaches back into
+        # the previous calendar file, and the window filter downstream discards
+        # whatever it does not need.
+        want |= {y - 1 for y in want} | {y + 1 for y in want}
+        out = [p for p in out
+               if int(os.path.basename(p).rsplit("_", 1)[1].split(".")[0]) in want]
+    return out
+
+
+def load_pixel_daily(data_dir: str, climate_model: str, aoi: str,
+                     features_dir: str | None = None,
+                     years: list | None = None) -> pd.DataFrame:
+    """Daily admin-2 climate from the PIXEL-FIRST store, in raw-column schema.
+
+    Same shape as the aggregate-first climate parquets, so it is a drop-in for
+    them -- but the numbers differ in ordering: these were area-weighted from
+    per-pixel values, the others were computed on an already-averaged unit. For
+    a linear pass-through variable (tmax, pr) the two orderings agree exactly;
+    they diverge only once something nonlinear is applied downstream, which is
+    the whole reason this store exists.
+    """
+    paths = find_pixel_daily_files(data_dir, climate_model, aoi, features_dir, years)
+    if not paths:
+        looked = pixel_features_dirs(data_dir, climate_model, features_dir)
+        raise FileNotFoundError(
+            f"No pixel-first DAILY features for AOI {aoi!r}.\n"
+            f"Looked in:\n" + "".join(f"  {d}\n" for d in looked) +
+            f"Build them with:\n"
+            f"  python python/era5_features.py --aoi={aoi} --source={climate_model} "
+            f"--years=<years> --reduce=daily --features=tmax,tmin,hurs,pr"
+        )
+    df = pd.concat([_read_parquet(pth) for pth in paths], ignore_index=True)
+    have = {k: v for k, v in _RAW_FEATURE_ALIASES.items() if k in df.columns}
+    df = df.rename(columns=have)
+    missing = [v for v in _RAW_FEATURE_ALIASES.values() if v not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Pixel-first daily store is missing {missing}. It holds "
+            f"{[c for c in df.columns if c not in ('adm2_id','adm2','adm1','date','doy','year_month','hindcast_start','forecast_year','target_year')]}.\n"
+            f"Rebuild stage 3 with --features=tmax,tmin,hurs,pr (identity "
+            f"features that reproduce the raw ERA5 variables)."
+        )
+    print(f"  Pixel-first daily store: {len(df):,} rows from {len(paths)} file(s)")
+    return df
 
 
 def load_pixel_season_features(
@@ -1640,25 +1728,26 @@ def load_pixel_season_features(
     target: str,
     hindcast_years: list | None = None,
     features_dir: str | None = None,
+    kind: str = "season",
 ) -> tuple[pd.DataFrame, list]:
-    """Read stage-3 season features and join the yield target onto them.
+    """Read stage-3 features and join the yield target onto them.
 
     Returns (adm2_df, feature_cols) in the same shape as the other feature
     modes: one row per (adm2_id, hindcast_start) carrying adm2_id, adm2, adm1,
     hindcast_start, target_year, yield and the feature columns.
     """
     paths, tag = find_season_feature_files(
-        data_dir, climate_model, aoi, crop, features_dir)
+        data_dir, climate_model, aoi, crop, features_dir, kind)
     if not paths:
         looked = pixel_features_dirs(data_dir, climate_model, features_dir)
         raise FileNotFoundError(
-            f"No pixel-first season features for AOI {aoi!r}, crop {crop!r}.\n"
+            f"No pixel-first {kind} features for AOI {aoi!r}, crop {crop!r}.\n"
             f"Looked in:\n" + "".join(f"  {d}\n" for d in looked) +
             f"Point --pixel_features_dir (or ERA5_OUT_DIR) at the store, or "
             f"build it with:\n"
             f"  Rscript R/era5-pixel-store.R --aoi={aoi} <years>\n"
             f"  python python/era5_features.py --aoi={aoi} --source={climate_model} "
-            f"--years=<years> --reduce=season "
+            f"--years=<years> --reduce={kind} "
             f"--crop={CY_CROP_NAMES.get(crop, crop)}"
         )
 
@@ -1678,7 +1767,7 @@ def load_pixel_season_features(
             f"or rebuild stage 3 with --forecast-year {forecast_year}."
         )
 
-    print(f"  Pixel-first season features: {len(clim):,} rows from {len(paths)} "
+    print(f"  Pixel-first {kind} features: {len(clim):,} rows from {len(paths)} "
           f"file(s) [{tag}], harvest years "
           f"{int(clim['target_year'].min())}-{int(clim['target_year'].max())}")
     print(f"  Features ({len(feature_cols)}): {','.join(feature_cols)}")
@@ -1767,6 +1856,7 @@ def load_and_prepare(
     gdd_preseason_days: int = GDD_PRESEASON_DAYS,
     gdd_cap: float | None = GDD_CAP_C,
     pixel_features_dir: str | None = None,
+    climate_source: str = "aggregate",
 ) -> tuple[pd.DataFrame, list]:
     """Full pipeline: load → merge → window → featurise.
 
@@ -1805,7 +1895,7 @@ def load_and_prepare(
     # feature_mode "pixel" reads a design matrix that stage 3 already built, so
     # it skips the daily load and every builder below. Returns early rather than
     # threading a None daily_df through code that assumes one exists.
-    if feature_mode == "pixel":
+    if feature_mode in ("pixel", "pixel_blocks"):
         adm2_df, feature_cols = load_pixel_season_features(
             crop=crop,
             data_dir=data_dir,
@@ -1815,6 +1905,7 @@ def load_and_prepare(
             target=target,
             hindcast_years=hindcast_years,
             features_dir=pixel_features_dir,
+            kind="blocks" if feature_mode == "pixel_blocks" else "season",
         )
         if yield_history:
             adm2_df, hist_cols = _append_yield_history_features(
@@ -1841,6 +1932,8 @@ def load_and_prepare(
         target=target,
         forecast_year=forecast_year,
         aoi=aoi,
+        climate_source=climate_source,
+        pixel_features_dir=pixel_features_dir,
     )
 
     if feature_mode == "aggregated":

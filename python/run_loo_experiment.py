@@ -150,6 +150,7 @@ def build_config_key(args, climate_vars, study_start, study_end):
         "crop":               args.crop,
         "model_type":         args.model_type,
         "feature_mode":       args.feature_mode,
+        "climate_source":     args.climate_source,
         "target":             args.target,
         "forecast_year":      args.forecast_year,
         "aoi":                args.aoi,
@@ -374,11 +375,30 @@ def parse_args():
             "took the cropland-weighted admin-2 mean. The three modes above all "
             "average the climate over the unit first, which is wrong for GDD, "
             "EDD, VPD and every other threshold feature. Reads "
-            "{data_dir}/{climate_model}/features_admin2/ and ignores every "
+"'pixel_blocks': the same, but from --reduce=blocks -- one column per "
+            "feature per season-relative window (pr_m04 = rainfall at flowering). "
+            "Season totals cannot separate a dry spell at flowering from the same "
+            "shortfall at maturity; this can, at the cost of ~5x the columns, so "
+            "pair it with --model_type ridge rather than a tree. Both read "
+            "{data_dir}/{climate_model}/features_admin2/ and ignore every "
             "feature-building flag (--climate_vars, the agro group, the "
             "buffers) -- the feature set is fixed when stage 3 runs. "
             "Default: aggregated."
         ),
+    )
+    parser.add_argument(
+        "--climate_source", type=str, choices=["aggregate", "pixel"],
+        default="aggregate",
+        help="Where DAILY climate comes from for the modes that consume it "
+             "(aggregated / timeseries / agro / tst). 'aggregate' (default) "
+             "reads the classic climate parquets, whose admin-2 means were taken "
+             "BEFORE any feature was computed. 'pixel' reads the pixel-first "
+             "daily store from era5_features.py --reduce=daily, where the "
+             "admin-2 mean is taken after. The two agree exactly for a linear "
+             "pass-through and diverge once anything nonlinear (GDD, EDD, VPD, "
+             "thresholds) is applied downstream. Needs --features=tmax,tmin,"
+             "hurs,pr at stage 3. Ignored by --feature_mode pixel/pixel_blocks, "
+             "which are pixel-first by construction.",
     )
     parser.add_argument(
         "--pixel_features_dir", type=str, default=None,
@@ -1428,6 +1448,8 @@ def main():
             climate_model=args.climate_model,
             ens_member=args.ens_member,
             aoi=args.aoi,
+            climate_source=args.climate_source,
+            pixel_features_dir=args.pixel_features_dir,
             use_phenology=args.use_phenology,
             phenology_suffix=args.phenology_suffix,
             phenology_lag_years=args.phenology_lag_years,
@@ -1495,6 +1517,7 @@ def main():
             gdd_preseason_days=args.gdd_preseason_days,
             gdd_cap=args.gdd_cap,
             pixel_features_dir=args.pixel_features_dir,
+            climate_source=args.climate_source,
         )
         county_meta = adm2_df[["adm2_id", "adm2", "adm1"]].drop_duplicates("adm2_id")
 

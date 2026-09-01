@@ -175,7 +175,72 @@ def _hot_days(ds, threshold=35.0):
     return (ds["tasmax_C"] > threshold).astype("float32").where(ds["tasmax_C"].notnull())
 
 
+@feature(
+    "tmax",
+    deps=("tasmax_C",),
+    reduce="mean",
+    unit="degC",
+    doc="""
+    Daily maximum temperature. Reduced by MEAN, so a block value is the mean of
+    that window's daily maxima -- not the single hottest day, which is what
+    hot_days and edd are for.
+    """,
+)
+def _tmax(ds):
+    return ds["tasmax_C"]
+
+
+@feature(
+    "tmin",
+    deps=("tasmin_C",),
+    reduce="mean",
+    unit="degC",
+    doc="Daily minimum temperature, averaged over the window.",
+)
+def _tmin(ds):
+    return ds["tasmin_C"]
+
+
+@feature(
+    "pr_mean",
+    deps=("pr_mm",),
+    reduce="mean",
+    unit="mm/day",
+    doc="""
+    Mean daily precipitation. Paired with `pr` (which accumulates): over a fixed
+    window the two are proportional, but blocks differ in length by a day or two,
+    so the mean is the one that compares cleanly across them.
+    """,
+)
+def _pr_mean(ds):
+    return ds["pr_mm"]
+
+
+@feature(
+    "hurs",
+    deps=("hursmin",),
+    reduce="mean",
+    unit="percent",
+    doc="""
+    Daily minimum relative humidity, passed through unchanged. An identity
+    feature: with tmax, tmin and pr it reconstructs the four raw ERA5 variables
+    as an area-weighted admin-2 series, which is what a sequence model wants as
+    input. Cheap to carry and it keeps the raw series inside the pixel-first
+    ordering rather than requiring a separate aggregate-first pipeline.
+    """,
+)
+def _hurs(ds):
+    return ds["hursmin"]
+
+
+# The four raw ERA5 variables, area-weighted per day: the input a sequence model
+# takes. --reduce=daily --features=RAW_FEATURES writes one row per unit per day.
+RAW_FEATURES = ["tmax", "tmin", "hurs", "pr"]
+
+# The season default stays as it was: these three exist for --reduce blocks and
+# are opt-in via --features, so adding them does not silently change any run.
 DEFAULT_FEATURES = ["gdd", "edd", "tavg", "vpd", "pr", "hot_days"]
+BLOCK_FEATURES = ["gdd", "edd", "tmax", "tmin", "pr", "pr_mean", "vpd"]
 
 
 # ================================== paths ====================================
@@ -396,6 +461,24 @@ def check_grid(ds: xr.Dataset, lay: Layout, w: pd.DataFrame | None = None):
         )
 
 
+def require_features(ds: xr.Dataset, names, lay: Layout, year):
+    """Stage-2 files hold whatever --features was passed when they were written.
+
+    Asking stage 3 for a feature stage 2 never computed is a common sequencing
+    slip -- especially after new features are added to the registry -- and the
+    raw KeyError from xarray does not say which stage to re-run.
+    """
+    missing = [n for n in names if n not in ds]
+    if missing:
+        raise SystemExit(
+            f"per-pixel features {missing} are not in {lay.features(year).name}, "
+            f"which holds {sorted(str(v) for v in ds.data_vars)}.\n"
+            f"Stage 2 writes only the features it was asked for. Re-run it with "
+            f"them included:\n"
+            f"  python python/era5_features.py --aoi={lay.aoi} --source={lay.source} "
+            f"--stage=features --features={','.join(names)} --years=... --overwrite")
+
+
 def pair_values(da: xr.DataArray, w: pd.DataFrame) -> np.ndarray:
     """(n_pairs, n_time): the feature at each (admin unit, pixel) pair.
 
@@ -504,6 +587,134 @@ def season_windows(unit_ids, cal, year, fixed=None):
         end = pd.Timestamp(f"{year}-01-01") + pd.Timedelta(days=eos_i - 1)
         out[uid] = (start, end)
     return out
+
+
+def block_windows(unit_ids, cal, year, fixed=None, n_blocks: int = 6):
+    """Split each unit's season into n_blocks consecutive windows.
+
+    WHY SEASON-RELATIVE RATHER THAN CALENDAR MONTHS
+    Districts sow up to three weeks apart (ZM maize sos spans doy 307-329), so
+    "January" is a different growth stage in different districts and averaging
+    it across them blurs the very thing these features exist to resolve. Blocks
+    are defined as fractions of each unit's OWN season, so m04 is the flowering
+    window everywhere.
+
+    WHY EQUAL FRACTIONS RATHER THAN FIXED 30-DAY WINDOWS
+    Season length varies by unit (157-203 days for Zambian maize), so fixed
+    30-day windows would give some units 6 blocks and others 7 -- a ragged
+    design matrix whose trailing column is missing for a subset of units, which
+    then drop out of the model entirely. Equal fractions keep the matrix
+    rectangular; blocks come out near the requested length and the CLI reports
+    the spread.
+
+    WHAT THIS IS NOT
+    An equal split is a PROXY for phenology, not phenology. Real crop
+    development runs on accumulated heat, so in a cool year the flowering window
+    arrives later than a fixed fraction of the season implies. cy-bench gives
+    only sos and eos -- no per-stage dates -- so a thermal-time staging would
+    need a phenology product this pipeline does not have. Worth revisiting if
+    the block features prove informative.
+    """
+    out = {}
+    for uid, (start, end) in season_windows(unit_ids, cal, year, fixed).items():
+        total = (end - start).days + 1
+        if total < n_blocks:
+            continue                      # too short to split meaningfully
+        edges = np.linspace(0, total, n_blocks + 1).round().astype(int)
+        out[uid] = [(start + pd.Timedelta(days=int(edges[i])),
+                     start + pd.Timedelta(days=int(edges[i + 1]) - 1))
+                    for i in range(n_blocks)]
+    return out
+
+
+def blocks_from_days(unit_ids, cal, year, fixed, block_days: int) -> int:
+    """How many equal blocks give windows closest to `block_days` long."""
+    lens = [(e - s).days + 1
+            for s, e in season_windows(unit_ids, cal, year, fixed).values()]
+    if not lens:
+        return 1
+    return max(1, int(round(float(np.median(lens)) / block_days)))
+
+
+def aggregate_blocks(lay: Layout, year, w, names, cal, fixed=None,
+                     n_blocks: int = 6) -> pd.DataFrame:
+    """One row per (unit, harvest year); one column per (feature, block).
+
+    Same pixel-first ordering as aggregate_season -- the feature was computed per
+    pixel upstream, here each pixel's own block window is reduced along time and
+    only then are pixels averaged by cropland weight. The only difference is that
+    the window is a sixth of the season rather than all of it, so a dry spell at
+    flowering is a different number from the same shortfall at maturity.
+    """
+    starts, unit_ids = group_starts(w)
+    bounds = np.r_[starts, len(w)]
+    wt = w["w"].to_numpy()
+    windows = block_windows(unit_ids, cal, year, fixed, n_blocks)
+    if not windows:
+        raise SystemExit(
+            f"no unit has a usable season window for harvest year {year} -- "
+            f"check the crop calendar covers these adm2_ids.")
+
+    wanted = season_source_years(year, lay.forecast_year)
+    earliest = min(b[0][0] for b in windows.values())
+    if lay.forecast_year == 0 and earliest.year >= year:
+        wanted = [year]
+    have = [y for y in wanted if lay.features(y).exists()]
+    if not have:
+        raise SystemExit(
+            f"no per-pixel features for harvest year {year} "
+            f"(looked for source year(s) {wanted}); run --stage=features first")
+
+    cols = [f"{nm}_m{b + 1:02d}" for nm in names for b in range(n_blocks)]
+    results = {c: np.full(len(unit_ids), np.nan) for c in cols}
+
+    with contextlib.ExitStack() as stack:
+        dsets = [stack.enter_context(open_nc(lay.features(y))) for y in have]
+        ds = xr.concat(dsets, dim="time", data_vars="all",
+                       combine_attrs="override") if len(dsets) > 1 else dsets[0]
+        check_grid(ds, lay, w)
+        require_features(ds, names, lay, have[0])
+        times = pd.to_datetime(ds["time"].values)
+
+        latest = max(b[-1][1] for b in windows.values())
+        if earliest < times.min() or latest > times.max():
+            missing = [y for y in wanted if y not in have]
+            raise SystemExit(
+                f"harvest year {year}: season windows run outside the loaded days "
+                f"({times.min().date()} to {times.max().date()}); source year(s) "
+                f"{missing} are missing. Run --stage=features for them first.")
+
+        for name in names:
+            spec = REGISTRY[name]
+            vals = pair_values(ds[name].load(), w)
+            for gi, uid in enumerate(unit_ids):
+                if uid not in windows:
+                    continue
+                pw = wt[bounds[gi]:bounds[gi + 1]]
+                for bi, (b0, b1) in enumerate(windows[uid]):
+                    sel = (times >= b0) & (times <= b1)
+                    if not sel.any():
+                        continue
+                    block = vals[bounds[gi]:bounds[gi + 1], sel]
+                    per_pixel = season_reduce(block, spec.reduce)
+                    ok = ~np.isnan(per_pixel) & (pw > 0)
+                    if ok.any():
+                        results[f"{name}_m{bi + 1:02d}"][gi] = np.average(
+                            per_pixel[ok], weights=pw[ok])
+            del vals
+
+    df = pd.DataFrame({"adm2_id": unit_ids, **results})
+    df = df.merge(unit_meta(w), on="adm2_id", how="left")
+    df["harvest_year"] = year
+    df["season_start"] = [windows[u][0][0] if u in windows else pd.NaT for u in unit_ids]
+    df["season_end"] = [windows[u][-1][1] if u in windows else pd.NaT for u in unit_ids]
+    df["n_blocks"] = n_blocks
+    df["hindcast_start"] = year - lay.forecast_year
+    df["forecast_year"] = lay.forecast_year
+    df["target_year"] = year
+    lead = ["adm2_id", "adm2", "adm1", "harvest_year", "hindcast_start", "forecast_year",
+            "target_year", "season_start", "season_end", "n_blocks"]
+    return df[lead + cols]
 
 
 def season_source_years(harvest_year: int, forecast_year: int) -> list[int]:
@@ -622,6 +833,7 @@ def aggregate_season(lay: Layout, year, w, names, cal, fixed=None) -> pd.DataFra
         dsets = [stack.enter_context(open_nc(lay.features(y))) for y in have]
         ds = xr.concat(dsets, dim="time", data_vars="all", combine_attrs="override") if len(dsets) > 1 else dsets[0]
         check_grid(ds, lay, w)
+        require_features(ds, names, lay, have[0])
         times = pd.to_datetime(ds["time"].values)
 
         # A window running off the end of what is loaded used to be warned about
@@ -673,17 +885,19 @@ def aggregate_season(lay: Layout, year, w, names, cal, fixed=None) -> pd.DataFra
     return df[lead + names]
 
 
-def stage_aggregate(lay, years, names, reduce, weighting, crop, cy_country, season, overwrite):
+def stage_aggregate(lay, years, names, reduce, weighting, crop, cy_country, season,
+                    overwrite, block_days: int = 30, n_blocks: int | None = None):
     lay.admin2.mkdir(parents=True, exist_ok=True)
     w = load_weights(lay, weighting)
     print(f"  weights: {len(w)} pixel-unit pairs over {w.adm2_id.nunique()} units "
           f"({weighting}-weighted)")
 
     fixed = tuple(float(x) for x in season.split(":")) if season else None
+    seasonal = reduce in ("season", "blocks")
     cal = pd.DataFrame() if fixed else (
-        load_crop_calendar(lay, crop, cy_country) if reduce == "season" else pd.DataFrame())
+        load_crop_calendar(lay, crop, cy_country) if seasonal else pd.DataFrame())
 
-    if reduce == "season":
+    if seasonal:
         # `years` arrived as SOURCE years; a season is keyed by its harvest year,
         # and which harvest years those sources can cover depends on the lead
         # time and on whether the crop calendar crosses the new year.
@@ -702,19 +916,39 @@ def stage_aggregate(lay, years, names, reduce, weighting, crop, cy_country, seas
               + (f"; {len(dropped)} candidate year(s) lack a complete season" if dropped else ""))
         years = harvest_years
 
+    # Block count is fixed ONCE, from the first harvest year, and reused for
+    # every year of the run. Letting it float per year would give different
+    # years different columns, which is not a design matrix.
+    if reduce == "blocks":
+        _, uids = group_starts(w)
+        if n_blocks is None:
+            n_blocks = blocks_from_days(uids, cal, years[0], fixed, block_days)
+        lens = [(e - s).days + 1 for s, e in
+                season_windows(uids, cal, years[0], fixed).values()]
+        if lens:
+            print(f"  {n_blocks} blocks/season; season length "
+                  f"{min(lens)}-{max(lens)} days -> blocks of "
+                  f"~{min(lens)//n_blocks}-{max(lens)//n_blocks} days")
+
     for year in years:
         if reduce == "daily":
             out = lay.admin2 / f"features_{lay.aoi}_daily_{year}.parquet"
         else:
             tag = "fixed" if fixed else crop
-            out = lay.admin2 / f"features_{lay.aoi}_{tag}_season_{year}.parquet"
+            kind = "blocks" if reduce == "blocks" else "season"
+            out = lay.admin2 / f"features_{lay.aoi}_{tag}_{kind}_{year}.parquet"
         if out.exists() and not overwrite:
             print(f"  {year}: exists, skipping ({out.name})")
             continue
-        df = (aggregate_daily(lay, year, w, names) if reduce == "daily"
-              else aggregate_season(lay, year, w, names, cal, fixed))
+        if reduce == "daily":
+            df = aggregate_daily(lay, year, w, names)
+        elif reduce == "blocks":
+            df = aggregate_blocks(lay, year, w, names, cal, fixed, n_blocks)
+        else:
+            df = aggregate_season(lay, year, w, names, cal, fixed)
         df.to_parquet(out, index=False)
-        filled = df[names].notna().all(axis=1).sum()
+        value_cols = [c for c in df.columns if c.split("_m")[0] in names or c in names]
+        filled = df[value_cols].notna().all(axis=1).sum()
         print(f"  {year}: wrote {out.name} ({len(df)} rows, {filled} complete)")
 
 
@@ -768,9 +1002,20 @@ def main(argv=None):
                    help="comma-separated; see --list-features")
     p.add_argument("--param", action="append", metavar="FEAT.arg=value",
                    help="override a feature parameter, e.g. gdd.tbase=8")
-    p.add_argument("--reduce", choices=["daily", "season"], default="daily",
+    p.add_argument("--reduce", choices=["daily", "season", "blocks"], default="daily",
                    help="daily: weighted mean per unit per day. season: accumulate over "
-                        "the crop-calendar window, one row per unit per harvest year")
+                        "the whole crop-calendar window, one row per unit per harvest "
+                        "year. blocks: the same, but split into consecutive "
+                        "season-relative windows (~--block-days long), giving one column "
+                        "per feature per block (gdd_m01, pr_m04, ...). Season totals "
+                        "cannot separate a dry spell at flowering from the same shortfall "
+                        "at maturity; blocks can.")
+    p.add_argument("--block-days", type=int, default=30, metavar="N",
+                   help="Target block length for --reduce=blocks. The season is split "
+                        "into equal fractions, so actual blocks land near this. "
+                        "Default: 30.")
+    p.add_argument("--n-blocks", type=int, default=None, metavar="N",
+                   help="Exact number of blocks, overriding --block-days.")
     p.add_argument("--weight", choices=list(WEIGHT_COLUMNS), default="cropland",
                    help="cropland: cropland-area weighted (default). area: polygon overlap "
                         "only. none: unweighted pixel mean")
@@ -816,7 +1061,7 @@ def main(argv=None):
     if a.stage in ("aggregate", "both"):
         print(f"\nStage 3: admin-2 aggregation ({a.reduce})")
         stage_aggregate(lay, years, names, a.reduce, a.weight, a.crop, cy_country,
-                        a.season, a.overwrite)
+                        a.season, a.overwrite, a.block_days, a.n_blocks)
     print("\nDone.")
     return 0
 

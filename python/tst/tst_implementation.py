@@ -267,6 +267,8 @@ def load_climate_crop_data(
     phenology_lag_years: int = 1,
     phenology_lookback_years: int = 1,
     forecast_year: int = 1,
+    climate_source: str = "aggregate",
+    pixel_features_dir: str | None = None,
 ) -> pd.DataFrame:
     """Load one or more hindcast years of climate data and merge with crop yield.
 
@@ -309,15 +311,31 @@ def load_climate_crop_data(
         If any climate parquet or the crop parquet cannot be located.
     """
     # ── climate ──────────────────────────────────────────────────────────────
-    climate_frames = []
-    for year in sorted(hindcast_years):
-        path = _find_climate_file(data_dir, climate_model, year, ens_member,
-                                  forecast_year=forecast_year, aoi=aoi)
-        climate_frames.append(pd.read_parquet(path, engine="fastparquet"))
+    if climate_source == "pixel":
+        # The pixel-first daily store: admin-2 means taken AFTER each feature was
+        # computed per pixel. For the raw pass-through variables a sequence model
+        # consumes, the two orderings agree exactly -- averaging is linear -- so
+        # this changes provenance rather than numbers here. It matters because
+        # the same store then feeds the season and block reductions, where the
+        # ordering does change the answer, and mixing sources across arms would
+        # make them incomparable.
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(
+            _os.path.abspath(__file__)))))
+        from data_loader import load_pixel_daily
+        want = [y + forecast_year for y in hindcast_years]
+        climate_df = load_pixel_daily(data_dir, climate_model, aoi,
+                                      pixel_features_dir, want)
+    else:
+        climate_frames = []
+        for year in sorted(hindcast_years):
+            path = _find_climate_file(data_dir, climate_model, year, ens_member,
+                                      forecast_year=forecast_year, aoi=aoi)
+            climate_frames.append(pd.read_parquet(path, engine="fastparquet"))
 
-    print(f"[data] Loaded {len(climate_frames)} climate parquet(s) (FY{forecast_year}) "
-          f"for s-years {sorted(hindcast_years)}")
-    climate_df = pd.concat(climate_frames, ignore_index=True)
+        print(f"[data] Loaded {len(climate_frames)} climate parquet(s) (FY{forecast_year}) "
+              f"for s-years {sorted(hindcast_years)}")
+        climate_df = pd.concat(climate_frames, ignore_index=True)
     climate_df["date"] = pd.to_datetime(climate_df["date"])
     # fastparquet returns integer id columns as float; normalise, then derive the
     # forecast target year (hindcast_start + forecast_year) used to match yields.

@@ -181,8 +181,75 @@ def coef_table(names, beta, se, dof, sd_x, sd_y):
           f"{dof} degrees of freedom (year clusters - 1), not the row count.")
 
 
+def effective_sample_size(df: pd.DataFrame, feats: list):
+    """How many independent observations does this panel really contain?
+
+    Not the row count. Districts within a year share their weather, so their
+    yield anomalies are correlated (ICC ~ 0.25 for Zambian maize) and the rows
+    are partly repeats of each other. Kish's design effect discounts for that:
+
+        n_eff = n / (1 + (m - 1) * rho)
+
+    with m the districts per year and rho the intra-year correlation of the
+    residual being predicted. For Zambia that is ~2,368 / 18 ~ 130, not 2,368.
+
+    It also differs per FEATURE, which is the part that actually guides model
+    choice. A predictor that is essentially one national number per year carries
+    only as many independent values as there are years, however many rows it is
+    copied across; one that varies district-to-district within a year carries
+    close to the full row count. The between-year variance share below places
+    each feature on that scale, and the implied n_eff is roughly how many points
+    its coefficient is really estimated from.
+    """
+    rule("2. HOW MANY INDEPENDENT OBSERVATIONS?")
+    n = len(df)
+    ny = df["target_year"].nunique()
+    m = n / ny
+
+    anom = df["yield"] - df.groupby("adm2_id")["yield"].transform("mean")
+    a = df.assign(_a=anom)
+    rho = float((a.groupby("target_year")["_a"].transform("mean") ** 2).sum()
+                / (anom ** 2).sum())
+    deff = 1 + (m - 1) * rho
+    n_eff = n / deff
+
+    print(f"  rows                       {n:>10,}")
+    print(f"  years                      {ny:>10}")
+    print(f"  districts per year         {m:>10.1f}")
+    print(f"  intra-year ICC (yield)     {rho:>10.3f}")
+    print(f"  design effect 1+(m-1)*rho  {deff:>10.1f}")
+    print(f"  effective sample size      {n_eff:>10,.0f}")
+
+    print("\n  Per feature -- a predictor that is one national number per year is")
+    print("  worth only as many points as there are years, however many rows it")
+    print("  is copied across:")
+    print(f"\n    {'feature':<12}{'between-year':>14}{'implied n_eff':>15}")
+    print("    " + "-" * 41)
+    rows = []
+    for f in feats:
+        x = df[f].astype(float)
+        # Between-year share of the WITHIN-DISTRICT variation: the district mean
+        # is absorbed by the fixed effects, so it is not what identifies the
+        # coefficient.
+        xw = x - df.groupby("adm2_id")[f].transform("mean")
+        ss_t = float((xw ** 2).sum())
+        if ss_t <= 0:
+            continue
+        b = float((df.assign(_x=xw).groupby("target_year")["_x"]
+                   .transform("mean") ** 2).sum()) / ss_t
+        rows.append((f, b, b * ny + (1 - b) * n_eff))
+    for f, b, e in sorted(rows, key=lambda t: -t[1]):
+        print(f"    {f:<12}{100*b:>13.1f}%{e:>15,.0f}")
+    print("    " + "-" * 41)
+    print("  A feature high in this column is close to a national index: its")
+    print("  coefficient rests on a few dozen points no matter how many rows the")
+    print("  table has, and a flexible model will overfit it. One low in the")
+    print("  column carries genuine district-level information and supports more.")
+    return n_eff
+
+
 def panel_regression(df: pd.DataFrame, feats: list, share: float):
-    rule("2. PANEL REGRESSION, DISTRICT FIXED EFFECTS")
+    rule("3. PANEL REGRESSION, DISTRICT FIXED EFFECTS")
     print("  yield ~ climate + district FE, SEs clustered by year.")
     print("  Within transformation: every variable is a deviation from its own")
     print("  district's mean, so this is a pure within-district (year-to-year)")
@@ -217,7 +284,7 @@ def panel_regression(df: pd.DataFrame, feats: list, share: float):
 
 
 def national_regression(df: pd.DataFrame, feats: list):
-    rule("3. NATIONAL ANNUAL MEANS")
+    rule("4. NATIONAL ANNUAL MEANS")
     print("  The coherent signal is national, so this is the same question asked")
     print("  at the scale it lives, with no illusion of a large sample.")
 
@@ -260,7 +327,7 @@ def national_regression(df: pd.DataFrame, feats: list):
 
 
 def loo_linear(df: pd.DataFrame, feats: list, share: float):
-    rule("4. LEAVE-ONE-YEAR-OUT, LINEAR MODEL")
+    rule("5. LEAVE-ONE-YEAR-OUT, LINEAR MODEL")
     print("  Out-of-sample, but at a capacity the sample size supports. Compare")
     print("  this to the tree runs: if it is better, the trees were overfitting,")
     print("  not the features failing.")
@@ -340,6 +407,7 @@ def main():
     print(f"  features: {', '.join(feats)}")
 
     share = variance_decomposition(df)
+    effective_sample_size(df, feats)
     panel_regression(df, feats, share)
     national_regression(df, feats)
     loo_linear(df, feats, share)
@@ -357,7 +425,7 @@ def main():
   piece: season totals cannot separate a dry spell at flowering from the same
   deficit at maturity.
 
-  Section 4 vs the tree runs separates a model problem from a feature problem.""")
+  Section 5 vs the tree runs separates a model problem from a feature problem.""")
     return 0
 
 
