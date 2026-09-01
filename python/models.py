@@ -30,6 +30,7 @@ statistics are learned on training rows only.
 """
 
 import numpy as np
+from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.linear_model import ElasticNetCV, RidgeCV
 from sklearn.pipeline import Pipeline
@@ -43,8 +44,14 @@ SUPPORTED_MODELS = ["rf", "gbm", "xgb", "ridge", "enet"]
 RIDGE_ALPHAS = np.logspace(-3, 7, 41)
 
 
-class GroupedRidgeCV:
+class GroupedRidgeCV(RegressorMixin, BaseEstimator):
     """Ridge whose penalty is chosen by grouped CV, falling back to row-wise.
+
+    Inherits BaseEstimator so Pipeline can introspect it: from scikit-learn 1.6
+    `check_is_fitted` goes through `get_tags`, which needs `__sklearn_tags__`,
+    and a plain class raises AttributeError at predict time rather than at fit.
+    RegressorMixin goes first so BaseEstimator sits rightmost in the MRO, as
+    sklearn requires.
 
     Why not sklearn's RidgeCV directly: its default generalised CV holds out one
     ROW at a time, which assumes rows are independent. Seasonal climate features
@@ -65,28 +72,31 @@ class GroupedRidgeCV:
     """
 
     def __init__(self, alphas=RIDGE_ALPHAS, n_splits: int = 5):
-        self.alphas = np.asarray(alphas, dtype=float)
+        # Stored verbatim, not coerced: sklearn's get_params/clone contract is
+        # that __init__ records its arguments untouched.
+        self.alphas = alphas
         self.n_splits = n_splits
 
     def fit(self, X, y, groups=None):
         from sklearn.linear_model import Ridge
         X = np.asarray(X, dtype=float)
         y = np.asarray(y, dtype=float)
+        alphas = np.asarray(self.alphas, dtype=float)
 
         n_groups = 0 if groups is None else len(np.unique(groups))
         if groups is None or n_groups < 3:
-            base = RidgeCV(alphas=self.alphas).fit(X, y)
+            base = RidgeCV(alphas=alphas).fit(X, y)
             self.alpha_ = float(base.alpha_)
             self.n_groups_ = n_groups
         else:
             from sklearn.model_selection import GroupKFold
             splits = list(GroupKFold(n_splits=min(self.n_splits, n_groups)).split(X, y, groups))
-            err = np.zeros(len(self.alphas))
+            err = np.zeros(len(alphas))
             for tr, te in splits:
-                for i, a in enumerate(self.alphas):
+                for i, a in enumerate(alphas):
                     r = Ridge(alpha=a).fit(X[tr], y[tr])
                     err[i] += float(((y[te] - r.predict(X[te])) ** 2).sum())
-            self.alpha_ = float(self.alphas[int(np.argmin(err))])
+            self.alpha_ = float(alphas[int(np.argmin(err))])
             self.n_groups_ = n_groups
             self.cv_curve_ = err / len(y)
 
