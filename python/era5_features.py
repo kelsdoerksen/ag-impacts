@@ -687,7 +687,12 @@ def aggregate_blocks(lay: Layout, year, w, names, cal, fixed=None,
         ds = xr.concat(dsets, dim="time", data_vars="all",
                        combine_attrs="override") if len(dsets) > 1 else dsets[0]
         check_grid(ds, lay, w)
-        require_features(ds, names, lay, have[0])
+        # Per FILE, not on the concatenation: xr.concat fills a variable that is
+        # absent from one input with NaN, so checking the joined dataset would
+        # pass and the missing year would surface only as unexplained NaN rows.
+        # Stage-2 files written at different times can hold different --features.
+        for _y, _d in zip(have, dsets):
+            require_features(_d, names, lay, _y)
         times = pd.to_datetime(ds["time"].values)
 
         latest = max(b[-1][1] for b in windows.values())
@@ -847,7 +852,12 @@ def aggregate_season(lay: Layout, year, w, names, cal, fixed=None) -> pd.DataFra
         dsets = [stack.enter_context(open_nc(lay.features(y))) for y in have]
         ds = xr.concat(dsets, dim="time", data_vars="all", combine_attrs="override") if len(dsets) > 1 else dsets[0]
         check_grid(ds, lay, w)
-        require_features(ds, names, lay, have[0])
+        # Per FILE, not on the concatenation: xr.concat fills a variable that is
+        # absent from one input with NaN, so checking the joined dataset would
+        # pass and the missing year would surface only as unexplained NaN rows.
+        # Stage-2 files written at different times can hold different --features.
+        for _y, _d in zip(have, dsets):
+            require_features(_d, names, lay, _y)
         times = pd.to_datetime(ds["time"].values)
 
         # A window running off the end of what is loaded used to be warned about
