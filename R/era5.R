@@ -269,53 +269,24 @@ era5_relative_humidity <- function(temp_c, dewpoint_c) {
 #      the licence. Until you do, every request fails on licence terms.
 #   4. reticulate::virtualenv_install("r-reticulate", "cdsapi")
 
-# Download one month of hourly ERA5 over one AOI, returning the path to a
-# directory holding the netCDF(s) for that month. Months already in cache_dir
-# are reused, which is what makes an interrupted multi-year run cheap to resume.
+# Issue one CDS request and land it as a directory of netCDFs.
 #
-# A directory rather than a file because CDS decides how many files to send:
-# `download_format = "unarchived"` gets a plain netCDF for a single variable,
-# but a request mixing instantaneous variables (2m_temperature,
-# 2m_dewpoint_temperature) with accumulated ones (total_precipitation) always
-# comes back as a zip of two -- stepType-instant and stepType-accum -- because
-# the two have different time semantics. Both shapes are normalised to "a
-# directory of .nc files" here so open_cds_month() only has one case to handle.
-cds_month_nc <- function(aoi, year, month, cache_dir, verbose = TRUE) {
-  dest <- file.path(cache_dir, sprintf("era5_cds_%s_%d-%02d", aoi, year, month))
-  if (dir.exists(dest) && length(list.files(dest, pattern = "\\.nc$"))) {
-    if (verbose) cat("cached, ")
-    return(dest)
-  }
-
-  box   <- AOI_BOUNDS[[aoi]]
-  first <- as.Date(sprintf("%d-%02d-01", year, month))
-  ndays <- as.integer(format(seq(first, by = "month", length.out = 2L)[2] - 1, "%d"))
-
-  request <- list(
-    product_type    = "reanalysis",
-    variable        = as.list(ERA5_ML_VARS),
-    year            = as.character(year),
-    month           = sprintf("%02d", month),
-    day             = as.list(sprintf("%02d", seq_len(ndays))),
-    time            = as.list(sprintf("%02d:00", 0:23)),
-    # CDS wants the box as North, West, South, East, in -180..180 -- which is
-    # how AOI_BOUNDS already stores it, so no 0..360 conversion here.
-    area            = c(box$lat_max, box$lon_min, box$lat_min, box$lon_max),
-    data_format     = "netcdf",
-    download_format = "unarchived"
-  )
-
-  # Build the month under a temporary name and move it into place only once it
-  # is complete, so an interrupted transfer cannot leave a half-written
-  # directory that the cache check above would trust as a finished month.
+# Built under a temporary name and moved into place only once complete, so an
+# interrupted transfer cannot leave a half-written directory that a cache check
+# would trust as finished.
+.cds_fetch <- function(request, dest, label) {
   tmp <- paste0(dest, ".part")
   unlink(tmp, recursive = TRUE)
   dir.create(tmp, recursive = TRUE)
   on.exit(unlink(tmp, recursive = TRUE), add = TRUE)
 
   target <- file.path(tmp, "download")
-  cdsapi$Client()$retrieve(CDS_DATASET, request, target)
-  if (!file.exists(target)) stop("CDS retrieve returned no file for ", year, "-", month)
+  # retry_max defaults to 500, which is right for a flaky connection and badly
+  # wrong for a permanent rejection: a 403 "cost limits exceeded" was retried
+  # for the better part of an hour before surfacing. A handful of retries still
+  # rides out a network blip but lets a refusal through in minutes.
+  cdsapi$Client(retry_max = 5L)$retrieve(CDS_DATASET, request, target)
+  if (!file.exists(target)) stop("CDS retrieve returned no file for ", label)
 
   # Sniff the magic bytes rather than trusting the requested download_format.
   if (identical(readBin(target, "raw", 2L), as.raw(c(0x50, 0x4b)))) {  # "PK"
@@ -326,11 +297,216 @@ cds_month_nc <- function(aoi, year, month, cache_dir, verbose = TRUE) {
   }
 
   if (!length(list.files(tmp, pattern = "\\.nc$"))) {
-    stop("CDS returned no netCDF for ", year, "-", month)
+    stop("CDS returned no netCDF for ", label)
   }
   if (!dir.exists(dirname(dest))) dir.create(dirname(dest), recursive = TRUE)
   file.rename(tmp, dest)
   dest
+}
+
+.cds_area <- function(aoi) {
+  box <- AOI_BOUNDS[[aoi]]
+  # CDS wants the box as North, West, South, East, in -180..180 -- which is how
+  # AOI_BOUNDS already stores it, so no 0..360 conversion here.
+  c(box$lat_max, box$lon_min, box$lat_min, box$lon_max)
+}
+
+# Local solar time offset for an AOI, in whole hours: longitude / 15.
+#
+# Solar, not civil: the diurnal cycle that puts the minimum near sunrise and the
+# maximum mid-afternoon tracks the sun, not a government's time zone, and is
+# unaffected by daylight saving. One offset per AOI, because a per-pixel offset
+# would give every pixel a different day boundary and the result could no longer
+# be one daily raster with one time axis. That is exact for a country under an
+# hour of longitude wide (most of cy-bench) and leaves a residual at the edges
+# of a wide one -- CONUS spans 3.9 h, so its coasts keep about +/-2 h.
+era5_solar_offset <- function(aoi) {
+  box <- AOI_BOUNDS[[aoi]]
+  as.integer(round(((box$lon_min + box$lon_max) / 2) / 15))
+}
+
+# The single UTC day of padding a shifted block needs, or NULL if none.
+#
+# Shifting the hourly axis by +h means a local day begins h hours into the
+# previous UTC day, so an eastward AOI needs the UTC day *before* the block; a
+# westward one needs the day *after*. One day either way covers any offset, |h|
+# never exceeding 12.
+.era5_pad_date <- function(year, months, utc_offset) {
+  if (utc_offset == 0) return(NULL)
+  first <- as.Date(sprintf("%d-%02d-01", year, min(months)))
+  last  <- seq(as.Date(sprintf("%d-%02d-01", year, max(months))),
+               by = "month", length.out = 2L)[2] - 1
+  if (utc_offset > 0) first - 1 else last + 1
+}
+
+# One UTC day of hourly ERA5, as the pad for a shifted block. 3 variables x 24
+# hours = 72 fields, so it is a trivial request -- but it IS a request, and CDS
+# charges queue time per request, so it is cached under a name that the
+# per-year hourly cleanup does not match. Pads are a few hundred KB and get
+# reused by the next year, which is worth far more than the space.
+cds_pad_day_nc <- function(aoi, date, cache_dir, verbose = TRUE) {
+  dest <- file.path(cache_dir, sprintf("era5_cds_%s_pad_%s", aoi, format(date, "%Y%m%d")))
+  if (dir.exists(dest) && length(list.files(dest, pattern = "\\.nc$"))) return(dest)
+  if (verbose) cat(sprintf("+pad %s, ", format(date, "%Y-%m-%d")))
+
+  .cds_fetch(list(
+    product_type    = "reanalysis",
+    variable        = as.list(ERA5_ML_VARS),
+    year            = format(date, "%Y"),
+    month           = format(date, "%m"),
+    day             = format(date, "%d"),
+    time            = as.list(sprintf("%02d:00", 0:23)),
+    area            = .cds_area(aoi),
+    data_format     = "netcdf",
+    download_format = "unarchived"
+  ), dest, paste("pad", format(date)))
+}
+
+# Move the hourly time axis onto local solar time, so the daily resample that
+# follows bins local days rather than UTC days.
+.era5_shift_time <- function(ds, utc_offset) {
+  if (utc_offset == 0) return(ds)
+  ds$assign_coords(time = ds[["time"]] + np$timedelta64(as.integer(utc_offset), "h"))
+}
+
+# Keep only whole local days belonging to this block. Shifting leaves a partial
+# day hanging off the far end from the pad, which would otherwise be written as
+# a real day built from a fraction of its hours.
+.era5_keep_dates <- function(rasters, from, to) {
+  lapply(rasters, function(r) {
+    keep <- which(time(r) >= from & time(r) <= to)
+    out  <- r[[keep]]
+    time(out) <- time(r)[keep]
+    out
+  })
+}
+
+# Cache directory name for one request's worth of months. A single month keeps
+# the original {year}-{mm} spelling, so caches written before request batching
+# existed are still found and never re-downloaded; a run adds its last month.
+# Both match era5-aoi.R's "^era5_cds_{aoi}_{year}-" discard pattern.
+.cds_dir_name <- function(aoi, year, months) {
+  if (length(months) == 1) sprintf("era5_cds_%s_%d-%02d", aoi, year, months)
+  else sprintf("era5_cds_%s_%d-%02d-%02d", aoi, year, min(months), max(months))
+}
+
+.cds_label <- function(year, months) {
+  if (length(months) == 1) sprintf("%d-%02d", year, months)
+  else sprintf("%d-%02d..%02d", year, min(months), max(months))
+}
+
+# How many months to ask for in one request, from the AOI's size.
+#
+# Waiting is per request; processing is per byte. So the span is made as large
+# as memory allows: era5_month_rasters() holds several intermediates of the
+# hourly array at once for the humidity calculation, so the raw block is capped
+# near `budget` and the peak lands around four times that.
+#
+# CONUS comes out at 1 month, which is exactly what this did before spans
+# existed; a country the size of Burkina Faso comes out at 12, collapsing a
+# whole year into a single request.
+.cds_auto_span <- function(aoi, budget = 250e6) {
+  box   <- AOI_BOUNDS[[aoi]]
+  ncell <- ceiling((box$lon_max - box$lon_min) / 0.25) *
+           ceiling((box$lat_max - box$lat_min) / 0.25)
+  per_month <- 744 * ncell * 4 * length(ERA5_ML_VARS)   # hours x cells x float32 x vars
+  max(1L, min(12L, as.integer(floor(budget / per_month))))
+}
+
+# Split a year into the runs of months that will each become one CDS request.
+#
+# Months already cached on their own -- from a run predating batching, or one
+# interrupted partway -- are emitted as single-month groups, so a resumed year
+# reuses them instead of paying to fetch them again inside a larger run.
+.cds_plan_groups <- function(aoi, year, cache_dir, span) {
+  have <- vapply(1:12, function(m) {
+    d <- file.path(cache_dir, .cds_dir_name(aoi, year, m))
+    dir.exists(d) && length(list.files(d, pattern = "\\.nc$")) > 0
+  }, logical(1))
+
+  groups <- list()
+  run    <- integer(0)
+  for (m in 1:12) {
+    if (have[m]) {
+      if (length(run)) { groups <- c(groups, list(run)); run <- integer(0) }
+      groups <- c(groups, list(m))
+    } else {
+      run <- c(run, m)
+      if (length(run) >= span) { groups <- c(groups, list(run)); run <- integer(0) }
+    }
+  }
+  if (length(run)) groups <- c(groups, list(run))
+  groups
+}
+
+# Download a run of consecutive months of hourly ERA5 over one AOI, returning
+# the path to a directory holding the netCDF(s) for them. Runs already in
+# cache_dir are reused, which is what makes an interrupted multi-year run cheap
+# to resume.
+#
+# WHY A RUN AND NOT A MONTH. CDS charges queue time per *request*, not per byte:
+# a measured Burkina Faso year spent 18-20 minutes waiting for every 2 minutes
+# of actual processing, whatever the month. Asking for twelve months in one
+# request therefore costs about what one month costs, and turns a year from
+# twelve waits into one. The only thing bounding the span is memory during the
+# daily reduction -- see .cds_auto_span().
+#
+# A directory rather than a file because CDS decides how many files to send:
+# `download_format = "unarchived"` gets a plain netCDF for a single variable,
+# but a request mixing instantaneous variables (2m_temperature,
+# 2m_dewpoint_temperature) with accumulated ones (total_precipitation) always
+# comes back as a zip of two -- stepType-instant and stepType-accum -- because
+# the two have different time semantics. Both shapes are normalised to "a
+# directory of .nc files" here so open_cds_month() only has one case to handle.
+cds_period_nc <- function(aoi, year, months, cache_dir, verbose = TRUE) {
+  months <- sort(as.integer(months))
+  dest <- file.path(cache_dir, .cds_dir_name(aoi, year, months))
+  if (dir.exists(dest) && length(list.files(dest, pattern = "\\.nc$"))) {
+    if (verbose) cat("cached, ")
+    return(dest)
+  }
+
+  # The longest month in the run. CDS drops date combinations that do not exist
+  # (31 February and so on) rather than failing, so asking every month for the
+  # same day list is safe -- and for a single month this is exactly the day
+  # count the per-month version used, so that path is unchanged.
+  ndays <- max(vapply(months, function(m) {
+    first <- as.Date(sprintf("%d-%02d-01", year, m))
+    as.integer(format(seq(first, by = "month", length.out = 2L)[2] - 1, "%d"))
+  }, integer(1)))
+
+  request <- list(
+    product_type    = "reanalysis",
+    variable        = as.list(ERA5_ML_VARS),
+    year            = as.character(year),
+    month           = as.list(sprintf("%02d", months)),
+    day             = as.list(sprintf("%02d", seq_len(ndays))),
+    time            = as.list(sprintf("%02d:00", 0:23)),
+    # CDS wants the box as North, West, South, East, in -180..180 -- which is
+    # how AOI_BOUNDS already stores it, so no 0..360 conversion here.
+    area            = .cds_area(aoi),
+    data_format     = "netcdf",
+    download_format = "unarchived"
+  )
+
+  # CDS enforces a per-request cost limit, and rejects anything over it with a
+  # 403 rather than trimming it. The ceiling is not documented per dataset and
+  # differs by account, so rather than hard-coding a guess, an over-large run is
+  # halved and retried until it fits. Each half is cached under its own name, so
+  # the discovery is paid for once and the next year reuses the working size.
+  out <- tryCatch(.cds_fetch(request, dest, .cds_label(year, months)),
+                  error = function(e) {
+    msg <- conditionMessage(e)
+    too_big <- grepl("cost limit|too large|request is too", msg, ignore.case = TRUE)
+    if (!too_big || length(months) < 2) stop(e)
+    mid <- length(months) %/% 2
+    cat(sprintf("\n    CDS refused %d months as too large; splitting into %d + %d\n",
+                length(months), mid, length(months) - mid))
+    flush(stdout())
+    c(cds_period_nc(aoi, year, months[seq_len(mid)], cache_dir, verbose),
+      cds_period_nc(aoi, year, months[-seq_len(mid)], cache_dir, verbose))
+  })
+  out
 }
 
 # The smallest real request there is: one variable, one hour, a 1x1 degree box.
@@ -388,6 +564,18 @@ open_cds_month <- function(nc_dir) {
 }
 
 
+# Open one or more cached CDS directories as a single hourly dataset.
+#
+# cds_period_nc() returns more than one directory when a run had to be split to
+# fit the per-request cost limit. Those pieces are consecutive in time and share
+# a grid, so they concatenate; sortby makes the result independent of the order
+# the pieces came back in.
+open_cds_dirs <- function(dirs) {
+  parts <- lapply(dirs, open_cds_month)
+  if (length(parts) == 1) parts[[1]] else xr$concat(parts, dim = "time")$sortby("time")
+}
+
+
 # ===== DAILY RASTERS =====
 
 # Daily tasmax/tasmin/hursmin/pr for one month of hourly data. Takes an xarray
@@ -430,19 +618,40 @@ era5_month_rasters <- function(ds) {
 #          hour regardless of AOI: ~50 GB and several hours per CONUS year.
 era5_daily_rasters <- function(aoi, year, source = c("cds", "arco"),
                                cds_cache_dir = file.path("era5_cds_cache", aoi),
-                               verbose = TRUE) {
+                               verbose = TRUE, months_per_request = NULL,
+                               utc_offset = 0L) {
   source <- match.arg(source)
+  utc_offset <- as.integer(utc_offset)
 
-  # Walk the year one month at a time rather than selecting it in one go.
-  # A CONUS year of hourly ERA5 is ~830 MB per variable, and the humidity
-  # calculation holds several intermediates of that size at once, so the
-  # whole-year form needs many GB before it produces its first number. Only the
-  # daily aggregates (a few hundred layers, ~35 MB per variable) are kept, so
-  # month blocks bound memory to a twelfth of that. They are also the unit CDS
-  # queues requests in, and they give a slow download something to report
-  # progress against.
+  # Walk the year in blocks rather than selecting it in one go. A CONUS year of
+  # hourly ERA5 is ~830 MB per variable and the humidity calculation holds
+  # several intermediates of that size at once, so the whole-year form needs
+  # many GB before it produces its first number. Only the daily aggregates (a
+  # few hundred layers, ~35 MB per variable) are kept, so blocks bound memory.
+  #
+  # How big a block is depends on the source, because their costs are shaped
+  # differently. CDS charges a long queue wait per request and almost nothing
+  # for size, so blocks are made as large as memory allows and a small country
+  # becomes one request for the whole year. ARCO has no queue at all but
+  # transfers a global field per hour regardless of AOI, so its cost is purely
+  # per byte and there is nothing to gain by batching -- it stays monthly, which
+  # also keeps a slow transfer reporting progress twelve times a year.
   month_starts <- as.Date(sprintf("%d-%02d-01", year, 1:12))
   month_ends   <- c(month_starts[-1], as.Date(sprintf("%d-01-01", year + 1))) - 1
+
+  span <- if (source == "arco") 1L
+          else if (is.null(months_per_request)) .cds_auto_span(aoi)
+          else max(1L, min(12L, as.integer(months_per_request)))
+  groups <- if (source == "arco") as.list(1:12)
+            else .cds_plan_groups(aoi, year, cds_cache_dir, span)
+  if (verbose && source == "cds") {
+    cat(sprintf("  %d CDS request(s) for %d, up to %d month(s) each%s\n",
+                length(groups), year, span,
+                if (utc_offset == 0) "" else
+                  sprintf(" (+1 pad day each, local solar time UTC%+d)", utc_offset)))
+  } else if (verbose && utc_offset != 0) {
+    cat(sprintf("  local solar time UTC%+d\n", utc_offset))
+  }
 
   if (source == "arco") {
     # chunks = list(time = 24) hands the read to dask so those per-hour global
@@ -455,22 +664,42 @@ era5_daily_rasters <- function(aoi, year, source = c("cds", "arco"),
     ds_all <- keep_variables(ds_all, ERA5_ML_VARS)
   }
 
-  blocks <- lapply(seq_along(month_starts), function(m) {
-    if (verbose) cat(sprintf("  ERA5 %s (%s) ... ", format(month_starts[m], "%Y-%m"), source))
+  blocks <- lapply(groups, function(ms) {
+    if (verbose) cat(sprintf("  ERA5 %s (%s) ... ", .cds_label(year, ms), source))
     t0 <- Sys.time()
 
+    want_from <- month_starts[min(ms)]
+    want_to   <- month_ends[max(ms)]
+    pad_date  <- .era5_pad_date(year, ms, utc_offset)
+
     ds <- if (source == "arco") {
-      crop_to_aoi(ds_all$sel(time = py$slice(format(month_starts[m]),
-                                             format(month_ends[m]))), aoi)
+      # ARCO slices arbitrary time ranges, so the padding a shift needs is just
+      # a wider window -- no extra request, because there are no requests.
+      lo <- if (is.null(pad_date)) want_from else min(want_from, pad_date)
+      hi <- if (is.null(pad_date)) want_to   else max(want_to,   pad_date)
+      crop_to_aoi(ds_all$sel(time = py$slice(format(lo), format(hi))), aoi)
     } else {
-      open_cds_month(cds_month_nc(aoi, year, m, cds_cache_dir, verbose))
+      main <- open_cds_dirs(cds_period_nc(aoi, year, ms, cds_cache_dir, verbose))
+      if (is.null(pad_date)) main else {
+        pad <- open_cds_dirs(cds_pad_day_nc(aoi, pad_date, cds_cache_dir, verbose))
+        # sortby rather than relying on concat order, so this is correct whether
+        # the pad belongs before the block (eastward) or after it (westward).
+        xr$concat(list(main, pad), dim = "time")$sortby("time")
+      }
     }
 
+    ds  <- .era5_shift_time(ds, utc_offset)
     out <- era5_month_rasters(ds)
+    # Drop the partial local day the shift leaves hanging off the far end.
+    out <- .era5_keep_dates(out, want_from, want_to)
 
     if (verbose) {
       cat(sprintf("%d days, %.1f min\n", nlyr(out$tasmax),
                   as.numeric(difftime(Sys.time(), t0, units = "mins"))))
+      # Flush per block, so a redirected log reports progress as it happens
+      # rather than a buffer at a time -- the difference between watching a run
+      # and guessing at it.
+      flush(stdout())
     }
     out
   })

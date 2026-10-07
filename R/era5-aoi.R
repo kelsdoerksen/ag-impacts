@@ -161,11 +161,22 @@ era5_resolve_out_dir <- function(aoi_tag, out_flag = "", model = "ERA5") {
 # so a complete year is exactly that day sequence; a layer count that disagrees
 # means the cached file is not a whole year and is treated as unusable rather
 # than silently mislabelled.
+# Filename marker for the time convention a cached year was built on. UTC gets
+# no marker, so every file written before local time existed is still found and
+# reused; a shifted year gets "_lst+03" and lands beside it rather than on top
+# of it. Mixing the two inside one daily_grids would be silent and wrong, so it
+# is made impossible rather than merely discouraged.
+era5_time_tag <- function(utc_offset) {
+  if (as.integer(utc_offset) == 0L) "" else sprintf("_lst%+03d", as.integer(utc_offset))
+}
+
 era5_year_rasters <- function(aoi, year, cache_dir, aoi_tag = aoi,
-                              source = "cds", cds_dir = NULL, keep_hourly = FALSE) {
+                              source = "cds", cds_dir = NULL, keep_hourly = FALSE,
+                              months_per_request = NULL, utc_offset = 0L) {
   dates <- seq(as.Date(sprintf("%d-01-01", year)),
                as.Date(sprintf("%d-12-31", year)), by = "day")
-  paths <- file.path(cache_dir, sprintf("era5_%s_%s_%d.tif", ERA5_VARS, aoi_tag, year))
+  paths <- file.path(cache_dir, sprintf("era5_%s_%s_%d%s.tif", ERA5_VARS, aoi_tag, year,
+                                        era5_time_tag(utc_offset)))
   names(paths) <- ERA5_VARS
 
   if (all(file.exists(paths))) {
@@ -181,7 +192,9 @@ era5_year_rasters <- function(aoi, year, cache_dir, aoi_tag = aoi,
   cat("Fetching ERA5", year, "for AOI", aoi, "via", source,
       "- one month at a time:\n")
   t0 <- Sys.time()
-  clim <- era5_daily_rasters(aoi, year, source = source, cds_cache_dir = cds_dir)
+  clim <- era5_daily_rasters(aoi, year, source = source, cds_cache_dir = cds_dir,
+                             months_per_request = months_per_request,
+                             utc_offset = utc_offset)
   cat(sprintf("ERA5 %d downloaded in %.1f min\n", year,
               as.numeric(difftime(Sys.time(), t0, units = "mins"))))
 

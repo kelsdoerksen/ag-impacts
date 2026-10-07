@@ -397,6 +397,18 @@ def load_weights(lay: Layout, weighting: str) -> pd.DataFrame:
     # dropping these is exact, not an approximation -- it just avoids carrying
     # the pixels through every array op.
     w = w[w["w"] > 0].copy()
+    # row/col are grid indices and get used to index numpy arrays directly, so
+    # they have to be an integer dtype. They arrive as float64: terra returns an
+    # NA cell for a polygon lying outside the raster (the "clipped" units the
+    # grid manifest counts), arrow stores the column as a nullable int, and
+    # pandas reads that back as float. Filtering on weight already removes those
+    # rows -- NaN > 0 is False -- but the dtype stays float, and numpy refuses a
+    # float index. Drop any survivors defensively, then cast.
+    idx = ["row", "col", "cell"]
+    bad = w[idx].isna().any(axis=1)
+    if bad.any():
+        w = w[~bad].copy()
+    w[idx] = w[idx].astype("int64")
     # Contiguous groups let the whole aggregation run as one reduceat rather
     # than a per-unit Python loop.
     w.sort_values(["adm2_id", "cell"], inplace=True)

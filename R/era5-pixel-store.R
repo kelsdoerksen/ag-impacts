@@ -36,6 +36,7 @@
 #   Rscript R/era5-pixel-store.R --aoi=ZM --check         # prove the setup works
 #   Rscript R/era5-pixel-store.R --aoi=ZM --grid-only     # weights only, no cubes
 #   Rscript R/era5-pixel-store.R --aoi=CONUS --source=cds 2000-2024
+#   Rscript R/era5-pixel-store.R --aoi=BF --months-per-request=3 2001-2019
 #
 # LAYOUT under {out_dir}  (default {AGIMPACTS_ROOT}/{AOI}_processed_data/ERA5)
 #
@@ -100,6 +101,26 @@ era5_keep_hourly <- FALSE
 era5_source  <- era5_take_flag("source", era5_source)
 era5_aoi_tag <- era5_take_flag("aoi", era5_aoi_tag)
 .out_flag    <- era5_take_flag("out", "")
+# Months per CDS request. Unset means size it from the AOI: the queue wait is
+# per request and dwarfs the work, so a small country asks for a whole year at
+# once while CONUS still goes month by month to bound memory.
+era5_months_per_request <- era5_take_flag("months-per-request", "")
+era5_months_per_request <- if (nzchar(era5_months_per_request)) {
+  as.integer(era5_months_per_request)
+} else NULL
+
+# Time convention for the daily reduction. ERA5 is hourly on UTC and the daily
+# resample bins whatever axis it is given, so by default a "day" is a UTC day.
+# --local-time shifts the hourly axis onto local solar time first, so tasmax and
+# tasmin are the local day's extremes -- which is what they are meant to be, and
+# what matters for degree days. Opt-in, because switching it on changes the
+# numbers: years already downloaded stay UTC unless refetched.
+#   --local-time        solar offset from the AOI's centre longitude
+#   --utc-offset=N      an explicit whole-hour offset instead
+.local_time  <- "--local-time" %in% .args
+.args        <- setdiff(.args, "--local-time")
+.tz_flag     <- era5_take_flag("utc-offset", "")
+era5_utc_offset <- if (nzchar(.tz_flag)) as.integer(.tz_flag) else 0L
 if (length(.args)) era5_years <- era5_parse_years(.args)
 
 if (!era5_source %in% c("cds", "arco")) {
@@ -112,6 +133,12 @@ if (!era5_aoi_tag %in% names(ERA5_AOIS)) {
 
 era5_cfg <- ERA5_AOIS[[era5_aoi_tag]]
 era5_aoi <- era5_cfg$era5_key
+
+if (.local_time) {
+  if (nzchar(.tz_flag)) stop("use either --local-time or --utc-offset=, not both")
+  era5_utc_offset <- era5_solar_offset(era5_aoi)
+}
+if (abs(era5_utc_offset) > 12L) stop("--utc-offset must be between -12 and 12")
 
 era5_out_dir   <- era5_resolve_out_dir(era5_aoi_tag, .out_flag, era5_model)
 era5_cache_dir <- file.path(era5_out_dir, "daily_grids")
@@ -262,6 +289,7 @@ era5_build_grid <- function(cfg, aoi_tag, ref_rast, grid_dir, overwrite = FALSE)
     n_cells_used   = nrow(cells),
     units_no_crop  = length(empty),
     units_clipped  = sum(clipped),
+    utc_offset     = as.integer(era5_utc_offset),
     vars           = unname(vapply(ERA5_VARS, function(v) ERA5_UNIT_CONV[[v]]$name, "")),
     var_units      = unname(vapply(ERA5_VARS, function(v) ERA5_UNIT_CONV[[v]]$unit, "")),
     cropland_raster = harv_tif,
@@ -308,9 +336,33 @@ era5_nc_is_complete <- function(path, varnames, ndays) {
 # cache stays in era5.R's raw units (Kelvin, precip flux) because that is what
 # era5-sample-gen.R's extraction expects; the conversion happens here, once, on
 # the way out, so the feature stage never has to think about it.
-era5_write_pixel_year <- function(clim, year, aoi_tag, nc_dir, overwrite = FALSE) {
+# The time convention a cube was written on, from its global attributes. A cube
+# with no such attribute predates local time and is therefore UTC.
+era5_nc_utc_offset <- function(path) {
+  if (!file.exists(path) || !requireNamespace("ncdf4", quietly = TRUE)) return(NA_integer_)
+  nc <- tryCatch(ncdf4::nc_open(path), error = function(e) NULL)
+  if (is.null(nc)) return(NA_integer_)
+  on.exit(ncdf4::nc_close(nc), add = TRUE)
+  a <- tryCatch(ncdf4::ncatt_get(nc, 0, "era5_utc_offset"),
+                error = function(e) list(hasatt = FALSE))
+  if (isTRUE(a$hasatt)) as.integer(a$value) else 0L
+}
+
+era5_write_pixel_year <- function(clim, year, aoi_tag, nc_dir, overwrite = FALSE,
+                                  utc_offset = 0L) {
   out_nc <- file.path(nc_dir, sprintf("era5_pixel_%s_%d.nc", aoi_tag, year))
   if (file.exists(out_nc) && !overwrite) {
+    # The cube filename carries no time tag, because the Python feature stage
+    # looks it up by name. So the convention is checked instead of encoded: a
+    # cube built on a different one is a hard error, never a silent skip.
+    have <- era5_nc_utc_offset(out_nc)
+    if (!is.na(have) && have != as.integer(utc_offset)) {
+      stop(sprintf(paste0("%s already exists but was built on UTC%+d, and this run is ",
+                          "UTC%+d.\nMixing time conventions in one pixel_daily would be ",
+                          "silent and wrong. Re-run with --overwrite to replace it, or ",
+                          "point --out at a separate tree."),
+                   basename(out_nc), have, as.integer(utc_offset)), call. = FALSE)
+    }
     cat("Cube already exists, skipping:", basename(out_nc), "\n")
     return(invisible(out_nc))
   }
@@ -338,6 +390,9 @@ era5_write_pixel_year <- function(clim, year, aoi_tag, nc_dir, overwrite = FALSE
   # truncated .nc that looks complete to the skip check above. The .nc extension
   # is kept on the scratch name -- writeCDF picks its driver from it.
   part <- file.path(nc_dir, sprintf(".era5_pixel_%s_%d.part.nc", aoi_tag, year))
+  atts <- c(sprintf("era5_utc_offset=%d", as.integer(utc_offset)),
+            sprintf("era5_time_convention=%s",
+                    if (utc_offset == 0) "UTC day" else "local solar day"))
 
   # terra::writeCDF() writes the file through ncdf4 and then re-opens it with
   # sds() purely to build its return value. That read goes through GDAL, which
@@ -348,7 +403,7 @@ era5_write_pixel_year <- function(clim, year, aoi_tag, nc_dir, overwrite = FALSE
   # library that wrote it, and a hard dependency of writeCDF) rather than
   # letting a missing GDAL plugin end an overnight run.
   ok <- tryCatch({
-    writeCDF(d, filename = part, overwrite = TRUE, compression = 6)
+    writeCDF(d, filename = part, overwrite = TRUE, compression = 6, atts = atts)
     TRUE
   }, error = function(e) {
     if (era5_nc_is_complete(part, names(layers), length(dates))) {
@@ -426,12 +481,16 @@ era5_pixel_main <- function() {
   cat("  AOI:        ", era5_aoi_tag, "(bbox", era5_aoi, ")\n")
   cat("  Years:      ", paste(era5_years, collapse = ", "), "\n")
   cat("  Source:     ", era5_source, "\n")
+  cat("  Day:        ", if (era5_utc_offset == 0) "UTC" else
+        sprintf("local solar (UTC%+d)", era5_utc_offset), "\n")
   cat("  Output dir: ", era5_out_dir, "\n\n")
 
   get_year <- function(y) {
     era5_year_rasters(era5_aoi, y, era5_cache_dir, aoi_tag = era5_aoi_tag,
                       source = era5_source, cds_dir = era5_cds_dir,
-                      keep_hourly = era5_keep_hourly)
+                      keep_hourly = era5_keep_hourly,
+                      months_per_request = era5_months_per_request,
+                      utc_offset = era5_utc_offset)
   }
 
   # The first year does double duty: it supplies the grid template the weight
@@ -446,13 +505,15 @@ era5_pixel_main <- function() {
     return(invisible(NULL))
   }
 
-  era5_write_pixel_year(clim, first, era5_aoi_tag, era5_nc_dir, overwrite = .overwrite)
+  era5_write_pixel_year(clim, first, era5_aoi_tag, era5_nc_dir, overwrite = .overwrite,
+                        utc_offset = era5_utc_offset)
   rm(clim); gc()
 
   for (y in era5_years[-1]) {
     clim <- get_year(y)
     era5_assert_grid(clim[[1]][[1]], man$grid, sprintf("the %d daily grids", y))
-    era5_write_pixel_year(clim, y, era5_aoi_tag, era5_nc_dir, overwrite = .overwrite)
+    era5_write_pixel_year(clim, y, era5_aoi_tag, era5_nc_dir, overwrite = .overwrite,
+                          utc_offset = era5_utc_offset)
     rm(clim); gc()
   }
 
@@ -460,6 +521,44 @@ era5_pixel_main <- function() {
   cat("Next:  python/era5_features.py --aoi=", era5_aoi_tag, " --stage=features\n", sep = "")
 }
 
+# R buffers stdout when it is redirected to a file, so an error raised deep in a
+# long run can be lost entirely if the process ends before the buffer is
+# flushed -- which is exactly how this pipeline's first failures presented: a
+# log that simply stops mid-request with no message. Catching it here and
+# flushing explicitly means the reason always reaches the log, whatever it was.
+.era5_die <- function(e) {
+  msg <- tryCatch(conditionMessage(e), error = function(...) "<condition message unreadable>")
+  cls <- tryCatch(paste(class(e), collapse = "/"), error = function(...) "?")
+
+  # Two independent records, because each can fail on its own. The file is
+  # written through its own connection and closed immediately, so it survives
+  # both stdout buffering and a handler that dies partway; the console copy is
+  # what shows up in the driver log when everything behaves. useBytes guards
+  # against a message carrying bytes that would make a normal write throw --
+  # which is the likeliest reason an earlier failure left no trace at all.
+  try({
+    con <- file(file.path(era5_out_dir, "last_error.txt"), open = "wt")
+    writeLines(c(format(Sys.time()), paste("condition:", cls), msg), con, useBytes = TRUE)
+    close(con)
+  }, silent = TRUE)
+  try({
+    cat("\n", strrep("!", 70), "\nERROR [", cls, "]: ", msg, "\n",
+        strrep("!", 70), "\n", sep = "")
+    flush(stdout())
+  }, silent = TRUE)
+  quit(status = 1, save = "no")
+}
+
 if (sys.nframe() == 0L) {
-  if (.check_only) era5_check() else era5_pixel_main()
+  # `condition`, not just `error`: the last failure exited 1 without tripping an
+  # error handler at all, so anything that can end the run -- including a
+  # non-error condition -- gets recorded rather than vanishing.
+  withCallingHandlers(
+    tryCatch({
+      if (.check_only) era5_check() else era5_pixel_main()
+    }, error = .era5_die),
+    condition = function(c) {
+      if (inherits(c, c("message", "warning", "restart"))) return(invisible(NULL))
+      if (!inherits(c, "error")) .era5_die(c)
+    })
 }

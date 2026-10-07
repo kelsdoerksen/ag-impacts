@@ -332,6 +332,42 @@ python python/run_loo_experiment.py --climate_model ERA5 --ens_member obs \
 
 ---
 
+## 9b. How many CDS requests a year costs
+
+CDS charges **queue time per request, not per byte**. Measured on a real
+Burkina Faso run:
+
+```
+accepted → running     18-20 min     queue wait
+running  → successful      2 min     actual work
+```
+
+So a request for one month and a request for twelve cost about the same. The
+downloader therefore asks for as many months at once as memory allows, sized
+automatically from the AOI's cell count (`.cds_auto_span()` in `era5.R`):
+
+| AOI | cells | months/request | requests/year |
+|---|---|---|---|
+| CONUS, BR, AU | 23k–32k | 1 | 12 (unchanged) |
+| IN | 12k | 2 | 6 |
+| ET | 2.8k | 10 | 2 |
+| ZM, BF, ML, SN, MG | 0.2k–2.2k | 12 | **1** |
+
+For a small country that is a 12× reduction in queue waits — a year drops from
+roughly four hours to under one. Override with `--months-per-request=N` if you
+need to (N=1 restores the old behaviour).
+
+**Resuming is unaffected.** Months already cached individually — from a run that
+predates batching, or one interrupted partway — are reused as-is, and only the
+gaps are re-requested. A year with months 1–5 on disk becomes five cache hits
+plus one request for 6–12.
+
+**ARCO ignores all of this.** It has no queue but transfers a global field per
+hour regardless of AOI, so its cost is purely per byte and batching buys
+nothing; it stays monthly. That also makes ARCO the better source for large
+AOIs and for anything run while CDS is throttling you — it has no per-account
+fair-share penalty at all.
+
 ## 10. Per-pixel features (the other pipeline)
 
 ### Why
