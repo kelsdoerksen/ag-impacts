@@ -355,7 +355,25 @@ load_us_boundaries <- function(shp_path) {
 # is the reconstructed parent code {CC}-A1-{AA} -- both are codes, not names.
 # adm_id is also the join key to the cy-bench yield csvs.
 load_cybench_boundaries <- function(shp_path) {
-  regions <- st_read(shp_path, quiet = TRUE) %>%
+  regions <- st_read(shp_path, quiet = TRUE)
+  # Brazil's shapefile ships without a .prj, so its CRS reads as missing and
+  # st_transform() refuses it. Its coordinates are plain degrees, and
+  # tools/build-cybench-aois.R already assumed WGS84 when it derived the
+  # bounding box -- recorded as crs_assumed in cybench-aois.json. Assume the
+  # same thing here rather than failing, so the AOI and its registry entry agree
+  # on what the numbers mean. Anything already carrying a CRS is untouched.
+  if (is.na(sf::st_crs(regions))) {
+    rng <- as.numeric(sf::st_bbox(regions))
+    if (all(abs(rng[c(1, 3)]) <= 180) && all(abs(rng[c(2, 4)]) <= 90)) {
+      sf::st_crs(regions) <- 4326
+      message("note: ", basename(shp_path), " has no CRS; assuming EPSG:4326 ",
+              "(matches cybench-aois.json's crs_assumed)")
+    } else {
+      stop(basename(shp_path), " has no CRS and its coordinates are not degrees; ",
+           "cannot assume EPSG:4326", call. = FALSE)
+    }
+  }
+  regions <- regions %>%
     st_transform(crs = 4326) %>%
     mutate(
       adm2_id = adm_id,
