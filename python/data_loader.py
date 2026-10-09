@@ -7,30 +7,27 @@ Expected files in data_dir:
             resolution" below for every convention accepted)
   Crop:     crop_{crop}_{aoi}.parquet
 
-Two feature modes
------------------
-aggregated
-    One row per (adm2_id, hindcast_start).
-    Features = mean, std, and (for pr_mm) sum of each weather variable
-    computed over the seasonal window using date arithmetic:
-        [plant_start_date − preseason_buffer days,
-         harvest_end_date + postharvest_buffer days]
+Feature modes
+-------------
+Both read a design matrix that stage 3 has already built, so the feature
+definition lives in python/era5_features.py and this module only joins it to
+the yield targets. Features are computed per pixel and only then averaged over
+cropland -- see the README for why that ordering is the whole point.
 
-timeseries
-    One row per (adm2_id, hindcast_start).
-    Features = daily values of each weather variable from Nov 1 of the
-    hindcast_start year through Nov 1 of the yield year (~365 columns per
-    variable), named  {var}_d{NNN:03d}  (NNN = 1-based day offset from Nov 1).
-    Missing days are forward-filled then backward-filled within each
-    county-year so no NaN values remain in the feature block.
+pixel
+    One row per (adm2_id, harvest_year). Features are whole-season totals or
+    means per climate variable, from features_{AOI}_{...}_season_{year}.parquet.
+
+pixel_blocks
+    The same, split into consecutive season-relative windows, giving one column
+    per feature per block (gdd_m01, pr_m04, ...). A season total cannot separate
+    a dry spell at flowering from the same shortfall at maturity; blocks can.
 
 Public API
 ----------
 load_and_prepare(...)      → (adm2_df, feature_cols)   ready for sklearn
-load_crop_climate_data(…)  → daily DataFrame            raw merged daily data
-aggregate_daily(daily_df)  → (adm2_df, weather_cols)   seasonal aggregation
-build_features(adm2_df, …) → (adm2_df, feature_cols)   drop-NaN step
-build_timeseries_features  → (adm2_df, feature_cols)   pivoted daily features
+load_pixel_season_features → (adm2_df, feature_cols)   stage-3 design matrix
+load_pixel_daily(...)      → daily DataFrame            stage-2 per-pixel series
 available_crops(data_dir, aoi) → list[str]
 parse_climate_vars(str)    → list[str]                 --climate_vars parsing
 history_leak_mask(...)     → ndarray (N, L) bool       held-out labels in history
@@ -64,11 +61,12 @@ def draw_seed() -> int:
     return secrets.randbelow(SEED_MAX) + 1
 
 WEATHER_VARS    = ["tasmax_C", "tasmin_C", "hursmin", "pr_mm"]
-FEATURE_MODES   = ["aggregated", "timeseries", "agro", "pixel", "pixel_blocks"]
+FEATURE_MODES   = ["pixel", "pixel_blocks"]
 
-# ── agronomic ("agro") feature mode ──────────────────────────────────────────
-# A deliberately small, physically-motivated feature set for isolating climate
-# skill, in place of the generic mean/std block of "aggregated" mode.
+# ── degree-day defaults ──────────────────────────────────────────────────────
+# Defaults for the degree-day features, mirrored by era5_features.py's registry
+# so a run that overrides them here and a stage-2 cube built elsewhere cannot
+# disagree silently.
 #
 # Growing and extreme degree days both use the single-sine method from
 # degree_days.py -- the day's heat integrated under a sine diurnal cycle between
@@ -632,36 +630,6 @@ def find_climate_file(data_dir: str, climate_model: str, year: int,
     )
 
 
-def find_climate_files(data_dir: str, climate_model: str,
-                       ens_member: str = "r1i4p1f1", aoi: str = "CONUS",
-                       forecast_year: int = 1,
-                       hindcast_years: list | None = None) -> list[str]:
-    """Locate the climate parquets for a whole series, one per hindcast year.
-
-    With hindcast_years given, each year is resolved individually (so a series
-    whose naming changed partway through still loads). Without it, every file
-    in the folder belonging to this AOI is returned.
-    """
-    if hindcast_years is not None:
-        return [find_climate_file(data_dir, climate_model, y, ens_member,
-                                  aoi, forecast_year)
-                for y in sorted(hindcast_years)]
-
-    cdir  = climate_dir(data_dir, climate_model, forecast_year)
-    found = {}
-    for pattern in climate_name_candidates(
-            climate_model, ens_member, aoi, forecast_year, year="*"):
-        for path in sorted(glob.glob(os.path.join(cdir, pattern))):
-            # First (most specific) pattern to claim a year wins.
-            found.setdefault(_parse_hindcast_year(path), path)
-    if not found:
-        raise FileNotFoundError(
-            f"No climate parquets for AOI {aoi!r} in {cdir!r}.\n"
-            f"  Present in that directory:\n{_climate_dir_listing(cdir)}"
-        )
-    return [found[y] for y in sorted(found)]
-
-
 def available_crops(data_dir: str, aoi: str = "CONUS") -> list[str]:
     """List crop names that have a crop_{name}_{aoi}.parquet in data_dir."""
     files = glob.glob(os.path.join(data_dir, f"crop_*_{aoi}.parquet"))
@@ -1003,554 +971,6 @@ def _append_phenology_features(
 
 
 # ---------------------------------------------------------------------------
-# Raw loading + merging
-# ---------------------------------------------------------------------------
-
-def load_crop_climate_data(
-    crop: str,
-    data_dir: str,
-    climate_model: str = "EC-Earth3",
-    ens_member: str = 'r1i4p1f1',
-    preseason_buffer: int = 60,
-    postharvest_buffer: int = 14,
-    hindcast_years: list | None = None,
-    feature_mode: str = "aggregated",
-    target: str = "yield",
-    forecast_year: int = 1,
-    aoi: str = "CONUS",
-    climate_source: str = "aggregate",
-    pixel_features_dir: str | None = None,
-) -> pd.DataFrame:
-    """Load and merge climate + crop parquets; apply the appropriate date window.
-
-    Aggregated / agro mode window (date-based, year-boundary safe):
-        [plant_start_date − preseason_buffer,  harvest_end_date + postharvest_buffer]
-        Where the crop calendar crosses the new year (plant_start_doy >
-        harvest_end_doy, as in southern-hemisphere maize), plant_start_date is
-        anchored in yield_year − 1 and that year's climate is pulled in too, so
-        the window covers the whole season rather than collapsing to nothing.
-        County-seasons the loaded climate does not cover end to end are dropped.
-
-    Timeseries mode window:
-        [Nov 1 of yield year − 1,  Nov 1 of yield year]
-
-    forecast_year selects which lead-year climate product to use:
-        1 (default) — {data_dir}/{climate_model}/  (s{Y-1} run, forecasts
-                      calendar year Y = hindcast_start + 1)
-        2           — {data_dir}/FY2/             (s{Y-2} run, forecasts
-                      calendar year Y = hindcast_start + 2)
-    In both cases the target (yield) year is hindcast_start + forecast_year, and
-    the crop yield is matched on that target year. Filenames are resolved by
-    find_climate_files, which accepts every naming convention in use and matches
-    the AOI explicitly — see the "Climate file resolution" section above.
-
-    Returns a daily DataFrame with columns:
-        adm2_id, adm2, adm1, hindcast_start, yield_year, date, doy,
-        year_month, tasmax_C, tasmin_C, hursmin, pr_mm,
-        plant_start_doy, plant_doy, harvest_doy, harvest_end_doy, yield
-    """
-    if feature_mode not in FEATURE_MODES:
-        raise ValueError(f"feature_mode must be one of {FEATURE_MODES}")
-
-    # ---- climate ----
-    if climate_source == "pixel":
-        # Same daily schema, different provenance: area-weighted from per-pixel
-        # values rather than computed on an already-averaged unit. Everything
-        # below -- stitching, the crop merge, the season window, the coverage
-        # guard -- is identical, which is why the switch lives here and not in a
-        # parallel loader that would drift out of step.
-        want = ([y + forecast_year for y in hindcast_years]
-                if hindcast_years else None)
-        climate_df = load_pixel_daily(data_dir, climate_model, aoi,
-                                      pixel_features_dir, want)
-    else:
-        # Resolved per hindcast year and per AOI, so a folder holding more than
-        # one AOI's series cannot cross-contaminate a run.
-        files = find_climate_files(data_dir, climate_model, ens_member, aoi,
-                                   forecast_year, hindcast_years)
-        print(f"Loading {len(files)} climate parquet(s) (forecast year {forecast_year})...")
-        climate_df = pd.concat([_read_parquet(f) for f in files], ignore_index=True)
-    climate_df["date"] = pd.to_datetime(climate_df["date"])
-    # fastparquet returns integer id columns as float; normalise so downstream
-    # merges/folds see a consistent int hindcast_start regardless of read engine.
-    climate_df["hindcast_start"] = climate_df["hindcast_start"].astype(int)
-    # The calendar year being forecast is hindcast_start + forecast_year (FY1 → +1,
-    # FY2 → +2). Compute it uniformly so the crop merge below is FY-agnostic.
-    climate_df["target_year"] = climate_df["hindcast_start"] + forecast_year
-    print(
-        f"  Climate rows: {len(climate_df):,}  "
-        f"hindcast_start years: {sorted(climate_df['hindcast_start'].unique())}"
-    )
-
-    # ---- crop ----
-    crop_file = os.path.join(data_dir, f"crop_{crop}_{aoi}.parquet")
-    if not os.path.exists(crop_file):
-        raise FileNotFoundError(
-            f"Crop parquet not found: {crop_file!r}\n"
-            f"Available crops for AOI {aoi!r}: {available_crops(data_dir, aoi)}"
-        )
-    crop_df = _read_parquet(crop_file)
-    # Filter structural zeros on the RAW yield, before _apply_target — once the
-    # target is yield_pct_change the column holds percent changes, which are
-    # legitimately negative. Doing it first also stops pct_change dividing by a
-    # zero prior year.
-    crop_df = drop_invalid_yield(crop_df, context=f"{crop}/{aoi}")
-    crop_df = _apply_target(crop_df, target)
-    # Crop yield is keyed by hindcast_start under the FY1 convention, i.e. it is
-    # the yield for calendar year hindcast_start + 1. Express that as target_year
-    # so it can be matched to any forecast-year climate product.
-    crop_df["target_year"] = crop_df["hindcast_start"] + 1
-    print(
-        f"  Crop ({crop}) rows: {len(crop_df):,}  "
-        f"hindcast_start years: {sorted(crop_df['hindcast_start'].unique())}"
-    )
-
-    # ---- cross-year seasons ----
-    # A southern-hemisphere season is planted in one calendar year and harvested
-    # in the next (Zambian maize: sos ~ DOY 326, eos ~ DOY 134), so half its
-    # weather sits in a climate file whose own target_year is a year earlier and
-    # would never reach this season's rows. Offer every climate row to the season
-    # ending in the FOLLOWING year as well; the date window below keeps only the
-    # days that genuinely fall inside a season, so the extra candidates cost rows
-    # in the merge and nothing in the result. Gated on the calendar actually
-    # crossing, since for a same-year AOI like CONUS this would double the merge
-    # to no purpose.
-    crosses_new_year = bool(
-        (crop_df["plant_start_doy"] > crop_df["harvest_end_doy"]).any())
-    # Only the observed (FY0) product needs stitching. Its files are calendar
-    # years, so a cross-year season straddles two of them -- but they are two
-    # slices of one continuous reanalysis, so joining them is just reading the
-    # record. A hindcast file is not: s{Y} runs Nov Y -> Oct Y+1, so it already
-    # holds its target season end to end, and reaching into s{Y-1} for a few
-    # extra pre-season days would splice a DIFFERENT initialization's weather
-    # into the same feature row. The pre-season buffer is clipped at the
-    # initialization date instead, which is what the hindcast actually knows.
-    stitch_prev_year = crosses_new_year and forecast_year == 0
-    if stitch_prev_year:
-        print("  Crop calendar crosses the new year (plant_start_doy > "
-              "harvest_end_doy): pairing each season with the previous "
-              "calendar year's observations as well.")
-        climate_df = pd.concat(
-            [climate_df,
-             climate_df.assign(target_year=climate_df["target_year"] + 1)],
-            ignore_index=True,
-        )
-    elif crosses_new_year:
-        print(f"  Crop calendar crosses the new year; forecast year "
-              f"{forecast_year} files span Nov-Oct and already cover the "
-              f"season, so any part of the {preseason_buffer}-day pre-season "
-              f"buffer that falls before the initialization date is clipped.")
-
-    # ---- merge ----
-    # Match on target_year (not hindcast_start): under FY1 these are equivalent,
-    # but under FY2 the climate's hindcast_start is 2 years before the target,
-    # so pairing on target_year keeps each county's weather with the right yield.
-    merged = climate_df.merge(
-        crop_df[["adm2_id", "target_year",
-                 "plant_start_doy", "plant_doy",
-                 "harvest_doy", "harvest_end_doy", "yield"]],
-        on=["adm2_id", "target_year"],
-        how="inner",
-    )
-    merged["yield_year"] = merged["target_year"]
-    # Re-key on the season rather than on the calendar year the climate row came
-    # from. These are the same thing for a same-year season, but a cross-year one
-    # is served by two climate files and every fold, groupby and yield-history
-    # lookup downstream keys on hindcast_start expecting target_year =
-    # hindcast_start + forecast_year — so the November half must carry the
-    # hindcast_start of the season it belongs to, not of the file it came from.
-    merged["hindcast_start"] = merged["target_year"] - forecast_year
-
-    # ---- date-based window (year-boundary safe) ----
-    # harvest_end_doy is a DOY in the yield year; plant_start_doy is a DOY in the
-    # yield year too for a same-year season, but in the year BEFORE it when the
-    # calendar crosses the new year. Anchor each end to its own Jan 1.
-    yield_yr_jan1 = pd.to_datetime(merged["yield_year"].astype(str) + "-01-01")
-
-    if feature_mode in ("aggregated", "agro"):
-        window_start = _plant_year_jan1(merged) + pd.to_timedelta(
-            merged["plant_start_doy"] - preseason_buffer - 1, unit="D"
-        )
-        window_end = yield_yr_jan1 + pd.to_timedelta(
-            merged["harvest_end_doy"] + postharvest_buffer - 1, unit="D"
-        )
-    else:  # timeseries: full Nov-to-Nov window ending in the yield year
-        window_start = pd.to_datetime(
-            (merged["yield_year"] - 1).astype(str) + "-11-01"
-        )
-        window_end = pd.to_datetime(
-            merged["yield_year"].astype(str) + "-11-01"
-        )
-
-    merged["_win_start"] = window_start
-    merged["_win_end"]   = window_end
-    mask   = (merged["date"] >= merged["_win_start"]) & (merged["date"] <= merged["_win_end"])
-    merged = merged[mask].copy().reset_index(drop=True)
-
-    if stitch_prev_year:
-        # A stitched season needs two climate files, so the first and last
-        # season of any series are half-covered — no planting weather for the
-        # earliest, no grain fill for the latest. Their aggregates would be taken
-        # over a truncated window and arrive looking like ordinary rows, so drop
-        # any county-season the loaded climate does not cover end to end. A
-        # same-year season cannot hit this (its window sits inside the one
-        # calendar year its climate file already covers), and a hindcast season
-        # is clipped at its initialization date by design, so the check belongs
-        # to the stitched case alone rather than to every AOI and product.
-        keys  = ["adm2_id", "hindcast_start"]
-        cover = merged.groupby(keys).agg(
-            first=("date", "min"), last=("date", "max"),
-            want_first=("_win_start", "first"), want_last=("_win_end", "first"))
-        complete = cover.index[(cover["first"] <= cover["want_first"])
-                               & (cover["last"] >= cover["want_last"])]
-        if len(complete) < len(cover):
-            short = cover.drop(index=complete)
-            print(f"  Dropping {len(short)} county-season(s) whose window the "
-                  f"loaded climate does not cover end to end (years: "
-                  f"{sorted(short.index.get_level_values('hindcast_start').unique())})")
-            merged = merged[
-                pd.MultiIndex.from_frame(merged[keys]).isin(complete)
-            ].copy().reset_index(drop=True)
-    merged = merged.drop(columns=["_win_start", "_win_end"])
-
-    print(
-        f"  After merge + {feature_mode} window: {len(merged):,} rows  "
-        f"({merged['adm2_id'].nunique()} counties)"
-    )
-    return merged
-
-
-# ---------------------------------------------------------------------------
-# Aggregated features
-# ---------------------------------------------------------------------------
-
-def aggregate_daily(daily_df: pd.DataFrame, weather_vars: list | None = None):
-    """Aggregate daily county×day data to one row per (adm2_id, hindcast_start).
-
-    Only the requested weather_vars are summarised (default: all of
-    WEATHER_VARS). Derived columns follow their inputs: temp_range_C is built
-    only when both tasmax_C and tasmin_C are selected, and the pr_mm_sum total
-    only when pr_mm is selected.
-
-    Returns (adm2_df, weather_cols).
-    """
-    df = daily_df.copy()
-    weather_cols = resolve_climate_vars(weather_vars)
-    if "tasmax_C" in weather_cols and "tasmin_C" in weather_cols:
-        df["temp_range_C"] = df["tasmax_C"] - df["tasmin_C"]
-        weather_cols = weather_cols + ["temp_range_C"]
-
-    agg = {}
-    for col in weather_cols:
-        agg[f"{col}_mean"] = (col, "mean")
-        agg[f"{col}_std"]  = (col, "std")
-    if "pr_mm" in weather_cols:
-        agg["pr_mm_sum"]   = ("pr_mm",           "sum")
-    agg["plant_doy"]       = ("plant_doy",        "first")
-    agg["harvest_doy"]     = ("harvest_doy",      "first")
-    agg["harvest_end_doy"] = ("harvest_end_doy",  "first")
-    agg["yield"]           = ("yield",            "first")
-    agg["adm2"]            = ("adm2",             "first")
-    agg["adm1"]            = ("adm1",             "first")
-
-    adm2_df = (
-        df.groupby(["adm2_id", "hindcast_start"])
-        .agg(**agg)
-        .reset_index()
-        .dropna(subset=["yield"])
-    )
-    print(f"(adm2, year) pairs with yield data: {len(adm2_df)}")
-    return adm2_df, weather_cols
-
-
-def build_features(adm2_df: pd.DataFrame, weather_cols: list):
-    """Drop rows with any NaN feature; return (adm2_df, feature_cols)."""
-    feature_cols = (
-        [f"{c}_mean" for c in weather_cols]
-        + [f"{c}_std"  for c in weather_cols]
-        + (["pr_mm_sum"] if "pr_mm" in weather_cols else [])
-        + ["plant_doy", "harvest_doy", "harvest_end_doy"]
-    )
-    mask    = adm2_df[feature_cols].notna().all(axis=1)
-    adm2_df = adm2_df[mask].copy()
-    print(f"Samples after dropping NaN features: {len(adm2_df)}")
-    return adm2_df, feature_cols
-
-
-# ---------------------------------------------------------------------------
-# Agronomic features ("agro" feature mode)
-# ---------------------------------------------------------------------------
-
-def _plant_year_jan1(df: pd.DataFrame) -> pd.Series:
-    """Jan 1 of the calendar year each row's plant_start_doy is measured in.
-
-    Usually that is the yield year. Where the crop calendar crosses the new year
-    — plant_start_doy after harvest_end_doy, as in southern-hemisphere maize —
-    planting happened in the year BEFORE the harvest, so the DOY is anchored a
-    year earlier. Anchoring both ends to the yield year there would produce a
-    window that ends months before it starts, and silently select no days at all.
-    """
-    plant_year = (df["yield_year"].astype(int)
-                  - (df["plant_start_doy"] > df["harvest_end_doy"]).astype(int))
-    return pd.to_datetime(plant_year.astype(str) + "-01-01")
-
-
-def _window_start_dates(df: pd.DataFrame, preseason_buffer: int) -> pd.Series:
-    """Nominal first day of each row's seasonal window.
-
-    Recomputed from the crop calendar rather than taken as each group's earliest
-    observed date, so the season-block grid is anchored identically for every
-    county-year even where the climate series is short a leading day.
-    """
-    return _plant_year_jan1(df) + pd.to_timedelta(
-        df["plant_start_doy"] - preseason_buffer - 1, unit="D")
-
-
-def build_agro_features(
-    daily_df: pd.DataFrame,
-    preseason_buffer: int = 60,
-    season_blocks: int = SEASON_BLOCKS_DEFAULT,
-    gdd_base: float = GDD_BASE_C,
-    edd_threshold: float = EDD_THRESHOLD_C,
-    gdd_preseason_days: int = GDD_PRESEASON_DAYS,
-    gdd_cap: float | None = GDD_CAP_C,
-) -> tuple[pd.DataFrame, list]:
-    """Build the curated agronomic feature set, one row per (adm2_id, hindcast_start).
-
-    Features (all computed inside the seasonal window the loader already applied,
-    i.e. [plant_start − preseason_buffer, harvest_end + postharvest_buffer]):
-
-      Heat accumulation (single-sine; see degree_days.py)
-        gdd                 Growing degree days between gdd_base and gdd_cap,
-                            summed over [plant_start − gdd_preseason_days,
-                            window end]. Each day's value integrates the heat
-                            under a sine diurnal cycle running between tasmin_C
-                            and tasmax_C, so a day whose mean sits below the
-                            base still accumulates the hours that were above it.
-                            Heat beyond gdd_cap stops counting here and is
-                            charged to edd instead. Defaults: base 10 C (corn
-                            lower threshold), cap = edd_threshold.
-        edd                 Extreme degree days above edd_threshold, same
-                            single-sine integral — the heat load above 30 C,
-                            not just its frequency, and not zero merely because
-                            the daily mean happens to land on the threshold.
-        days_over_{T}C      Count of days in the window with tasmax_C above the
-                            threshold. Reported alongside edd because "number of
-                            extreme degree days" is used for both quantities.
-
-      Season temperature
-        tasmax_C_mean       Mean daily maximum over the full window.
-        tasmin_C_mean       Mean daily minimum over the full window.
-
-      Whole-window humidity
-        hursmin_{mean,min,max,std,var}
-
-      Sub-seasonal precipitation and humidity
-        {pr_mm,hursmin}_m{NN}_{mean,min,max,std,var}
-                            for NN = 01..season_blocks, where block NN covers
-                            days [(NN−1)·30 + 1, NN·30] measured from the window
-                            start. The final block absorbs any remaining days, so
-                            a longer window lengthens the last block rather than
-                            adding a partly-empty one.
-
-    Notes
-    -----
-    GDD accumulation starts gdd_preseason_days before plant_start_doy, which is
-    only fully inside the loaded window when preseason_buffer >= that value; a
-    warning is printed otherwise since the sum would then be truncated.
-
-    Returns (adm2_df, feature_cols).
-    """
-    if season_blocks < 1:
-        raise ValueError(f"season_blocks must be >= 1, got {season_blocks}")
-    missing = [c for c in ("tasmax_C", "tasmin_C", "hursmin", "pr_mm")
-               if c not in daily_df.columns]
-    if missing:
-        raise ValueError(
-            f"agro feature mode needs daily columns {missing}, which are absent. "
-            "It uses the full weather set, so do not restrict --climate_vars."
-        )
-    if preseason_buffer < gdd_preseason_days:
-        print(
-            f"WARNING: --preseason_buffer {preseason_buffer} is shorter than the "
-            f"{gdd_preseason_days}-day GDD pre-plant lead-in, so GDD is "
-            f"accumulated from the window start instead and undercounts."
-        )
-
-    df = daily_df.copy()
-    df["date"] = pd.to_datetime(df["date"])
-    keys = ["adm2_id", "hindcast_start"]
-
-    # ---- daily derived quantities ----
-    # Single-sine degree days, shared with era5_features.py so gdd and edd name
-    # the same quantity in both pipelines. NaN temperatures are carried through
-    # explicitly: numpy comparisons against NaN are False, which would otherwise
-    # turn a missing day into a zero-degree-day one and bias the season sum low.
-    cap    = edd_threshold if gdd_cap is None else gdd_cap
-    tmin_a = df["tasmin_C"].to_numpy(dtype="float64")
-    tmax_a = df["tasmax_C"].to_numpy(dtype="float64")
-    valid  = np.isfinite(tmin_a) & np.isfinite(tmax_a)
-
-    df["_gdd_day"] = np.where(
-        valid, capped_degree_days(tmin_a, tmax_a, gdd_base, cap), np.nan)
-    df["_edd_day"] = np.where(
-        valid, degree_days_sine(tmin_a, tmax_a, edd_threshold), np.nan)
-    df["_hot_day"] = (df["tasmax_C"] > edd_threshold).astype(float).where(
-        df["tasmax_C"].notna())
-
-    # GDD accumulates only from gdd_preseason_days before the planting window
-    # opens, so zero out the earlier part of the window rather than sub-setting
-    # rows (keeps one pass over the frame and one groupby).
-    gdd_start = _plant_year_jan1(df) + pd.to_timedelta(
-        df["plant_start_doy"] - gdd_preseason_days - 1, unit="D")
-    df["_gdd_day"] = df["_gdd_day"].where(df["date"] >= gdd_start, 0.0)
-
-    # ---- season block index ----
-    # Days elapsed since the nominal window start, bucketed into fixed-length
-    # blocks. The last block is clipped so it absorbs the variable-length tail.
-    elapsed = (df["date"] - _window_start_dates(df, preseason_buffer)).dt.days
-    df["_block"] = (elapsed // SEASON_BLOCK_DAYS).clip(lower=0,
-                                                       upper=season_blocks - 1)
-
-    # ---- whole-window aggregates ----
-    hot_col = f"days_over_{edd_threshold:g}C"
-    agg = {
-        "gdd":            ("_gdd_day",  "sum"),
-        "edd":            ("_edd_day",  "sum"),
-        hot_col:          ("_hot_day",  "sum"),
-        "tasmax_C_mean":  ("tasmax_C",  "mean"),
-        "tasmin_C_mean":  ("tasmin_C",  "mean"),
-    }
-    for var in WHOLE_WINDOW_STATS_VARS:
-        for stat in SEASON_BLOCK_STATS:
-            agg[f"{var}_{stat}"] = (var, stat)
-    agg["yield"] = ("yield", "first")
-    agg["adm2"]  = ("adm2",  "first")
-    agg["adm1"]  = ("adm1",  "first")
-
-    adm2_df = df.groupby(keys).agg(**agg).reset_index()
-
-    whole_cols = (
-        ["gdd", "edd", hot_col, "tasmax_C_mean", "tasmin_C_mean"]
-        + [f"{v}_{s}" for v in WHOLE_WINDOW_STATS_VARS
-           for s in SEASON_BLOCK_STATS]
-    )
-
-    # ---- per-block aggregates ----
-    # Aggregate once per (county-year, block), then pivot blocks into columns.
-    block_stats = (
-        df.groupby(keys + ["_block"])[SEASON_BLOCK_VARS]
-        .agg(SEASON_BLOCK_STATS)
-    )
-    # MultiIndex columns (var, stat) x block index -> flat {var}_m{NN}_{stat}
-    block_wide = block_stats.unstack("_block")
-    block_wide.columns = [
-        f"{var}_m{int(blk) + 1:02d}_{stat}"
-        for var, stat, blk in block_wide.columns
-    ]
-    block_cols = [
-        f"{var}_m{b + 1:02d}_{stat}"
-        for var in SEASON_BLOCK_VARS
-        for b in range(season_blocks)
-        for stat in SEASON_BLOCK_STATS
-    ]
-    # Name every expected column even if no county-year reached that block, so
-    # the feature matrix has a fixed width and the NaN filter below reports it.
-    block_wide = block_wide.reindex(columns=block_cols)
-    adm2_df = adm2_df.merge(block_wide.reset_index(), on=keys, how="left")
-
-    feature_cols = whole_cols + block_cols
-
-    # A single-day block makes std/var undefined; that is a real coverage gap in
-    # the window, so drop those county-years rather than imputing a zero spread.
-    adm2_df = adm2_df.dropna(subset=["yield"])
-    before  = len(adm2_df)
-    adm2_df = adm2_df[adm2_df[feature_cols].notna().all(axis=1)].reset_index(drop=True)
-    if before != len(adm2_df):
-        print(f"  Dropped {before - len(adm2_df):,} county-years with incomplete "
-              f"season-block coverage")
-
-    print(
-        f"Agro features      : {len(feature_cols)} columns "
-        f"({len(whole_cols)} whole-window + {len(block_cols)} sub-seasonal over "
-        f"{season_blocks} x {SEASON_BLOCK_DAYS}d blocks); "
-        f"{len(adm2_df):,} county-year pairs"
-    )
-    return adm2_df, feature_cols
-
-
-# ---------------------------------------------------------------------------
-# Timeseries features
-# ---------------------------------------------------------------------------
-
-def build_timeseries_features(
-    daily_df: pd.DataFrame,
-    weather_vars: list = WEATHER_VARS,
-) -> tuple[pd.DataFrame, list]:
-    """Pivot daily data to one row per (adm2_id, hindcast_start).
-
-    Column names: {var}_d{NNN:03d}  where NNN is the 1-based day offset
-    from Nov 1 of the hindcast_start year (so d001 = Nov 1 of hindcast year,
-    d366 ≈ Nov 1 of yield year).
-
-    Missing days within each county-year are forward-filled then backward-
-    filled so no NaN values remain in the feature block (RF-compatible).
-
-    Returns (adm2_df, feature_cols).
-    """
-    df = daily_df.copy()
-    df["date"] = pd.to_datetime(df["date"])
-
-    # Anchor day offsets to Nov 1 of the year before the target/yield year. This
-    # equals the hindcast_start year for FY1 but not for later forecast years
-    # (FY2's window starts two Novembers after its hindcast_start), so prefer
-    # target_year when the loader supplied it.
-    anchor_year = (df["target_year"] - 1) if "target_year" in df.columns \
-        else df["hindcast_start"]
-    season_start    = pd.to_datetime(anchor_year.astype(str) + "-11-01")
-    df["day_offset"] = (df["date"] - season_start).dt.days + 1
-
-    # Pivot each variable then concatenate column-wise
-    pivots = []
-    for var in weather_vars:
-        piv = (
-            df.pivot_table(
-                index=["adm2_id", "hindcast_start"],
-                columns="day_offset",
-                values=var,
-                aggfunc="mean",
-            )
-            .rename(columns=lambda d: f"{var}_d{int(d):03d}")
-        )
-        pivots.append(piv)
-
-    ts_wide = pd.concat(pivots, axis=1)
-
-    # Fill gaps within each county-year's series
-    ts_wide = ts_wide.ffill(axis=1).bfill(axis=1)
-
-    feature_cols = list(ts_wide.columns)
-    ts_wide      = ts_wide.reset_index()
-
-    # Attach metadata and yield
-    meta = (
-        df[["adm2_id", "hindcast_start", "adm2", "adm1", "yield"]]
-        .drop_duplicates(subset=["adm2_id", "hindcast_start"])
-    )
-    adm2_df = (
-        meta.merge(ts_wide, on=["adm2_id", "hindcast_start"], how="inner")
-        .dropna(subset=["yield"])
-        .reset_index(drop=True)
-    )
-
-    print(
-        f"Timeseries features: {len(feature_cols)} columns  "
-        f"({len(adm2_df)} county-year pairs)"
-    )
-    return adm2_df, feature_cols
-
-
-# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -1833,11 +1253,8 @@ def load_pixel_season_features(
 def load_and_prepare(
     crop: str,
     data_dir: str,
-    feature_mode: str = "aggregated",
+    feature_mode: str = "pixel_blocks",
     climate_model: str = "EC-Earth3",
-    ens_member: str = "r1i4p1f1",
-    preseason_buffer: int = 60,
-    postharvest_buffer: int = 14,
     hindcast_years: list | None = None,
     target: str = "yield",
     forecast_year: int = 1,
@@ -1850,13 +1267,7 @@ def load_and_prepare(
     phenology_suffix: str | None = None,
     phenology_lookback_years: int = 1,
     climate_vars: list | None = None,
-    season_blocks: int = SEASON_BLOCKS_DEFAULT,
-    gdd_base: float = GDD_BASE_C,
-    edd_threshold: float = EDD_THRESHOLD_C,
-    gdd_preseason_days: int = GDD_PRESEASON_DAYS,
-    gdd_cap: float | None = GDD_CAP_C,
     pixel_features_dir: str | None = None,
-    climate_source: str = "aggregate",
 ) -> tuple[pd.DataFrame, list]:
     """Full pipeline: load → merge → window → featurise.
 
@@ -1879,16 +1290,9 @@ def load_and_prepare(
 
     climate_vars restricts which daily weather variables are featurised
     (default: all of WEATHER_VARS), so feature-space ablations can run e.g.
-    temperature + precipitation only. It does not apply to feature_mode "agro",
-    whose feature list is fixed by construction.
-
-    feature_mode "agro" replaces the generic mean/std block with the curated
-    agronomic set built by build_agro_features: corn growing degree days,
-    extreme degree days above edd_threshold (both single-sine, see
-    degree_days.py), season mean tasmax/tasmin,
-    whole-window humidity statistics, and per-season-block precipitation and
-    humidity statistics. season_blocks / gdd_base / edd_threshold / gdd_cap /
-    gdd_preseason_days are forwarded to it.
+    Only the stage-3 design matrix is read here; the feature set and its
+    thresholds were fixed when era5_features.py stage 2 ran, so climate_vars
+    selects which of those columns to keep rather than how they were built.
     """
     climate_vars = resolve_climate_vars(climate_vars)
 
@@ -1919,39 +1323,6 @@ def load_and_prepare(
                 lookback_years=phenology_lookback_years)
             feature_cols = feature_cols + pheno_cols
         return adm2_df, feature_cols
-
-    daily_df = load_crop_climate_data(
-        crop=crop,
-        data_dir=data_dir,
-        climate_model=climate_model,
-        ens_member=ens_member,
-        preseason_buffer=preseason_buffer,
-        postharvest_buffer=postharvest_buffer,
-        hindcast_years=hindcast_years,
-        feature_mode=feature_mode,
-        target=target,
-        forecast_year=forecast_year,
-        aoi=aoi,
-        climate_source=climate_source,
-        pixel_features_dir=pixel_features_dir,
-    )
-
-    if feature_mode == "aggregated":
-        adm2_df, weather_cols = aggregate_daily(daily_df, weather_vars=climate_vars)
-        adm2_df, feature_cols = build_features(adm2_df, weather_cols)
-    elif feature_mode == "agro":
-        adm2_df, feature_cols = build_agro_features(
-            daily_df,
-            preseason_buffer=preseason_buffer,
-            season_blocks=season_blocks,
-            gdd_base=gdd_base,
-            edd_threshold=edd_threshold,
-            gdd_preseason_days=gdd_preseason_days,
-            gdd_cap=gdd_cap,
-        )
-    else:
-        adm2_df, feature_cols = build_timeseries_features(
-            daily_df, weather_vars=climate_vars)
 
     if yield_history:
         adm2_df, hist_cols = _append_yield_history_features(

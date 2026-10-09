@@ -41,6 +41,10 @@ source(file.path(ERA5_R_DIR, "ML-sample-gen.R"))
 
 library(arrow)
 
+# Stage 1's shared engine: grid identity, the weight table, the cube writer and
+# the run loop, used identically by era5-pixel-store.R and dcpp-pixel-store.R.
+source(file.path(ERA5_R_DIR, "pixel-store.R"))
+
 
 # ===== AOI REGISTRY =====
 

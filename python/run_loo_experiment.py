@@ -157,8 +157,6 @@ def build_config_key(args, climate_vars, study_start, study_end):
         "climate_model":      args.climate_model,
         "ens_member":         args.ens_member,
         "climate_vars":       list(climate_vars),
-        "preseason_buffer":   args.preseason_buffer,
-        "postharvest_buffer": args.postharvest_buffer,
         "study_start":        study_start,
         "study_end":          study_end,
         "train_all_years":    bool(args.train_all_years),
@@ -185,17 +183,6 @@ def build_config_key(args, climate_vars, study_start, study_end):
         "sample_counties":    args.sample_counties,
         "sample_seed":        args.sample_seed,
     }
-    if args.feature_mode == "agro":
-        # These define the agro feature space, so they belong in the arm — but
-        # only when that mode is active, or the hash would churn for every
-        # tabular run whenever an agro default moves.
-        key["agro"] = {
-            "season_blocks":      args.season_blocks,
-            "gdd_base":           args.gdd_base,
-            "edd_threshold":      args.edd_threshold,
-            "gdd_cap":            args.gdd_cap,
-            "gdd_preseason_days": args.gdd_preseason_days,
-        }
     if args.model_type == "tst":
         # Model capacity / optimisation settings change the arm, but only the
         # tst path reads them — including them for tabular runs would churn the
@@ -362,28 +349,21 @@ def parse_args():
         help=f"Crop to model. Choices: {SUPPORTED_CROPS}. Default: corn.",
     )
     parser.add_argument(
-        "--feature_mode", type=str, choices=FEATURE_MODES, default="aggregated",
+        "--feature_mode", type=str, choices=FEATURE_MODES, default="pixel_blocks",
         help=(
-            "'aggregated': mean/std/sum per variable over the seasonal window. "
-            "'timeseries': full daily values (Nov 1 – Nov 1) as individual features. "
-            "'agro': curated agronomic set over the seasonal window — corn GDD, "
-            "extreme degree days, season mean tasmax/tasmin, whole-window "
-            "humidity stats, and per-season-block precipitation/humidity stats. "
-            "Ignores --climate_vars (its variable list is fixed). "
-            "'pixel': read the season features era5_features.py --reduce=season "
-            "already built, which computed each feature PER PIXEL and only then "
-            "took the cropland-weighted admin-2 mean. The three modes above all "
-            "average the climate over the unit first, which is wrong for GDD, "
-            "EDD, VPD and every other threshold feature. Reads "
-"'pixel_blocks': the same, but from --reduce=blocks -- one column per "
-            "feature per season-relative window (pr_m04 = rainfall at flowering). "
-            "Season totals cannot separate a dry spell at flowering from the same "
-            "shortfall at maturity; this can, at the cost of ~5x the columns, so "
-            "pair it with --model_type ridge rather than a tree. Both read "
-            "{data_dir}/{climate_model}/features_admin2/ and ignore every "
-            "feature-building flag (--climate_vars, the agro group, the "
-            "buffers) -- the feature set is fixed when stage 3 runs. "
-            "Default: aggregated."
+            "Both modes read a design matrix that era5_features.py stage 3 "
+            "already built, having computed each feature PER PIXEL and only then "
+            "taken the cropland-weighted admin-2 mean -- the order that matters "
+            "for GDD, EDD, VPD and every other threshold feature. "
+            "'pixel': whole-season totals/means per variable (--reduce=season). "
+            "'pixel_blocks': one column per feature per season-relative window "
+            "(pr_m04 = rainfall at flowering, --reduce=blocks). Season totals "
+            "cannot separate a dry spell at flowering from the same shortfall at "
+            "maturity; blocks can, at ~5x the columns, so pair them with "
+            "--model_type ridge rather than a tree. "
+            "Both read {data_dir}/{climate_model}/features_admin2/; the feature "
+            "set and its thresholds are fixed when stage 3 runs, so no flag here "
+            "can change them. Default: pixel_blocks."
         ),
     )
     parser.add_argument(
@@ -408,14 +388,6 @@ def parse_args():
              "{data_dir}/{climate_model}/ — e.g. a lab machine keeping ERA5 on "
              "a separate disk. ERA5_OUT_DIR is also honoured, matching "
              "era5_features.py. Default: {data_dir}/{climate_model}/features_admin2.",
-    )
-    parser.add_argument(
-        "--preseason_buffer", type=int, default=60,
-        help="Days before plant_start_doy (aggregated mode only, default: 60).",
-    )
-    parser.add_argument(
-        "--postharvest_buffer", type=int, default=14,
-        help="Days after harvest_end_doy (aggregated mode only, default: 14).",
     )
     parser.add_argument(
         "--target", type=str, choices=ALL_TARGETS, default="yield",
@@ -643,42 +615,6 @@ def parse_args():
                              "behaviour for comparison.")
 
     # ── PatchTST hyperparameters (only used when --model_type tst) ──
-    agro = parser.add_argument_group("Agronomic feature options (--feature_mode agro)")
-    agro.add_argument(
-        "--season_blocks", type=int, default=SEASON_BLOCKS_DEFAULT,
-        help="Number of 30-day blocks, measured from the window start, that "
-             "precipitation and humidity are summarised over. The last block "
-             "absorbs the remaining days of the window. Default: "
-             f"{SEASON_BLOCKS_DEFAULT} (240 days, which every CONUS corn "
-             "window covers).",
-    )
-    agro.add_argument(
-        "--gdd_base", type=float, default=GDD_BASE_C,
-        help="Lower base temperature in C subtracted from mean daily air "
-             f"temperature to accumulate growing degree days. Default: {GDD_BASE_C} "
-             "(corn).",
-    )
-    agro.add_argument(
-        "--edd_threshold", type=float, default=EDD_THRESHOLD_C,
-        help="Temperature in C above which daily tasmax counts toward extreme "
-             f"degree days. Default: {EDD_THRESHOLD_C}.",
-    )
-    agro.add_argument(
-        "--gdd_cap", type=float, default=None,
-        help="Upper bound in C on heat that counts toward growing degree days. "
-             "Heat above it stops accumulating in gdd and is charged to edd "
-             "instead, which is the piecewise-linear corn response rather than "
-             "an unbounded one that would credit a 40 C day as maximally good. "
-             "Default: --edd_threshold, so the two partition the day's heat "
-             "with no gap or overlap.",
-    )
-    agro.add_argument(
-        "--gdd_preseason_days", type=int, default=GDD_PRESEASON_DAYS,
-        help="Days before plant_start_doy at which GDD accumulation begins. "
-             f"Default: {GDD_PRESEASON_DAYS}. Must be <= --preseason_buffer or "
-             "the sum is truncated at the window start.",
-    )
-
     tst = parser.add_argument_group("PatchTST options (--model_type tst)")
     tst.add_argument("--patch_length", type=int,   default=16,
                      help="Patch size in days (e.g. 16 ≈ 2 weeks).")
@@ -1401,14 +1337,7 @@ def main():
     print(f"Model           : {args.model_type}")
     print(f"Feature mode    : {args.feature_mode}")
     print(f"Target          : {args.target}")
-    if args.feature_mode == "agro":
-        print(f"Agro features   : single-sine GDD {args.gdd_base:g}-"
-              f"{(args.gdd_cap if args.gdd_cap is not None else args.edd_threshold):g}C "
-              f"from {args.gdd_preseason_days}d pre-plant; EDD/hot-day threshold "
-              f"{args.edd_threshold:g}C; {args.season_blocks} x "
-              f"{SEASON_BLOCK_DAYS}d season blocks  (--climate_vars ignored)")
-    else:
-        print(f"Climate vars    : {','.join(climate_vars)}")
+    print(f"Climate vars    : {','.join(climate_vars)}")
     if args.yield_history:
         print(f"Yield history   : on  (leak guard: "
               f"{'OFF — training sees held-out labels' if args.allow_history_leakage else 'on'})")
@@ -1446,9 +1375,7 @@ def main():
             hindcast_years=train_years,
             crop=args.crop,
             climate_model=args.climate_model,
-            ens_member=args.ens_member,
             aoi=args.aoi,
-            climate_source=args.climate_source,
             pixel_features_dir=args.pixel_features_dir,
             use_phenology=args.use_phenology,
             phenology_suffix=args.phenology_suffix,
@@ -1497,9 +1424,6 @@ def main():
             hindcast_years=train_years,
             feature_mode=args.feature_mode,
             climate_model=args.climate_model,
-            ens_member=args.ens_member,
-            preseason_buffer=args.preseason_buffer,
-            postharvest_buffer=args.postharvest_buffer,
             target=args.target,
             forecast_year=args.forecast_year,
             aoi=args.aoi,
@@ -1511,13 +1435,7 @@ def main():
             phenology_suffix=args.phenology_suffix,
             phenology_lookback_years=args.phenology_lookback_years,
             climate_vars=climate_vars,
-            season_blocks=args.season_blocks,
-            gdd_base=args.gdd_base,
-            edd_threshold=args.edd_threshold,
-            gdd_preseason_days=args.gdd_preseason_days,
-            gdd_cap=args.gdd_cap,
             pixel_features_dir=args.pixel_features_dir,
-            climate_source=args.climate_source,
         )
         county_meta = adm2_df[["adm2_id", "adm2", "adm1"]].drop_duplicates("adm2_id")
 
@@ -1636,8 +1554,6 @@ def main():
         "use_phenology":      args.use_phenology,
         "phenology_lag_years": args.phenology_lag_years,
         "phenology_lookback_years": args.phenology_lookback_years,
-        "preseason_buffer":   args.preseason_buffer,
-        "postharvest_buffer": args.postharvest_buffer,
         "study_start":        study_start,
         "study_end":          study_end,
         "model_type":         args.model_type,
@@ -1646,11 +1562,6 @@ def main():
         "within_county_features": args.within_county_features,
         "anomaly_detrend":    args.anomaly_detrend,
         "min_trend_years":    args.min_trend_years,
-        "season_blocks":      args.season_blocks,
-        "gdd_base":           args.gdd_base,
-        "edd_threshold":      args.edd_threshold,
-        "gdd_cap":            args.gdd_cap,
-        "gdd_preseason_days": args.gdd_preseason_days,
         "cv_scheme":          args.cv_scheme,
         "cell_lookup":        args.cell_lookup,
         "use_phenology":      args.use_phenology,

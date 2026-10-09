@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-# The single-sine degree-day kernel is shared with data_loader.py's "agro"
+# The single-sine degree-day kernel is shared with data_loader.py
 # feature mode, so gdd/edd mean the same thing whichever pipeline produced them.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from degree_days import degree_days_sine  # noqa: E402

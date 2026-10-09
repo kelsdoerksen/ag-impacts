@@ -65,20 +65,13 @@ def parse_args():
         help=f"Model type. Choices: {SUPPORTED_MODELS}. Default: rf.",
     )
     parser.add_argument(
-        "--feature_mode", type=str, choices=FEATURE_MODES, default="aggregated",
+        "--feature_mode", type=str, choices=FEATURE_MODES, default="pixel_blocks",
         help=(
-            "'aggregated': mean/std/sum per variable over the seasonal window. "
-            "'timeseries': full daily values (Nov 1 – Nov 1) as individual features. "
-            "Default: aggregated."
+            "'pixel': whole-season totals/means from era5_features.py stage 3. "
+            "'pixel_blocks': the same, split into season-relative windows. Both "
+            "read a design matrix whose features were computed per pixel and "
+            "only then averaged over cropland. Default: pixel_blocks."
         ),
-    )
-    parser.add_argument(
-        "--preseason_buffer", type=int, default=60,
-        help="Days before plant_start_doy to include (aggregated mode only, default: 60).",
-    )
-    parser.add_argument(
-        "--postharvest_buffer", type=int, default=14,
-        help="Days after harvest_end_doy to include (aggregated mode only, default: 14).",
     )
     parser.add_argument(
         "--target", type=str, choices=TARGET_OPTIONS, default="yield",
@@ -167,8 +160,6 @@ def main():
         crop=args.crop,
         data_dir=args.data_dir,
         feature_mode=args.feature_mode,
-        preseason_buffer=args.preseason_buffer,
-        postharvest_buffer=args.postharvest_buffer,
         target=args.target,
     )
 
@@ -245,8 +236,6 @@ def main():
         "run_id":               run_id,
         "crop":                 args.crop,
         "target":               args.target,
-        "preseason_buffer":     args.preseason_buffer,
-        "postharvest_buffer":   args.postharvest_buffer,
         "test_year":            test_year,
         "train_years":          train_years,
         "study_start":          study_start,
