@@ -40,7 +40,12 @@ SHARE_MOUNT=${SHARE_MOUNT:-/mnt/crl_storage}
 DATA_ROOT=${AGIMPACTS_ROOT:-$SHARE_MOUNT/personal_folders/kdoerksen}
 # Root of the published DCPP archive: {DCPP_ROOT}/{member}/day/{var}/gr/{version}
 DCPP_ROOT=${DCPP_ROOT:-$SHARE_MOUNT/all_datasets/dcpp_daily/EC-Earth3}
-OUT_ROOT=${OUT_ROOT:-$DATA_ROOT}
+# Output lives under its own dcpp/ subtree rather than beside the ERA5 trees, so
+# the two sources are separable at a glance and a stray --aois cannot drop
+# hindcast cubes next to reanalysis ones. Note this means era5_features.py's
+# DEFAULT path resolution ({root}/{AOI}_processed_data/{source}) will not find
+# them: pass --out, as this script does and as the stage-3 examples show.
+OUT_ROOT=${OUT_ROOT:-$DATA_ROOT/dcpp}
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 RSCRIPT=${RSCRIPT:-Rscript}
