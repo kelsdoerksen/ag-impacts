@@ -1,25 +1,12 @@
-# ag-impacts
+# 👩‍🌾 ag-impacts
 
-Climate-impacted crop yield prediction with ML.
+Climate-impacted crop yield prediction with AI.
 
-Daily climate — observed (ERA5) or forecast (EC-Earth3 DCPP hindcasts) — is
-turned into agronomic features per admin-2 unit and used to predict crop yield.
+Utilizing daily climate data either observed (ERA5) or forecasted (EC-Earth3 DCPP hindcasts), processed into agronomic features per admin-2 unit and used as inputs into ML models to predict crop yield 1-5 years ahead.
 
-## The one design decision worth knowing
+## Aggregated Feature Design
 
-**Features are computed per pixel, then averaged over cropland.** Not the other
-way round. Averaging first and computing features second is only valid for
-features linear in their inputs, and the useful ones are not:
-
-```
-mean_i( max(0, T_i - Tbase) )  !=  max(0, mean_i(T_i) - Tbase)
-```
-
-Averaging first clips the tails, so a unit containing both a cool and a hot pixel
-loses the heat the hot pixel actually accumulated. Growing and extreme degree
-days, VPD, dry-day and hot-day counts are all affected. Both climate sources go
-through the same three stages, in the same order, so a comparison between them
-measures forecast skill rather than a difference in processing.
+**Features are computed per pixel, then averaged over cropland.** 
 
 ```
 stage 1   daily gridded climate  ->  per-pixel daily cube (NetCDF)
@@ -34,12 +21,12 @@ stage 3   features + weights     ->  admin-2 table              (weighting here)
 
 ### Stage 1 — download and store per pixel (R)
 
-| file | what it does |
+| script | functionality |
 |---|---|
-| `R/pixel-store.R` | **The shared stage-1 engine.** Grid-identity check, the cropland weight table, unit conversion, the cube writer, resume logic and the run loop. Not run directly — both front-ends below are thin wrappers over it, so the two sources cannot drift apart. |
+| `R/pixel-store.R` | **Shared stage-1 engine.** Grid-identity check, the cropland weight table, unit conversion, the cube writer, resume logic and the run loop.|
 | `R/era5-pixel-store.R` | **Stage 1 for ERA5.** Front-end: fetches hourly ERA5 (CDS or ARCO), reduces it to daily, optionally on local solar days (`--local-time`). |
 | `R/dcpp-pixel-store.R` | **Stage 1 for the DCPP hindcasts.** Front-end: reads EC-Earth3 daily NetCDFs for one initialisation year and lead time (`--forecast-year`). |
-| `R/era5.R` | ERA5 acquisition. Two sources — CDS (server-side subsetting, queued, batched into multi-month requests) and ARCO-ERA5 on GCS (no account, no queue, transfers global fields). Reduces hourly to daily `tasmax`/`tasmin`/`hursmin`/`pr`. Holds `AOI_BOUNDS`, the single registry of AOI bounding boxes. |
+| `R/era5.R` | ERA5 acquisition. Available at two sources: CDS (server-side subsetting, queued, batched into multi-month requests) and ARCO-ERA5 on GCS (no account, no queue, transfers global fields). Reduces hourly to daily `tasmax`/`tasmin`/`hursmin`/`pr`. Holds `AOI_BOUNDS`, the single registry of AOI bounding boxes. |
 | `R/era5-aoi.R` | Shared configuration: the AOI registry (`ERA5_AOIS` — every cy-bench country plus CONUS), the GeoTIFF daily-grid cache, argument parsing, preflight. Sourced by both front-ends. |
 | `R/ML-sample-gen.R` | The DCPP NetCDF readers (`nc_path`, `read_nc_region`, `arrays_to_rast`) and the admin-boundary loaders both sources share. A library, not a script — it has no `main()`. |
 
@@ -53,9 +40,9 @@ Rscript R/era5-pixel-store.R --aoi=US --source=arco 2000-2023   # ARCO (large AO
 Rscript R/dcpp-pixel-store.R --aoi=CONUS --forecast-year=1 1982-2018
 ```
 
-### Stages 2 and 3 — features and aggregation (Python)
+### Stages 2 and 3: generate features and aggregate (Python)
 
-| file | what it does |
+| script | functionality |
 |---|---|
 | `python/era5_features.py` | **Stages 2 and 3 for both sources.** Stage 2 computes per-pixel daily features; stage 3 takes the cropland-area-weighted admin-2 mean, optionally accumulated over a crop-calendar season (`--reduce season`) or season-relative blocks (`--reduce blocks`). `--source` selects the climate tree; `--forecast-year` the lead time. `--list-features` shows the registry. |
 | `python/degree_days.py` | The single-sine degree-day integral, shared by `era5_features.py` and `data_loader.py` so the feature definition cannot differ between the two. |
@@ -69,9 +56,9 @@ python python/era5_features.py --aoi=US --years=2000-2023 --stage=aggregate \
 
 ### Supporting data
 
-| file | what it does |
+| script | functionality |
 |---|---|
-| `R/build-cybench-aois.R` | Generates `R/cybench-aois.json` — every cy-bench country's bounding box, polygon count, and per-crop year coverage — from the shapefiles themselves, so the boxes cannot drift from the geometry. Re-run it rather than editing the JSON. |
+| `R/build-cybench-aois.R` | Generates `R/cybench-aois.json`: every cy-bench country's bounding box, polygon count, and per-crop year coverage from the AOI shapefiles, so the boxes cannot drift from the geometry. Re-run it rather than editing the JSON. |
 | `R/crop-data-gen.R`, `R/crop-data-gen-cybench.R` | Yield and crop-area target tables (cy-bench and other sources). |
 | `R/phenology-sample-gen.R` | NDVI / FPAR / soil-moisture phenology series per admin unit. |
 | `R/county-climate-cell.R` | County-to-climate-cell lookups used by the experiment runner. |
@@ -80,9 +67,9 @@ python python/era5_features.py --aoi=US --years=2000-2023 --stage=aggregate \
 
 ## ML pipeline
 
-| file | what it does |
+| script | functionality |
 |---|---|
-| `python/data_loader.py` | Assembles the design matrix: joins stage 3's admin-2 features to yield targets, and optionally appends yield history and phenology. `FEATURE_MODES` is `pixel` (whole-season) and `pixel_blocks` (season-relative windows) — both read what stage 3 built, so the feature set is fixed upstream and no flag here can change it. |
+| `python/data_loader.py` | Assembles the design matrix: joins stage 3's admin-2 features to yield targets, and optionally appends yield history and phenology. `FEATURE_MODES` is `pixel` (whole-season) and `pixel_blocks` (season-relative windows) are fixed upstream. |
 | `python/models.py`, `python/train_eval.py` | Model definitions and the train/evaluate loop. |
 | `python/run_loo_experiment.py` | Leave-one-out experiment runner. |
 | `python/tst/` | Time-series transformer arms. |
