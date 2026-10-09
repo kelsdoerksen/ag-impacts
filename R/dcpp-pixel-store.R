@@ -33,6 +33,8 @@
 #   Rscript R/dcpp-pixel-store.R --aoi=ZM --forecast-year=2 1990-2010
 #   Rscript R/dcpp-pixel-store.R --aoi=CONUS --check
 #   Rscript R/dcpp-pixel-store.R --aoi=CONUS --grid-only 1982
+#   Rscript R/dcpp-pixel-store.R --aoi=ZM --member=r2i4p1f1 \
+#       --tag=EC-Earth3_r2i4p1f1 2001-2021       # a second realisation
 #
 # LAYOUT under {out_dir}  (default {AGIMPACTS_ROOT}/{AOI}_processed_data/{model})
 #
@@ -75,6 +77,12 @@ dcpp_member  <- "r1i4p1f1"
 dcpp_aoi_tag <- era5_take_flag("aoi", dcpp_aoi_tag)
 dcpp_model   <- era5_take_flag("model", dcpp_model)
 dcpp_member  <- era5_take_flag("member", dcpp_member)
+# The output identity, separate from the CMIP model name that appears in the
+# NetCDF filenames. Cubes are named pixel_{tag}_{AOI}_s{year}.nc, with no member
+# token, so two members written under the same tag would overwrite each other.
+# Pass --tag=EC-Earth3_r2i4p1f1 to give each realisation its own tree, and the
+# same value to era5_features.py --source so it finds them.
+dcpp_tag     <- era5_take_flag("tag", "")
 .fy_flag     <- era5_take_flag("forecast-year", "")
 .out_flag    <- era5_take_flag("out", "")
 .dir_flag    <- era5_take_flag("data-dir", "")
@@ -90,7 +98,8 @@ if (dcpp_fy < 1L || dcpp_fy > 10L) stop("--forecast-year must be between 1 and 1
 dcpp_cfg <- ERA5_AOIS[[dcpp_aoi_tag]]
 dcpp_key <- dcpp_cfg$era5_key
 
-dcpp_out_dir  <- era5_resolve_out_dir(dcpp_aoi_tag, .out_flag, dcpp_model)
+if (!nzchar(dcpp_tag)) dcpp_tag <- dcpp_model
+dcpp_out_dir  <- era5_resolve_out_dir(dcpp_aoi_tag, .out_flag, dcpp_tag)
 dcpp_nc_dir   <- file.path(dcpp_out_dir, "pixel_daily")
 dcpp_grid_dir <- file.path(dcpp_out_dir, "grid")
 
@@ -176,22 +185,23 @@ dcpp_check <- function() {
 dcpp_pixel_main <- function() {
   dcpp_preflight()
   cat("  Model:      ", dcpp_model, "member", dcpp_member, "FY", dcpp_fy, "\n")
+  cat("  Output tag: ", dcpp_tag, "\n")
   cat("  Output dir: ", dcpp_out_dir, "\n")
 
   pixel_store_run(
     aoi_tag    = dcpp_aoi_tag,
-    source_tag = dcpp_model,
+    source_tag = dcpp_tag,
     years      = dcpp_years,
     loader     = dcpp_cfg$loader,
     get_year   = dcpp_year_rasters,
     cube_path  = function(y) file.path(dcpp_nc_dir,
-                   sprintf("pixel_%s_%s_s%d.nc", dcpp_model, dcpp_aoi_tag, y)),
+                   sprintf("pixel_%s_%s_s%d.nc", dcpp_tag, dcpp_aoi_tag, y)),
     grid_dir   = dcpp_grid_dir,
     overwrite  = .overwrite,
     grid_only  = .grid_only,
     # The hindcasts are published as daily fields, so there is no shift to make.
     utc_offset = 0L,
-    extra_manifest = list(model = dcpp_model, member = dcpp_member,
+    extra_manifest = list(model = dcpp_model, member = dcpp_member, tag = dcpp_tag,
                           forecast_year = dcpp_fy,
                           lon_range = lon_range, lat_range = lat_range)
   )
