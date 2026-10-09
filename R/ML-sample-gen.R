@@ -71,12 +71,27 @@ out_dir    <- file.path(proc_root, "CONUS_processed_data", "EC-Earth3")
 
 nc_listing <- function(var) {
   if (!is.null(.nc_index[[var]])) return(.nc_index[[var]])
-  files <- unlist(lapply(nc_versions, function(v) {
-    d <- file.path(day_data_dir, var, "gr", v)
-    if (!dir.exists(d)) return(character(0))
+
+  # Where to look, most specific first. The pinned nc_versions are preferred so
+  # a known-good publication keeps winning, but they are not required: the
+  # archive gains a new version directory now and then, and a hardcoded list
+  # turns that into "No NetCDFs found" rather than simply using what is there.
+  # The last two candidates cover an archive laid out without version
+  # directories at all.
+  gr    <- file.path(day_data_dir, var, "gr")
+  pinned <- file.path(gr, nc_versions)
+  found  <- sort(list.dirs(gr, full.names = TRUE, recursive = FALSE), decreasing = TRUE)
+  dirs   <- unique(c(pinned[dir.exists(pinned)],
+                     setdiff(found, pinned),
+                     gr, file.path(day_data_dir, var)))
+
+  files <- unlist(lapply(dirs[dir.exists(dirs)], function(d) {
     file.path(d, list.files(d, pattern = "\\.nc$"))
   }), use.names = FALSE)
-  if (!length(files)) stop("No NetCDFs found for variable '", var, "' under ", day_data_dir)
+  if (!length(files)) {
+    stop("No NetCDFs found for variable '", var, "'. Looked in:\n  ",
+         paste(dirs, collapse = "\n  "), call. = FALSE)
+  }
   .nc_index[[var]] <- files
   files
 }

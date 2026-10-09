@@ -274,8 +274,15 @@ class Layout:
         self.admin2 = self.out / "features_admin2"
 
     def _year_tag(self, year):
-        # s-prefixed for an initialised run, bare for an observed calendar year.
-        return f"s{year}" if self.forecast_year else f"{year}"
+        # An initialised run is identified by BOTH its lead time and its
+        # initialisation year: the same s-year at two lead times is two
+        # different forecasts, verifying against two different harvest years.
+        # Leaving the lead out made them share a filename, so a second lead
+        # would have been skipped as "already written" and silently inherited
+        # the first one's data. Mirrors the fy{n}_s{year} convention the climate
+        # parquets already use. An observed run (forecast_year 0) keeps the bare
+        # calendar year, so existing ERA5 files are untouched.
+        return f"fy{self.forecast_year}_s{year}" if self.forecast_year else f"{year}"
 
     def cube(self, year):
         if self.source == "ERA5":
@@ -966,13 +973,17 @@ def stage_aggregate(lay, years, names, reduce, weighting, crop, cy_country, seas
                   f"{min(lens)}-{max(lens)} days -> blocks of "
                   f"~{min(lens)//n_blocks}-{max(lens)//n_blocks} days")
 
+    # Lead-time marker on the admin-2 outputs too: two leads verifying against
+    # the same harvest year are two different predictions and must not share a
+    # filename. Empty for an observed run, so ERA5 filenames do not change.
+    fy_tag = f"fy{lay.forecast_year}_" if lay.forecast_year else ""
     for year in years:
         if reduce == "daily":
-            out = lay.admin2 / f"features_{lay.aoi}_daily_{year}.parquet"
+            out = lay.admin2 / f"features_{lay.aoi}_{fy_tag}daily_{year}.parquet"
         else:
             tag = "fixed" if fixed else crop
             kind = "blocks" if reduce == "blocks" else "season"
-            out = lay.admin2 / f"features_{lay.aoi}_{tag}_{kind}_{year}.parquet"
+            out = lay.admin2 / f"features_{lay.aoi}_{tag}_{fy_tag}{kind}_{year}.parquet"
         if out.exists() and not overwrite:
             print(f"  {year}: exists, skipping ({out.name})")
             continue

@@ -195,7 +195,11 @@ dcpp_pixel_main <- function() {
     loader     = dcpp_cfg$loader,
     get_year   = dcpp_year_rasters,
     cube_path  = function(y) file.path(dcpp_nc_dir,
-                   sprintf("pixel_%s_%s_s%d.nc", dcpp_tag, dcpp_aoi_tag, y)),
+                   # fy in the name, not just the manifest: the same s-year at
+                   # two lead times is two different forecasts, and sharing a
+                   # filename would let the second be skipped as already done.
+                   sprintf("pixel_%s_%s_fy%d_s%d.nc",
+                           dcpp_tag, dcpp_aoi_tag, dcpp_fy, y)),
     grid_dir   = dcpp_grid_dir,
     overwrite  = .overwrite,
     grid_only  = .grid_only,
