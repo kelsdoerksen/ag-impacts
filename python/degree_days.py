@@ -1,10 +1,12 @@
 """Single-sine degree days, shared by the two feature pipelines.
 
-Both `era5_features.py` (per-pixel ERA5 features) and `data_loader.py`
-(`--feature_mode agro`) accumulate growing and extreme degree days. They used to
-carry separate implementations — one integrating the diurnal cycle, one working
-off the daily mean — which meant `gdd` and `edd` named different quantities
-depending on which path produced them. One definition lives here now.
+`era5_features.py` accumulates growing and extreme degree days per pixel for
+both climate sources, ERA5 and the EC-Earth3 hindcasts. The two pipelines once
+carried separate implementations — one integrating the diurnal cycle, one
+working off the daily mean — which meant `gdd` and `edd` named different
+quantities depending on which path produced them. One definition lives here now,
+and the thresholds are set where the features are built (stage 2), not at model
+fit time.
 
 Why a sine and not the daily mean
 ---------------------------------

@@ -63,41 +63,6 @@ def draw_seed() -> int:
 WEATHER_VARS    = ["tasmax_C", "tasmin_C", "hursmin", "pr_mm"]
 FEATURE_MODES   = ["pixel", "pixel_blocks"]
 
-# ── degree-day defaults ──────────────────────────────────────────────────────
-# Defaults for the degree-day features, mirrored by era5_features.py's registry
-# so a run that overrides them here and a stage-2 cube built elsewhere cannot
-# disagree silently.
-#
-# Growing and extreme degree days both use the single-sine method from
-# degree_days.py -- the day's heat integrated under a sine diurnal cycle between
-# tasmin and tasmax, not read off the daily mean. See that module for why the
-# distinction matters (it is the difference between counting and missing the
-# heat on every day the threshold falls inside the day's range).
-#
-# GDD is capped: heat between GDD_BASE_C and GDD_CAP_C counts toward growth,
-# heat above the cap does not and is charged to EDD instead. That is the
-# piecewise-linear corn response -- gains to ~30 C, losses above it.
-GDD_BASE_C          = 10.0   # corn lower base temperature
-EDD_THRESHOLD_C     = 30.0   # corn extreme-heat threshold
-GDD_CAP_C           = None   # upper bound on beneficial heat; None = EDD_THRESHOLD_C
-GDD_PRESEASON_DAYS  = 14     # GDD accumulation starts this many days pre-plant
-
-# Sub-seasonal features are binned into fixed-length blocks measured from the
-# window start rather than calendar months, so block k means the same
-# phenological stage in every county (m01 is always "the month before the
-# planting window opens"). Calendar months cannot do this: the CONUS corn
-# window spans DOY ~0-363 and varies in length by ~80 days, so a given calendar
-# month falls inside some counties' windows and outside others'.
-SEASON_BLOCK_DAYS    = 30
-SEASON_BLOCKS_DEFAULT = 8    # 8 x 30 = 240 days; every CONUS corn window covers it
-
-# Variables summarised per season block, and the statistics computed for each.
-SEASON_BLOCK_VARS  = ["pr_mm", "hursmin"]
-SEASON_BLOCK_STATS = ["mean", "min", "max", "std", "var"]
-
-# Variables summarised over the whole window ("entire time series") with the
-# same five statistics.
-WHOLE_WINDOW_STATS_VARS = ["hursmin"]
 TARGET_OPTIONS  = ["yield", "yield_pct_change"]
 
 # Targets expressed relative to a county's own history. Unlike the entries in

@@ -52,12 +52,7 @@ from sklearn.metrics import root_mean_squared_error
 from models import YieldModel, SUPPORTED_MODELS
 from data_loader import (
     ANOMALY_TARGETS,
-    EDD_THRESHOLD_C,
     FEATURE_MODES,
-    GDD_BASE_C,
-    GDD_PRESEASON_DAYS,
-    SEASON_BLOCKS_DEFAULT,
-    SEASON_BLOCK_DAYS,
     SUPPORTED_CROPS,
     TARGET_OPTIONS,
     WEATHER_VARS,
