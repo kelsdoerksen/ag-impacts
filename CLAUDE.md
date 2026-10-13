@@ -141,6 +141,116 @@ anomalies (how spatially coherent the shock is).
 Deprioritise small admin-1 AOIs (MZ, LS, AO, TD — ≤26 units) as robustness
 checks only, and anything with mean_r below ~0.1 (CN, EL, PT, IT, IN).
 
+## Onboarding a collaborator for ERA5 processing
+
+AOIs are independent — each writes to its own `{AOI}_processed_data/ERA5`
+directory — so two people can process different AOIs into the same tree with no
+coordination beyond agreeing who takes which. Claim a block from the table
+below and say so.
+
+### 1. Get your own CDS account
+
+**Do not share an account.** The CDS queue penalty is per-account and
+compounds with recent usage: two people on one account slow each other down
+badly, and large requests start being refused on cost. With separate accounts
+you genuinely parallelise.
+
+1. Register at <https://cds.climate.copernicus.eu> and verify the email.
+2. Open the **reanalysis-era5-single-levels** dataset, go to its *Download*
+   tab, scroll to the licence box and **accept the Copernicus licence**. This
+   is the step people miss — the API returns 403 until it is accepted, and the
+   error does not say why.
+3. Copy your **Personal Access Token** from your profile page (a 36-character
+   UUID).
+4. Write `~/.cdsapirc`:
+
+   ```
+   url: https://cds.climate.copernicus.eu/api
+   key: <your-36-char-token>
+   ```
+
+   `chmod 600 ~/.cdsapirc`. Note the current API takes the token alone — the
+   older `UID:APIKEY` form is for the retired endpoint.
+
+### 2. Set up on the lab PC
+
+```sh
+ssh crl@137.158.31.55
+cd ~/kdoerksen/code/ag-impacts && git pull
+conda activate agimpacts-r          # NOT the base env: see Environment above
+
+# prove the setup before committing to a batch -- seconds, one live CDS fetch
+python python/run_cybench_era5.py     --out /mnt/crl_storage/personal_folders/kdoerksen/era5     --root /mnt/crl_storage/personal_folders/kdoerksen     --aois CZ --from-year 2001 --python $CONDA_PREFIX/bin/python
+```
+
+That prints the plan without downloading. Then one AOI for real, in tmux:
+
+```sh
+tmux new -s era5_cz
+python python/run_cybench_era5.py     --out /mnt/crl_storage/personal_folders/kdoerksen/era5     --root /mnt/crl_storage/personal_folders/kdoerksen     --aois CZ,PL,BG,SK,BE,AT --from-year 2001     --python $CONDA_PREFIX/bin/python --go
+# Ctrl-b d to detach
+```
+
+Pass `--root` and `--out` on the command line, never via export — a `tmux new`
+attached to an existing server does not inherit the parent shell's exports.
+
+Explicit `--aois` runs in the order given, so put the ones you care about
+first. Everything is resumable: both stages skip what is already on disk, and a
+failed AOI is logged and stepped over rather than stopping the queue.
+
+### 3. AOIs still to do, in priority order
+
+`mean_r` is the mean pairwise correlation of detrended unit yield anomalies —
+how spatially coherent the annual climate shock is. `CV` is how much
+interannual variation exists to explain. Both measured from the cy-bench yield
+tables; see Priorities above for the method.
+
+| | units | yrs | obs | CV | mean_r | req/yr | notes |
+|---|---|---|---|---|---|---|---|
+| DE | 321 | 43 | 8,945 | 0.13 | 0.32 | 1 | biggest remaining panel |
+| CZ | 14 | 16 | 216 | 0.18 | 0.81 | 1 | strongest coherence anywhere |
+| PL | 17 | 18 | 301 | 0.14 | 0.62 | 1 | |
+| IT | 101 | 26 | 2,318 | 0.17 | 0.11 | 2 | |
+| BG | 6 | 30 | 180 | 0.27 | 0.64 | 1 | |
+| SK | 8 | 12 | 94 | 0.23 | 0.76 | 1 | |
+| BE | 10 | 10 | 81 | 0.18 | 0.79 | 1 | |
+| AT | 9 | 46 | 414 | 0.12 | 0.45 | 1 | longest record here |
+| LT | 10 | 21 | 181 | 0.35 | 0.47 | 1 | |
+| LS | 10 | 41 | 393 | **0.50** | 0.46 | 1 | highest CV, cheapest AOI (168 cells) |
+| MZ | 10 | 22 | 196 | 0.42 | 0.53 | 2 | |
+| AO | 18 | 21 | 378 | 0.30 | 0.43 | 2 | |
+| IN | 501 | 28 | 11,930 | 0.33 | 0.09 | 6 | monsoon; second-biggest panel |
+| NE | 30 | 40 | 530 | 0.41 | 0.27 | 2 | |
+| ES | 53 | 23 | 1,146 | 0.17 | 0.13 | 3 | |
+| ZA | 9 | 36 | 316 | 0.20 | 0.33 | 4 | |
+| EL | 52 | 11 | 559 | 0.20 | 0.03 | 1 | weak signal |
+| NL | 10 | 13 | 119 | 0.17 | 0.15 | 1 | weak signal |
+| TD | 17 | 31 | 425 | 0.38 | 0.05 | 1 | weak signal |
+| PT | 7 | 35 | 243 | 0.14 | −0.02 | 3 | weak signal |
+| CN | 31 | 33 | 998 | 0.10 | 0.03 | — | **`--source arco`**: 36,105 cells, CDS refuses |
+
+Suggested coherent blocks: **Central Europe** (CZ, PL, BG, SK, BE, AT, DE, LT,
+NL, EL) — ten AOIs, nearly all 1 request/year, no ARCO needed. **Africa**
+(LS, MZ, AO, NE, TD, ZA). **Large/awkward** (IN, ES, IT, PT, CN) — CN must use
+ARCO.
+
+**Do not process**: `EE`, `FI`, `IE`, `LV` (100% zero yields in cy-bench);
+`DK` (7 units, median 2 years each), `SE` (1 unit), `HR` (2 units), `MX` (4
+distinct years) — too thin for a panel.
+
+### 4. Expectations and failure modes
+
+- **`--months-per-request`**: leave it off so each AOI sizes itself. If CDS
+  starts refusing with `403 ... cost limits exceeded`, pin `--months-per-request 3`.
+- **Queue time dominates.** 18–25 min of waiting per request for ~2 min of work,
+  and it degrades with recent account usage. A 1-request/year AOI over 20 years
+  is a few hours; the request count in the plan is the number that matters.
+- **Large AOIs need ARCO** (`--source arco`). A month over more than ~20,000
+  cells is refused by CDS on cost. ARCO has no queue but transfers global fields
+  and has **no intra-year cache**, so do not kill it mid-year.
+- If a run dies, `cat {out}/{AOI}/last_error.txt` has the reason even when the
+  log looks truncated.
+
 ## Working style
 
 - Verify against real data rather than asserting. Every fix in this repo's
