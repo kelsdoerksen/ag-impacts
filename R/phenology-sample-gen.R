@@ -25,7 +25,7 @@ library(arrow)
 
 # ===== MAIN VARIABLES TO UPDATE ACCORDINGLY =====
 
-country   <- "usa"                              # see COUNTRY_CONFIG below
+country   <- "usa"                              # fallback when no args are passed
 variables <- c("ndvi", "fpar", "soil_moisture") # phenology variables to generate
 
 proc_root    <- "/Users/kdoerkse/Documents/UCT/AgImpacts"
@@ -44,7 +44,16 @@ county_shp   <- file.path(proc_root, "us_county_2020_shapefile", "cb_2020_us_cou
 #                     adm2/adm1, matching the climate set
 #   adm_id_to_adm2  : fn(adm_id) -> adm2_id, mapping the CY-Bench id onto the
 #                     adm2_id convention this AOI's climate parquets use
-COUNTRY_CONFIG <- list(
+# `usa` is the LEGACY CONUS pipeline: it remaps cy-bench's US-SS-CCC ids onto
+# 5-digit GEOIDs and writes CONUS_processed_data, to match the climate parquets
+# ML-sample-gen.R produced. It is NOT interchangeable with the cy-bench "US"
+# AOI below, whose crop parquet and stage-3 features both key on the raw adm_id
+# -- mixing the two gives an empty join, not a wrong number.
+#
+# Every cy-bench AOI is otherwise identical: identity id mapping, boundaries
+# from its own polygon file, output beside its crop parquet. So those are
+# generated rather than listed.
+LEGACY_CONFIG <- list(
   usa = list(
     cy_country      = "US",
     crop            = "maize",
@@ -53,27 +62,34 @@ COUNTRY_CONFIG <- list(
     load_boundaries = function() load_us_boundaries(county_shp),
     # "US-SS-CCC" -> 5-digit GEOID
     adm_id_to_adm2  = function(adm_id) paste0(substr(adm_id, 4, 5), substr(adm_id, 7, 9))
-  ),
-  # cy-bench AOIs key the climate parquets on the raw adm_id, so the mapping is
-  # the identity and the boundary set comes from the cy-bench polygons.
-  BF = list(
-    cy_country      = "BF",
-    crop            = "maize",
-    aoi             = "BF",
-    out_dir         = file.path(proc_root, "BF_processed_data"),
-    load_boundaries = function() load_cybench_boundaries(file.path(cybench_poly, "BF", "BF.shp")),
-    adm_id_to_adm2  = function(adm_id) adm_id
-  ),
-  ET = list(
-    cy_country      = "ET",
-    crop            = "maize",
-    aoi             = "ET",
-    out_dir         = file.path(proc_root, "ET_preprocessed_data"),
-    load_boundaries = function() load_cybench_boundaries(file.path(cybench_poly, "ET", "ET.shp")),
-    adm_id_to_adm2  = function(adm_id) adm_id
   )
 )
 
+OUT_DIR_OVERRIDE <- list(ET = "ET_preprocessed_data")
+
+cy_config <- function(country, crop = "maize") {
+  dirname <- OUT_DIR_OVERRIDE[[country]]
+  if (is.null(dirname)) dirname <- paste0(country, "_processed_data")
+  list(
+    cy_country      = country,
+    crop            = crop,
+    aoi             = country,
+    out_dir         = file.path(proc_root, dirname),
+    load_boundaries = function() load_cybench_boundaries(
+      file.path(cybench_poly, country, paste0(country, ".shp"))),
+    adm_id_to_adm2  = function(adm_id) adm_id
+  )
+}
+
+resolve_config <- function(country) {
+  if (!is.null(LEGACY_CONFIG[[country]])) return(LEGACY_CONFIG[[country]])
+  shp <- file.path(cybench_poly, country, paste0(country, ".shp"))
+  if (!file.exists(shp)) {
+    stop("No polygons for '", country, "': ", shp,
+         "\n  Legacy AOIs: ", paste(names(LEGACY_CONFIG), collapse = ", "))
+  }
+  cy_config(country)
+}
 
 # ===== VARIABLE CONFIG =====
 # value_cols : numeric columns kept from each CY-Bench CSV
@@ -100,15 +116,23 @@ load_us_boundaries <- function(shp_path) {
 # adm_id — the same convention ML-sample-gen.R's load_cybench_boundaries() writes
 # into the climate parquets. cy-bench ships no unit names, so adm2 carries the id
 # itself and adm1 is the reconstructed parent code {CC}-A1-{AA}.
+# Four adm_id conventions across the cy-bench polygons; see the matching
+# cybench_adm1() in crop-data-gen-cybench.R.
+cybench_adm1 <- function(adm_id) {
+  ifelse(grepl("^[A-Z]{2}-A2-", adm_id),
+         paste0(substr(adm_id, 1, 2), "-A1-",
+                substr(sub("^[A-Z]{2}-A2-", "", adm_id), 1, 2)),
+  ifelse(grepl("^[A-Z]{2}-[0-9]+-", adm_id),
+         sub("^([A-Z]{2}-[0-9]+)-.*$", "\\1", adm_id),
+  ifelse(grepl("^[A-Z]{2}[0-9]", adm_id),
+         paste0(substr(adm_id, 1, 2), "-", substr(adm_id, 3, 4)),
+         substr(adm_id, 1, 3))))
+}
+
 load_cybench_boundaries <- function(shp_path) {
   st_read(shp_path, quiet = TRUE) %>%
     st_drop_geometry() %>%
-    transmute(
-      adm2_id = adm_id,
-      adm2    = adm_id,
-      adm1    = paste0(substr(adm_id, 1, 2), "-A1-",
-                       substr(sub("^[A-Z]{2}-A2-", "", adm_id), 1, 2))
-    )
+    transmute(adm2_id = adm_id, adm2 = adm_id, adm1 = cybench_adm1(adm_id))
 }
 
 # Read one CY-Bench phenology CSV and shape it into the standard phenology schema:
@@ -152,10 +176,7 @@ load_phenology_csv <- function(cybench_dir, crop, cy_country, var, value_cols, c
 # Wrapped so the file can be sourced for its functions without running the loop.
 main <- function(country = get("country", envir = globalenv())) {
 
-if (!country %in% names(COUNTRY_CONFIG)) {
-  stop("Unknown country '", country, "'. Options: ", paste(names(COUNTRY_CONFIG), collapse = ", "))
-}
-cfg       <- COUNTRY_CONFIG[[country]]
+cfg       <- resolve_config(country)
 crop      <- cfg$crop
 aoi       <- cfg$aoi
 pheno_dir <- file.path(cfg$out_dir, "phenology")  # separate from the climate parquets
