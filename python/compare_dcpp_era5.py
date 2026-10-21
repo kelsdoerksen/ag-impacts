@@ -441,7 +441,10 @@ def main(argv=None):
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--aois", required=True, help="comma-separated AOI tags, e.g. ZM,ET")
     p.add_argument("--members", help="comma-separated DCPP members; default: discover")
-    p.add_argument("--forecast-year", type=int, default=1)
+    p.add_argument("--forecast-years", default="1",
+                   help="comma-separated DCPP lead times, e.g. 1,2 or 1,2,3,4")
+    p.add_argument("--forecast-year", type=int, default=None,
+                   help="deprecated single-lead alias for --forecast-years")
     p.add_argument("--harvest-years", default="2002-2022",
                    help="HARVEST years to compare (source years are derived)")
     p.add_argument("--share", default=DEFAULT_SHARE,
@@ -485,20 +488,27 @@ def main(argv=None):
     harvest_years = parse_years(a.harvest_years)
     if not harvest_years:
         raise SystemExit(f"--harvest-years parsed to nothing: {a.harvest_years!r}")
-    if a.forecast_year < 1:
+    if a.forecast_year is not None:          # deprecated alias wins if given
+        a.forecast_years = str(a.forecast_year)
+    fy_list = parse_years(a.forecast_years)
+    if not fy_list:
+        raise SystemExit(f"--forecast-years parsed to nothing: {a.forecast_years!r}")
+    if min(fy_list) < 1:
         raise SystemExit(
-            f"--forecast-year must be >= 1 for a hindcast (got {a.forecast_year}).\n"
+            f"lead times must be >= 1 for a hindcast (got {sorted(fy_list)}).\n"
             "At 0 the DCPP outputs would take the observed naming convention and "
             "collide with the ERA5 tree's filenames.")
 
     # Source years each side needs. era5_features.py takes SOURCE years and
     # derives the harvest years itself, so these only have to be a superset.
     era5_src = sorted({y for h in harvest_years for y in season_source_years(h, 0)})
-    dcpp_src = sorted({y for h in harvest_years
-                       for y in season_source_years(h, a.forecast_year)})
+    dcpp_src_by_fy = {
+        fy: sorted({y for h in harvest_years for y in season_source_years(h, fy)})
+        for fy in fy_list}
 
     print("=" * 78)
-    print(f"DCPP (fy{a.forecast_year}) vs ERA5 -- cropland-weighted admin-2 features")
+    print(f"DCPP (fy{','.join(str(f) for f in fy_list)}) vs ERA5 "
+          f"-- cropland-weighted admin-2 features")
     print("=" * 78)
     print(f"  ERA5 tree   : {era5_root}/{{AOI}}")
     print(f"  DCPP tree   : {dcpp_root}/{{AOI}}_processed_data/{MODEL}_{{member}}")
@@ -506,7 +516,9 @@ def main(argv=None):
     print(f"  out         : {out_dir}")
     print(f"  harvest yrs : {harvest_years[0]}-{harvest_years[-1]} ({len(harvest_years)})")
     print(f"  ERA5 source : {era5_src[0]}-{era5_src[-1]}")
-    print(f"  DCPP source : {dcpp_src[0]}-{dcpp_src[-1]}")
+    for fy in fy_list:
+        v = dcpp_src_by_fy[fy]
+        print(f"  DCPP FY{fy}    : s{v[0]}-{v[-1]}")
     print(f"  features    : {','.join(feats)}   reduce={a.reduce} weight={a.weight}")
     print()
 
@@ -527,7 +539,7 @@ def main(argv=None):
     if not plan:
         raise SystemExit("nothing to do")
 
-    n_builds = sum(1 + len(m) for _, m in plan)
+    n_builds = sum(1 + len(m) * len(fy_list) for _, m in plan)
     print(f"\n  {len(plan)} AOI(s), {n_builds} era5_features.py invocation(s)")
     # Echo the exact commands: this is the thing worth reviewing before a long
     # run, and reconstructing it from the flags above is error-prone.
@@ -536,13 +548,12 @@ def main(argv=None):
     print("    " + " ".join(build_cmd(a, aoi0, "ERA5", era5_dir(era5_root, aoi0), 0, era5_src)))
     print("    " + " ".join(build_cmd(a, aoi0, f"{MODEL}_{mems0[0]}",
                                       dcpp_dir(dcpp_root, aoi0, mems0[0]),
-                                      a.forecast_year, dcpp_src)))
+                                      fy_list[0], dcpp_src_by_fy[fy_list[0]])))
     if not a.go:
         print("\n  dry run -- add --go to execute")
         return 0
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    tag = a.tag or f"fy{a.forecast_year}_{a.reduce}_{harvest_years[0]}-{harvest_years[-1]}"
 
     all_rows, failures, written = [], [], []
     for aoi, mems in plan:
@@ -553,6 +564,9 @@ def main(argv=None):
         aoi_out = out_dir / aoi
         (aoi_out / "logs").mkdir(parents=True, exist_ok=True)
 
+        # ERA5 is lead-independent: built and loaded ONCE per AOI, then reused
+        # for every lead. Rebuilding it per lead would spawn a process per lead
+        # that does nothing but print "exists, skipping".
         if not a.skip_build:
             print("  building ERA5 features ...")
             cmd = build_cmd(a, aoi, "ERA5", e_dir, 0, era5_src)
@@ -577,76 +591,86 @@ def main(argv=None):
         print(f"    ERA5: {len(era5)} rows, {era5.adm2_id.nunique()} units, "
               f"{era5.harvest_year.nunique()} years")
 
-        aoi_pairs = []
-        for mem in mems:
-            source = f"{MODEL}_{mem}"
-            d_dir = dcpp_dir(dcpp_root, aoi, mem)
-            if not a.skip_build:
-                print(f"  building {source} ...")
-                cmd = build_cmd(a, aoi, source, d_dir, a.forecast_year, dcpp_src)
-                if not run_build(cmd, aoi_out / "logs" / f"{aoi}_{source}.log"):
-                    failures.append((aoi, source, "build"))
+        for fy in fy_list:
+            a.forecast_year = fy          # build_cmd reads this
+            dcpp_src = dcpp_src_by_fy[fy]
+            tag = a.tag or f"fy{fy}_{a.reduce}_{harvest_years[0]}-{harvest_years[-1]}"
+            print(f"  -- FY{fy}  (initialisations s{dcpp_src[0]}-{dcpp_src[-1]}) --")
+
+            aoi_pairs = []
+            for mem in mems:
+                source = f"{MODEL}_{mem}"
+                d_dir = dcpp_dir(dcpp_root, aoi, mem)
+                label = f"{source} FY{fy}"
+                if not a.skip_build:
+                    print(f"    building {label} ...")
+                    cmd = build_cmd(a, aoi, source, d_dir, fy, dcpp_src)
+                    if not run_build(cmd, aoi_out / "logs" / f"{aoi}_{source}_fy{fy}.log"):
+                        failures.append((aoi, label, "build"))
+                        continue
+                dcpp = _load_side(d_dir, aoi, a.crop, fy, harvest_years,
+                                  a.reduce, fixed, f"{aoi}/{source}/FY{fy}")
+                if dcpp.empty:
+                    failures.append((aoi, label, "no output"))
                     continue
-            dcpp = _load_side(d_dir, aoi, a.crop, a.forecast_year, harvest_years,
-                              a.reduce, fixed, f"{aoi}/{source}")
-            if dcpp.empty:
-                failures.append((aoi, source, "no output"))
-                continue
-            usable = [c for c in have if c in value_columns(dcpp)]
-            if not usable:
-                failures.append((aoi, source, "no shared features"))
-                continue
-            pr = pair_long(era5, dcpp, usable, mem)
-            if pr.empty:
-                failures.append((aoi, source, "empty join"))
-                continue
-            dropped = era5.adm2_id.nunique() - pr.adm2_id.nunique()
-            print(f"    {source}: {len(pr)} paired values, {pr.adm2_id.nunique()} units"
-                  + (f" ({dropped} ERA5 unit(s) absent from DCPP)" if dropped > 0 else ""))
-            aoi_pairs.append(pr)
+                usable = [c for c in have if c in value_columns(dcpp)]
+                if not usable:
+                    failures.append((aoi, label, "no shared features"))
+                    continue
+                pr = pair_long(era5, dcpp, usable, mem)
+                if pr.empty:
+                    failures.append((aoi, label, "empty join"))
+                    continue
+                dropped = era5.adm2_id.nunique() - pr.adm2_id.nunique()
+                print(f"      {source}: {len(pr)} paired values, "
+                      f"{pr.adm2_id.nunique()} units"
+                      + (f" ({dropped} ERA5 unit(s) absent from DCPP)"
+                         if dropped > 0 else ""))
+                aoi_pairs.append(pr)
 
-        if not aoi_pairs:
-            continue
-        pairs = pd.concat(aoi_pairs, ignore_index=True)
-        pairs.insert(0, "aoi", aoi)
-        ens = ensemble_mean(pairs.drop(columns="aoi"))
-        ens.insert(0, "aoi", aoi)
-        # Pairs are written per AOI below, so nothing accumulates across AOIs:
-        # a 10-member x 21-year x 1900-unit AOI is millions of rows on its own.
-        rows, yrows = [], []
-        for member, mdf in pd.concat([pairs, ens], ignore_index=True).groupby("member"):
-            for feat, fdf in mdf.groupby("feature"):
-                key = {"aoi": aoi, "member": member, "feature": feat,
-                       "forecast_year": a.forecast_year}
-                rec = dict(key, reduce=a.reduce, weight=a.weight, crop=a.crop)
-                if member == "ENSMEAN":
-                    rec["n_members"] = int(fdf["n_members"].max())
-                rec.update(metrics(fdf))
-                rows.append(rec)
-                ym = yearly_metrics(fdf)
-                for k, v in reversed(list(key.items())):
-                    ym.insert(0, k, v)
-                yrows.append(ym)
-        all_rows.extend(rows)
-        yearly = pd.concat(yrows, ignore_index=True) if yrows else pd.DataFrame()
+            if not aoi_pairs:
+                continue
+            pairs = pd.concat(aoi_pairs, ignore_index=True)
+            pairs.insert(0, "aoi", aoi)
+            ens = ensemble_mean(pairs.drop(columns="aoi"))
+            ens.insert(0, "aoi", aoi)
+            # Pairs are written per (AOI, lead) below, so nothing accumulates
+            # across AOIs: a 10-member x 21-year x 1900-unit AOI is millions
+            # of rows on its own.
+            both = pd.concat([pairs, ens], ignore_index=True)
 
-        meta = dict(
-            created=time.strftime("%Y-%m-%d %H:%M:%S %Z"), argv=sys.argv,
-            model=MODEL, aoi=aoi, members=mems,
-            forecast_year=a.forecast_year,
-            harvest_years=[harvest_years[0], harvest_years[-1]],
-            era5_source_years=[era5_src[0], era5_src[-1]],
-            dcpp_source_years=[dcpp_src[0], dcpp_src[-1]],
-            features_requested=feats, compared_columns=sorted(set(have)),
-            reduce=a.reduce, weight=a.weight, crop=a.crop,
-            era5_dir=str(e_dir), dcpp_root=str(dcpp_root), data_root=a.root,
-        )
-        paths = write_aoi_outputs(aoi_out, tag, rows, yearly,
-                                  pd.concat([pairs, ens], ignore_index=True),
-                                  meta, [f for f in failures if f[0] == aoi])
-        written.extend(paths)
-        for q in paths:
-            print(f"    -> {q}")
+            rows, yrows = [], []
+            for member, mdf in both.groupby("member"):
+                for feat, fdf in mdf.groupby("feature"):
+                    key = {"aoi": aoi, "member": member, "feature": feat,
+                           "forecast_year": fy}
+                    rec = dict(key, reduce=a.reduce, weight=a.weight, crop=a.crop)
+                    if member == "ENSMEAN":
+                        rec["n_members"] = int(fdf["n_members"].max())
+                    rec.update(metrics(fdf))
+                    rows.append(rec)
+                    ym = yearly_metrics(fdf)
+                    for k, v in reversed(list(key.items())):
+                        ym.insert(0, k, v)
+                    yrows.append(ym)
+            all_rows.extend(rows)
+            yearly = pd.concat(yrows, ignore_index=True) if yrows else pd.DataFrame()
+
+            meta = dict(
+                created=time.strftime("%Y-%m-%d %H:%M:%S %Z"), argv=sys.argv,
+                model=MODEL, aoi=aoi, members=mems, forecast_year=fy,
+                harvest_years=[harvest_years[0], harvest_years[-1]],
+                era5_source_years=[era5_src[0], era5_src[-1]],
+                dcpp_source_years=[dcpp_src[0], dcpp_src[-1]],
+                features_requested=feats, compared_columns=sorted(set(have)),
+                reduce=a.reduce, weight=a.weight, crop=a.crop,
+                era5_dir=str(e_dir), dcpp_root=str(dcpp_root), data_root=a.root,
+            )
+            paths = write_aoi_outputs(aoi_out, tag, rows, yearly, both, meta,
+                                      [f for f in failures if f[0] == aoi])
+            written.extend(paths)
+            for q in paths:
+                print(f"      -> {q.name}")
 
     if not all_rows:
         raise SystemExit("no comparable data produced -- see the logs in "

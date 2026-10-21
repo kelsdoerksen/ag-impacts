@@ -143,6 +143,36 @@ def metric_table(ens: pd.DataFrame, fy: int) -> str:
             f'<tbody>{"".join(rows)}</tbody></table>')
 
 
+def lead_compare_table(ens: pd.DataFrame, metric: str, leads) -> str:
+    """Rows AOI/feature, one column per lead, plus the change across leads.
+
+    This is the layout for answering "how much skill is lost going from FY1 to
+    FY2": the two numbers sit adjacent, and the delta is computed rather than
+    left to the reader. The delta is deliberately NOT colour-coded by sign --
+    decay with lead is the expected physics, not a defect.
+    """
+    p = ens.pivot_table(index=["aoi", "feature"], columns="forecast_year",
+                        values=metric, aggfunc="mean", observed=True)
+    if p.empty:
+        return '<p class="na">no data</p>'
+    cols = list(p.columns)
+    head = "".join(f'<th class="r">FY{c}</th>' for c in cols)
+    delta_head = (f'<th class="r delta">&Delta; FY{cols[-1]}&minus;FY{cols[0]}</th>'
+                  if len(cols) > 1 else "")
+    rows = []
+    for (aoi, feat), row in p.iterrows():
+        cells = "".join(f'<td class="r">{num(v)}</td>' for v in row)
+        d = ""
+        if len(cols) > 1:
+            dv = row[cols[-1]] - row[cols[0]]
+            d = ('<td class="r delta">&mdash;</td>' if pd.isna(dv)
+                 else f'<td class="r delta">{dv:+.3f}</td>')
+        rows.append(f'<tr><td>{html.escape(str(aoi))}</td>'
+                    f'<td class="mono">{html.escape(str(feat))}</td>{cells}{d}</tr>')
+    return (f'<table><thead><tr><th>AOI</th><th>feature</th>{head}{delta_head}'
+            f'</tr></thead><tbody>{"".join(rows)}</tbody></table>')
+
+
 def lead_table(ens: pd.DataFrame, metric: str) -> str:
     p = ens.pivot_table(index=["aoi", "feature"], columns="forecast_year",
                         values=metric, aggfunc="mean", observed=True)
@@ -242,43 +272,55 @@ def chart_grid(yearly: pd.DataFrame, metric: str, ylab, ylim=(-1, 1)) -> str:
 
 # --------------------------------------------------------------------- main --
 
-def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--dir", required=True, help="comparisons root; reads {dir}/{AOI}/")
-    p.add_argument("--aois", help="comma-separated AOIs; default: all found")
-    p.add_argument("--metric", default="r_anom", choices=SKILL_ORDER,
-                   help="headline metric for the skill-vs-lead table")
-    p.add_argument("--out", default=None)
-    p.add_argument("--title", default="EC-Earth3 DCPP vs ERA5 — feature skill")
-    a = p.parse_args(argv)
+CSS = """
+:root{--bg:#fff;--fg:#17181a;--mut:#6b7280;--line:#e5e7eb;--head:#f9fafb;--card:#fff}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){
+ --bg:#121417;--fg:#e7e9ea;--mut:#9ba1a6;--line:#2a2e34;--head:#191c20;--card:#171a1e}}
+:root[data-theme=dark]{--bg:#121417;--fg:#e7e9ea;--mut:#9ba1a6;--line:#2a2e34;--head:#191c20;--card:#171a1e}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);margin:0;padding:34px 18px;
+ font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+.wrap{max-width:1180px;margin:0 auto}
+h1{font-size:26px;margin:0 0 4px;letter-spacing:-.01em}
+h2{font-size:18px;margin:40px 0 8px;padding-top:16px;border-top:2px solid var(--line)}
+h3{font-size:14px;margin:20px 0 6px;color:var(--mut);font-weight:600;
+ text-transform:uppercase;letter-spacing:.04em}
+.sub{color:var(--mut);font-size:13.5px;margin:0 0 14px;max-width:80ch}
+.meta{color:var(--mut);font-size:13px;margin:8px 0 0}
+table{border-collapse:collapse;width:100%;margin:10px 0 6px;font-size:13.5px}
+th,td{padding:6px 10px;border-bottom:1px solid var(--line);white-space:nowrap;text-align:left}
+thead th{background:var(--head);font-weight:600;font-size:12px;
+ text-transform:uppercase;letter-spacing:.03em;color:var(--mut)}
+td.r,th.r{text-align:right;font-variant-numeric:tabular-nums}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+.sm{font-size:12.5px;white-space:normal;color:var(--mut)}
+.defs td{white-space:normal;vertical-align:top}
+.dim{color:var(--mut)} .na{color:var(--mut)} .sd{color:var(--mut);font-size:11.5px}
+td.delta,th.delta{border-left:2px solid var(--line);font-variant-numeric:tabular-nums;
+ color:var(--fg);font-weight:600}
+h3.tight{margin:12px 0 2px;text-transform:none;letter-spacing:0}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px;margin:12px 0}
+.fig{margin:0;background:var(--card);border:1px solid var(--line);border-radius:7px;padding:10px 8px 4px}
+figcaption{font-size:12.5px;font-weight:600;padding:0 6px 4px;display:flex;
+ justify-content:space-between;align-items:baseline}
+.ylab{color:var(--mut);font-weight:400;font-size:11.5px}
+.chart{width:100%;height:auto;display:block}
+.grid line.grid{stroke:var(--line);stroke-width:1}
+line.grid{stroke:var(--line);stroke-width:1}
+line.zero{stroke:var(--mut);stroke-width:1;stroke-dasharray:3 2}
+text.tick{fill:var(--mut);font-size:9.5px}
+.ta-end{text-anchor:end}.ta-mid{text-anchor:middle}
+.legend{padding:2px 6px 6px;font-size:11.5px;color:var(--mut)}
+.key{margin-right:10px}.key i{display:inline-block;width:9px;height:9px;border-radius:2px;
+ margin-right:4px;vertical-align:-1px}
+.note{background:var(--head);border-left:3px solid var(--mut);padding:12px 15px;
+ margin:20px 0;font-size:13.5px;border-radius:0 5px 5px 0}
+@media(max-width:700px){body{padding:20px 14px}table{display:block;overflow-x:auto}
+ .grid{grid-template-columns:1fr}}
+"""
 
-    d = Path(a.dir)
-    aois = [x.strip() for x in a.aois.split(",") if x.strip()] if a.aois else None
-    summ = load(d, "dcpp_era5_corr_*.csv", aois)
-    yearly = load(d, "dcpp_era5_year_*.csv", aois, required=False)
-    print(f"summary: {len(summ)} rows, AOIs {sorted(summ.aoi.unique())}, "
-          f"leads {sorted(summ.forecast_year.unique())}")
-    print(f"per-year: {len(yearly)} rows" if not yearly.empty
-          else "per-year: none found (older run; rerun compare to get them)")
-
-    if a.out:
-        out = Path(a.out)
-    else:
-        out = d / ("dcpp_skill_report" + (f"_{'-'.join(aois)}" if aois else "") + ".html")
-
-    ens = summ[summ.member == "ENSMEAN"].copy()
-    mem = summ[summ.member != "ENSMEAN"].copy()
-    if ens.empty:
-        raise SystemExit("no ENSMEAN rows found")
-    order = ens.groupby("aoi")[a.metric].mean().sort_values(ascending=False).index.tolist()
-    for f in (ens, mem):
-        f["aoi"] = pd.Categorical(f.aoi, categories=order, ordered=True)
-    leads = sorted(summ.forecast_year.unique())
-    ey = yearly[yearly.member == "ENSMEAN"].copy() if not yearly.empty else pd.DataFrame()
-    if not ey.empty:
-        ey["aoi"] = pd.Categorical(ey.aoi, categories=order, ordered=True)
-
+def render_page(a, ens, mem, ey, leads, order, css):
+    """Assemble the whole HTML document for one set of leads."""
     defs = "".join(
         f'<tr><td class="mono">{k}</td><td>{html.escape(v[0])}</td>'
         f'<td class="mono sm">{html.escape(v[1])}</td><td class="sm">{html.escape(v[2])}</td></tr>'
@@ -299,7 +341,32 @@ def main(argv=None):
              'differ across units, so <span class="mono">r_space</span> and '
              '<span class="mono">r_acc</span> are genuinely different quantities.</p>')
 
-    B.append('<h2>2 &middot; Overall skill, ensemble mean</h2>')
+    B.append('<h2>2 &middot; Overall skill by lead, ensemble mean</h2>')
+    if len(leads) > 1:
+        B.append('<p class="sub">One table per metric so the leads sit side by side. '
+                 'The &Delta; column is the change from the shortest to the longest '
+                 'lead shown; decay is expected, since a longer lead means the '
+                 'initialisation is further from the target season.</p>')
+    for m in ("r_anom", "r_time", "r_acc"):
+        if m not in ens.columns:
+            continue
+        name, formula, _ = METRICS[m]
+        B.append(f'<h3>{html.escape(name)} &mdash; <span class="mono">{m}</span></h3>')
+        B.append(f'<p class="sub mono sm">{html.escape(formula)}</p>')
+        B.append(lead_compare_table(ens, m, leads))
+    diag = [m for m in ("r_space", "r_pooled") if m in ens.columns]
+    if diag:
+        B.append('<h3>Diagnostics &mdash; not skill</h3>')
+        B.append('<p class="sub">Both are climatology-dominated and sit near 1 on any '
+                 'real panel. A value materially below ~0.95 for a temperature-like '
+                 'feature points at the regridding or the weight join, not the forecast.</p>')
+        for m in diag:
+            B.append(f'<h3 class="tight"><span class="mono">{m}</span></h3>')
+            B.append(lead_compare_table(ens, m, leads))
+
+    B.append('<h2>2b &middot; All metrics at one lead</h2>')
+    B.append('<p class="sub">The same numbers arranged the other way, one lead at a '
+             'time, for reading a single lead in isolation.</p>')
     for fy in leads:
         B.append(f'<h3>Lead FY{fy}</h3>')
         B.append(metric_table(ens, fy))
@@ -359,49 +426,6 @@ def main(argv=None):
              + "".join(f'<th class="r">{c}</th>' for c in cov.columns)
              + f'</tr></thead><tbody>{cov_rows}</tbody></table>')
 
-    css = """
-:root{--bg:#fff;--fg:#17181a;--mut:#6b7280;--line:#e5e7eb;--head:#f9fafb;--card:#fff}
-@media(prefers-color-scheme:dark){:root:not([data-theme=light]){
- --bg:#121417;--fg:#e7e9ea;--mut:#9ba1a6;--line:#2a2e34;--head:#191c20;--card:#171a1e}}
-:root[data-theme=dark]{--bg:#121417;--fg:#e7e9ea;--mut:#9ba1a6;--line:#2a2e34;--head:#191c20;--card:#171a1e}
-*{box-sizing:border-box}
-body{background:var(--bg);color:var(--fg);margin:0;padding:34px 18px;
- font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
-.wrap{max-width:1180px;margin:0 auto}
-h1{font-size:26px;margin:0 0 4px;letter-spacing:-.01em}
-h2{font-size:18px;margin:40px 0 8px;padding-top:16px;border-top:2px solid var(--line)}
-h3{font-size:14px;margin:20px 0 6px;color:var(--mut);font-weight:600;
- text-transform:uppercase;letter-spacing:.04em}
-.sub{color:var(--mut);font-size:13.5px;margin:0 0 14px;max-width:80ch}
-.meta{color:var(--mut);font-size:13px;margin:8px 0 0}
-table{border-collapse:collapse;width:100%;margin:10px 0 6px;font-size:13.5px}
-th,td{padding:6px 10px;border-bottom:1px solid var(--line);white-space:nowrap;text-align:left}
-thead th{background:var(--head);font-weight:600;font-size:12px;
- text-transform:uppercase;letter-spacing:.03em;color:var(--mut)}
-td.r,th.r{text-align:right;font-variant-numeric:tabular-nums}
-.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
-.sm{font-size:12.5px;white-space:normal;color:var(--mut)}
-.defs td{white-space:normal;vertical-align:top}
-.dim{color:var(--mut)} .na{color:var(--mut)} .sd{color:var(--mut);font-size:11.5px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px;margin:12px 0}
-.fig{margin:0;background:var(--card);border:1px solid var(--line);border-radius:7px;padding:10px 8px 4px}
-figcaption{font-size:12.5px;font-weight:600;padding:0 6px 4px;display:flex;
- justify-content:space-between;align-items:baseline}
-.ylab{color:var(--mut);font-weight:400;font-size:11.5px}
-.chart{width:100%;height:auto;display:block}
-.grid line.grid{stroke:var(--line);stroke-width:1}
-line.grid{stroke:var(--line);stroke-width:1}
-line.zero{stroke:var(--mut);stroke-width:1;stroke-dasharray:3 2}
-text.tick{fill:var(--mut);font-size:9.5px}
-.ta-end{text-anchor:end}.ta-mid{text-anchor:middle}
-.legend{padding:2px 6px 6px;font-size:11.5px;color:var(--mut)}
-.key{margin-right:10px}.key i{display:inline-block;width:9px;height:9px;border-radius:2px;
- margin-right:4px;vertical-align:-1px}
-.note{background:var(--head);border-left:3px solid var(--mut);padding:12px 15px;
- margin:20px 0;font-size:13.5px;border-radius:0 5px 5px 0}
-@media(max-width:700px){body{padding:20px 14px}table{display:block;overflow-x:auto}
- .grid{grid-template-columns:1fr}}
-"""
     page = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -419,8 +443,63 @@ year-to-year signal with no spatial anomaly skill, or the reverse.
 <span class="mono">r_space</span> and <span class="mono">r_pooled</span> are included
 so that nobody quotes them by accident.</div>
 </div></body></html>"""
+    return page
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--dir", required=True, help="comparisons root; reads {dir}/{AOI}/")
+    p.add_argument("--aois", help="comma-separated AOIs; default: all found")
+    p.add_argument("--metric", default="r_anom", choices=SKILL_ORDER,
+                   help="headline metric for the skill-vs-lead table")
+    p.add_argument("--out", default=None)
+    p.add_argument("--per-lead-pages", action="store_true",
+                   help="also write one standalone HTML per lead, for slides")
+    p.add_argument("--title", default="EC-Earth3 DCPP vs ERA5 — feature skill")
+    a = p.parse_args(argv)
+
+    d = Path(a.dir)
+    aois = [x.strip() for x in a.aois.split(",") if x.strip()] if a.aois else None
+    summ = load(d, "dcpp_era5_corr_*.csv", aois)
+    yearly = load(d, "dcpp_era5_year_*.csv", aois, required=False)
+    print(f"summary: {len(summ)} rows, AOIs {sorted(summ.aoi.unique())}, "
+          f"leads {sorted(summ.forecast_year.unique())}")
+    print(f"per-year: {len(yearly)} rows" if not yearly.empty
+          else "per-year: none found (older run; rerun compare to get them)")
+
+    if a.out:
+        out = Path(a.out)
+    else:
+        out = d / ("dcpp_skill_report" + (f"_{'-'.join(aois)}" if aois else "") + ".html")
+
+    ens = summ[summ.member == "ENSMEAN"].copy()
+    mem = summ[summ.member != "ENSMEAN"].copy()
+    if ens.empty:
+        raise SystemExit("no ENSMEAN rows found")
+    order = ens.groupby("aoi")[a.metric].mean().sort_values(ascending=False).index.tolist()
+    for f in (ens, mem):
+        f["aoi"] = pd.Categorical(f.aoi, categories=order, ordered=True)
+    leads = sorted(summ.forecast_year.unique())
+    ey = yearly[yearly.member == "ENSMEAN"].copy() if not yearly.empty else pd.DataFrame()
+    if not ey.empty:
+        ey["aoi"] = pd.Categorical(ey.aoi, categories=order, ordered=True)
+
+    page = render_page(a, ens, mem, ey, leads, order, CSS)
     out.write_text(page, encoding="utf-8")
     print(f"wrote {out}  ({out.stat().st_size/1024:.0f} KB)")
+
+    # Optional standalone page per lead: same document, filtered to one lead, so
+    # a slide can show FY2 alone without the FY1 columns beside it.
+    if a.per_lead_pages and len(leads) > 1:
+        for fy in leads:
+            e1 = ens[ens.forecast_year == fy]
+            m1 = mem[mem.forecast_year == fy] if not mem.empty else mem
+            y1 = ey[ey.forecast_year == fy] if not ey.empty else ey
+            sub = render_page(a, e1, m1, y1, [fy], order, CSS)
+            q = out.with_name(f"{out.stem}_FY{fy}.html")
+            q.write_text(sub, encoding="utf-8")
+            print(f"wrote {q}  ({q.stat().st_size/1024:.0f} KB)")
 
     flat = out.with_suffix(".csv")
     cols = [c for c in ["aoi", "feature", "forecast_year", "member", *SKILL_ORDER,
