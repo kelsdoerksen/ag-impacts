@@ -122,6 +122,32 @@ def discover_members(dcpp_root: Path, aoi: str) -> list[str]:
     return out
 
 
+def discover_leads(dcpp_root: Path, aoi: str, members: list[str]) -> list[int]:
+    """Lead times that actually have stage-1 output for this AOI.
+
+    Stage 1 writes pixel_{tag}_{AOI}_fy{n}_s{year}.nc, so the leads present are
+    readable off the filenames. Checked across every member and unioned: a lead
+    processed for only some members is still worth comparing, and the per-member
+    loop reports the gaps.
+
+    Falls back to pixel_features/ when a tree has been cleaned of stage-1 cubes
+    but keeps stage-2 output, which is a state a --stage=features rerun leaves.
+    """
+    leads: set[int] = set()
+    for mem in members:
+        base = dcpp_dir(dcpp_root, aoi, mem)
+        for sub, pat in (("pixel_daily", f"pixel_*_{aoi}_fy*_s*.nc"),
+                         ("pixel_features", f"features_{aoi}_fy*_s*.nc")):
+            hits = list((base / sub).glob(pat)) if (base / sub).is_dir() else []
+            for f in hits:
+                m = re.search(r"_fy(\d+)_s\d+", f.name)
+                if m:
+                    leads.add(int(m.group(1)))
+            if hits:
+                break
+    return sorted(leads)
+
+
 def season_parquet(out_dir: Path, aoi: str, crop: str, forecast_year: int,
                    harvest_year: int, reduce: str, fixed_season: bool) -> Path:
     """Mirror of the filename stage_aggregate() builds in era5_features.py.
@@ -441,8 +467,9 @@ def main(argv=None):
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--aois", required=True, help="comma-separated AOI tags, e.g. ZM,ET")
     p.add_argument("--members", help="comma-separated DCPP members; default: discover")
-    p.add_argument("--forecast-years", default="1",
-                   help="comma-separated DCPP lead times, e.g. 1,2 or 1,2,3,4")
+    p.add_argument("--forecast-years", default=None,
+                   help="comma-separated DCPP lead times, e.g. 1,2. "
+                        "Default: every lead found in the DCPP tree.")
     p.add_argument("--forecast-year", type=int, default=None,
                    help="deprecated single-lead alias for --forecast-years")
     p.add_argument("--harvest-years", default="2002-2022",
@@ -490,25 +517,24 @@ def main(argv=None):
         raise SystemExit(f"--harvest-years parsed to nothing: {a.harvest_years!r}")
     if a.forecast_year is not None:          # deprecated alias wins if given
         a.forecast_years = str(a.forecast_year)
-    fy_list = parse_years(a.forecast_years)
-    if not fy_list:
-        raise SystemExit(f"--forecast-years parsed to nothing: {a.forecast_years!r}")
-    if min(fy_list) < 1:
-        raise SystemExit(
-            f"lead times must be >= 1 for a hindcast (got {sorted(fy_list)}).\n"
-            "At 0 the DCPP outputs would take the observed naming convention and "
-            "collide with the ERA5 tree's filenames.")
+    fy_list = parse_years(a.forecast_years) if a.forecast_years else None
+    if fy_list is not None:
+        if not fy_list:
+            raise SystemExit(f"--forecast-years parsed to nothing: {a.forecast_years!r}")
+        if min(fy_list) < 1:
+            raise SystemExit(
+                f"lead times must be >= 1 for a hindcast (got {sorted(fy_list)}).\n"
+                "At 0 the DCPP outputs would take the observed naming convention "
+                "and collide with the ERA5 tree's filenames.")
 
     # Source years each side needs. era5_features.py takes SOURCE years and
     # derives the harvest years itself, so these only have to be a superset.
     era5_src = sorted({y for h in harvest_years for y in season_source_years(h, 0)})
-    dcpp_src_by_fy = {
-        fy: sorted({y for h in harvest_years for y in season_source_years(h, fy)})
-        for fy in fy_list}
+    def src_for(fy):
+        return sorted({y for h in harvest_years for y in season_source_years(h, fy)})
 
     print("=" * 78)
-    print(f"DCPP (fy{','.join(str(f) for f in fy_list)}) vs ERA5 "
-          f"-- cropland-weighted admin-2 features")
+    print("DCPP vs ERA5 -- cropland-weighted admin-2 features")
     print("=" * 78)
     print(f"  ERA5 tree   : {era5_root}/{{AOI}}")
     print(f"  DCPP tree   : {dcpp_root}/{{AOI}}_processed_data/{MODEL}_{{member}}")
@@ -516,9 +542,9 @@ def main(argv=None):
     print(f"  out         : {out_dir}")
     print(f"  harvest yrs : {harvest_years[0]}-{harvest_years[-1]} ({len(harvest_years)})")
     print(f"  ERA5 source : {era5_src[0]}-{era5_src[-1]}")
-    for fy in fy_list:
-        v = dcpp_src_by_fy[fy]
-        print(f"  DCPP FY{fy}    : s{v[0]}-{v[-1]}")
+    print(f"  DCPP leads  : "
+          + (", ".join(f"FY{f}" for f in fy_list) if fy_list is not None
+             else "discovered per AOI from the DCPP tree"))
     print(f"  features    : {','.join(feats)}   reduce={a.reduce} weight={a.weight}")
     print()
 
@@ -534,21 +560,29 @@ def main(argv=None):
         if not e_dir.is_dir():
             print(f"  {aoi}: no ERA5 tree at {e_dir} -- skipping")
             continue
-        plan.append((aoi, mems))
-        print(f"  {aoi}: {len(mems)} member(s): {', '.join(mems)}")
+        fys = fy_list if fy_list is not None else discover_leads(dcpp_root, aoi, mems)
+        if not fys:
+            print(f"  {aoi}: no fy*_s* files under "
+                  f"{dcpp_dir(dcpp_root, aoi, mems[0])} -- skipping "
+                  f"(run run-dcpp.sh, or pass --forecast-years)")
+            continue
+        plan.append((aoi, mems, fys))
+        print(f"  {aoi}: {len(mems)} member(s): {', '.join(mems)}"
+              f"   leads: {', '.join(f'FY{f}' for f in fys)}"
+              + ("" if fy_list is not None else "  (discovered)"))
     if not plan:
         raise SystemExit("nothing to do")
 
-    n_builds = sum(1 + len(m) * len(fy_list) for _, m in plan)
+    n_builds = sum(1 + len(m) * len(f) for _, m, f in plan)
     print(f"\n  {len(plan)} AOI(s), {n_builds} era5_features.py invocation(s)")
     # Echo the exact commands: this is the thing worth reviewing before a long
     # run, and reconstructing it from the flags above is error-prone.
-    aoi0, mems0 = plan[0]
+    aoi0, mems0, fys0 = plan[0]
     print("\n  commands (first AOI shown; one per source):")
     print("    " + " ".join(build_cmd(a, aoi0, "ERA5", era5_dir(era5_root, aoi0), 0, era5_src)))
     print("    " + " ".join(build_cmd(a, aoi0, f"{MODEL}_{mems0[0]}",
                                       dcpp_dir(dcpp_root, aoi0, mems0[0]),
-                                      fy_list[0], dcpp_src_by_fy[fy_list[0]])))
+                                      fys0[0], src_for(fys0[0]))))
     if not a.go:
         print("\n  dry run -- add --go to execute")
         return 0
@@ -556,7 +590,7 @@ def main(argv=None):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     all_rows, failures, written = [], [], []
-    for aoi, mems in plan:
+    for aoi, mems, fys in plan:
         print(f"\n--- {aoi} ---")
         e_dir = era5_dir(era5_root, aoi)
         # One directory per AOI, holding that AOI's tables and its build logs.
@@ -591,9 +625,9 @@ def main(argv=None):
         print(f"    ERA5: {len(era5)} rows, {era5.adm2_id.nunique()} units, "
               f"{era5.harvest_year.nunique()} years")
 
-        for fy in fy_list:
+        for fy in fys:
             a.forecast_year = fy          # build_cmd reads this
-            dcpp_src = dcpp_src_by_fy[fy]
+            dcpp_src = src_for(fy)
             tag = a.tag or f"fy{fy}_{a.reduce}_{harvest_years[0]}-{harvest_years[-1]}"
             print(f"  -- FY{fy}  (initialisations s{dcpp_src[0]}-{dcpp_src[-1]}) --")
 
@@ -682,7 +716,7 @@ def main(argv=None):
     print("\n" + "=" * 78)
     print(f"wrote {len(written)} file(s) under {out_dir}/<AOI>/")
     print(f"report with: python python/report_dcpp_era5.py --dir {out_dir} "
-          f"--aois {','.join(aoi for aoi, _ in plan)}")
+          f"--aois {','.join(aoi for aoi, _, _ in plan)}")
     if failures:
         print(f"\n{len(failures)} failure(s):")
         for a_, s, w in failures:
