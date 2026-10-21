@@ -293,6 +293,22 @@ class Layout:
     def features(self, year):
         return self.pixel_features / f"features_{self.aoi}_{self._year_tag(year)}.nc"
 
+    def features_slice(self, s_year, lead):
+        """One published lead-year slice, addressed by (initialisation, lead).
+
+        features() varies the s-year at this Layout's fixed lead, which is the
+        right handle for most things. A season that crosses 31 October needs
+        two CONSECUTIVE LEAD SLICES OF THE SAME INITIALISATION -- fy{F}_s{S} and
+        fy{F+1}_s{S} -- which features() cannot name, because fy{F}_s{S+1}
+        covers the same dates from a DIFFERENT run. Splicing two
+        initialisations would put a discontinuity in soil moisture and the
+        atmospheric state in the middle of a growing season; splicing two leads
+        of one initialisation just reassembles a continuous trajectory that was
+        published in annual files.
+        """
+        tag = f"fy{lead}_s{s_year}" if lead else f"{s_year}"
+        return self.pixel_features / f"features_{self.aoi}_{tag}.nc"
+
     @property
     def stage1_hint(self):
         """The stage-1 command that produces what a caller just found missing."""
@@ -479,7 +495,7 @@ def check_grid(ds: xr.Dataset, lay: Layout, w: pd.DataFrame | None = None):
         )
 
 
-def require_features(ds: xr.Dataset, names, lay: Layout, year):
+def require_features(ds: xr.Dataset, names, lay: Layout, fname):
     """Stage-2 files hold whatever --features was passed when they were written.
 
     Asking stage 3 for a feature stage 2 never computed is a common sequencing
@@ -489,7 +505,7 @@ def require_features(ds: xr.Dataset, names, lay: Layout, year):
     missing = [n for n in names if n not in ds]
     if missing:
         raise SystemExit(
-            f"per-pixel features {missing} are not in {lay.features(year).name}, "
+            f"per-pixel features {missing} are not in {fname}, "
             f"which holds {sorted(str(v) for v in ds.data_vars)}.\n"
             f"Stage 2 writes only the features it was asked for. Re-run it with "
             f"them included:\n"
@@ -687,21 +703,23 @@ def aggregate_blocks(lay: Layout, year, w, names, cal, fixed=None,
             f"no unit has a usable season window for harvest year {year} -- "
             f"check the crop calendar covers these adm2_ids.")
 
-    wanted = season_source_years(year, lay.forecast_year)
+    # Same slice selection as aggregate_season: the blocks of a season that
+    # crosses 31 Oct need the next lead slice of the SAME initialisation.
     earliest = min(b[0][0] for b in windows.values())
-    if lay.forecast_year == 0 and earliest.year >= year:
-        wanted = [year]
-    have = [y for y in wanted if lay.features(y).exists()]
+    latest_w = max(b[-1][1] for b in windows.values())
+    wanted = season_slices(year, lay.forecast_year, earliest, latest_w)
+    have = [(sy, ld) for sy, ld in wanted if lay.features_slice(sy, ld).exists()]
     if not have:
-        raise SystemExit(
-            f"no per-pixel features for harvest year {year} "
-            f"(looked for source year(s) {wanted}); run --stage=features first")
+        raise SeasonUnavailable(
+            f"harvest year {year}: none of the needed slices exist "
+            f"{[f'fy{l}_s{y}' for y, l in wanted]}; run --stage=features first")
 
     cols = [f"{nm}_m{b + 1:02d}" for nm in names for b in range(n_blocks)]
     results = {c: np.full(len(unit_ids), np.nan) for c in cols}
 
     with contextlib.ExitStack() as stack:
-        dsets = [stack.enter_context(open_nc(lay.features(y))) for y in have]
+        dsets = [stack.enter_context(open_nc(lay.features_slice(sy, ld)))
+                 for sy, ld in have]
         ds = xr.concat(dsets, dim="time", data_vars="all",
                        combine_attrs="override") if len(dsets) > 1 else dsets[0]
         check_grid(ds, lay, w)
@@ -709,17 +727,20 @@ def aggregate_blocks(lay: Layout, year, w, names, cal, fixed=None,
         # absent from one input with NaN, so checking the joined dataset would
         # pass and the missing year would surface only as unexplained NaN rows.
         # Stage-2 files written at different times can hold different --features.
-        for _y, _d in zip(have, dsets):
-            require_features(_d, names, lay, _y)
+        for (_sy, _ld), _d in zip(have, dsets):
+            require_features(_d, names, lay, lay.features_slice(_sy, _ld).name)
         times = pd.to_datetime(ds["time"].values)
 
-        latest = max(b[-1][1] for b in windows.values())
-        if earliest < times.min() or latest > times.max():
-            missing = [y for y in wanted if y not in have]
-            raise SystemExit(
+        if earliest < times.min() or latest_w > times.max():
+            missing = [sl for sl in wanted if sl not in have]
+            raise SeasonUnavailable(
                 f"harvest year {year}: season windows run outside the loaded days "
-                f"({times.min().date()} to {times.max().date()}); source year(s) "
-                f"{missing} are missing. Run --stage=features for them first.")
+                f"({times.min().date()} to {times.max().date()}).\n"
+                + (f"Missing slice(s): "
+                   f"{', '.join(f'fy{l}_s{y}' for y, l in missing)}."
+                   if missing else
+                   "All needed slices are present, so the season extends beyond "
+                   "this run; use --season SOS:EOS."))
 
         for name in names:
             spec = REGISTRY[name]
@@ -752,6 +773,49 @@ def aggregate_blocks(lay: Layout, year, w, names, cal, fixed=None,
     lead = ["adm2_id", "adm2", "adm1", "harvest_year", "hindcast_start", "forecast_year",
             "target_year", "season_start", "season_end", "n_blocks"]
     return df[lead + cols]
+
+
+MAX_LEAD = 10          # DCPP runs are published out to 10 lead years
+
+
+class SeasonUnavailable(Exception):
+    """This harvest year cannot be assembled from what is on disk.
+
+    Raised instead of exiting so stage 3 can skip the year and keep going: at
+    the ends of a run the neighbouring lead slice simply does not exist, which
+    is a boundary effect rather than an error.
+    """
+
+
+def slice_span(s_year: int, lead: int) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Calendar span of one published slice: 1 Nov (S+L-1) to 31 Oct (S+L)."""
+    return (pd.Timestamp(year=s_year + lead - 1, month=11, day=1),
+            pd.Timestamp(year=s_year + lead, month=10, day=31))
+
+
+def season_slices(harvest_year: int, forecast_year: int,
+                  lo: pd.Timestamp, hi: pd.Timestamp) -> list[tuple[int, int]]:
+    """(initialisation, lead) slices needed to cover the window [lo, hi].
+
+    Observed (fy=0): calendar-year cubes, so every year the window touches.
+
+    Hindcast (fy>=1): the initialisation is FIXED at S = harvest_year - fy, and
+    only the lead varies. Every slice whose span overlaps the season is
+    returned, so a season reaching past 31 Oct picks up lead fy+1 and one
+    starting before 1 Nov picks up lead fy-1 -- both from the same run. A
+    season needing lead 0 cannot be built at all: that is asking a forecast to
+    cover days before its own initialisation.
+    """
+    if forecast_year == 0:
+        return [(y, 0) for y in range(lo.year, hi.year + 1)]
+    s = harvest_year - forecast_year
+    # Leads start at 1: a run cannot describe days before its own
+    # initialisation. A season reaching back past 1 Nov of the s-year is simply
+    # not coverable, and the units concerned are left NaN by the caller rather
+    # than failing the whole year -- a handful of outlier units must not cost
+    # the other few thousand.
+    return [(s, lead) for lead in range(1, MAX_LEAD + 1)
+            if slice_span(s, lead)[1] >= lo and slice_span(s, lead)[0] <= hi]
 
 
 def season_source_years(harvest_year: int, forecast_year: int) -> list[int]:
@@ -854,44 +918,68 @@ def aggregate_season(lay: Layout, year, w, names, cal, fixed=None) -> pd.DataFra
     # Which source years the windows actually reach into. At fy=0 a cross-year
     # calendar needs year-1 as well, but a same-year one does not, and loading a
     # cube nothing will read doubles the working set for nothing.
-    wanted = season_source_years(year, lay.forecast_year)
-    if lay.forecast_year == 0 and min(s for s, _ in windows.values()).year >= year:
-        wanted = [year]
-    have = [y for y in wanted if lay.features(y).exists()]
+    # Which slices the season actually touches, derived from the windows rather
+    # than assumed from the lead. This is what lets a season crossing 31 Oct
+    # pick up the next lead slice of the same initialisation (option B).
+    lo = min(a for a, _ in windows.values())
+    hi = max(b for _, b in windows.values())
+    wanted = season_slices(year, lay.forecast_year, lo, hi)
+    have = [(sy, ld) for sy, ld in wanted if lay.features_slice(sy, ld).exists()]
     if not have:
-        raise SystemExit(
-            f"no per-pixel features for harvest year {year} "
-            f"(looked for source year(s) {wanted}); run --stage=features first")
+        raise SeasonUnavailable(
+            f"harvest year {year}: none of the needed slices exist "
+            f"{[f'fy{l}_s{y}' for y, l in wanted]}; run --stage=features first")
 
     # Concatenated rather than open_mfdataset()'d: mfdataset pulls in dask, which
     # buys nothing here (each feature is loaded one at a time below) and is one
     # more thing that has to be installed on the lab machine.
     with contextlib.ExitStack() as stack:
-        dsets = [stack.enter_context(open_nc(lay.features(y))) for y in have]
+        dsets = [stack.enter_context(open_nc(lay.features_slice(sy, ld)))
+                 for sy, ld in have]
         ds = xr.concat(dsets, dim="time", data_vars="all", combine_attrs="override") if len(dsets) > 1 else dsets[0]
         check_grid(ds, lay, w)
         # Per FILE, not on the concatenation: xr.concat fills a variable that is
         # absent from one input with NaN, so checking the joined dataset would
         # pass and the missing year would surface only as unexplained NaN rows.
         # Stage-2 files written at different times can hold different --features.
-        for _y, _d in zip(have, dsets):
-            require_features(_d, names, lay, _y)
+        for (_sy, _ld), _d in zip(have, dsets):
+            require_features(_d, names, lay, lay.features_slice(_sy, _ld).name)
         times = pd.to_datetime(ds["time"].values)
 
         # A window running off the end of what is loaded used to be warned about
         # and then silently truncated into a smaller-but-plausible season total.
         # season_reduce now returns NaN for those rows instead, so the warning
         # says what actually happens to them.
-        missing = [y for y in wanted if y not in have]
+        missing = [sl for sl in wanted if sl not in have]
         covered = (times.min(), times.max())
-        short = [u for u, (s, e) in windows.items() if s < covered[0] or e > covered[1]]
+        short = [u for u, (a, b) in windows.items()
+                 if a < covered[0] or b > covered[1]]
         if short:
-            raise SystemExit(
-                f"harvest year {year}: {len(short)} unit(s) have a season window "
-                f"outside the loaded days ({covered[0].date()} to {covered[1].date()}); "
-                f"source year(s) {missing} are missing.\n"
-                f"Run --stage=features for {missing or wanted} first, or drop {year} "
-                f"from --years.")
+            frac = len(short) / len(windows)
+            if missing:
+                # Actionable: a slice that should exist does not. Worth stopping
+                # the year rather than returning a column of NaN nobody notices.
+                raise SeasonUnavailable(
+                    f"harvest year {year}: {len(short)} of {len(windows)} unit(s) "
+                    f"fall outside the loaded days "
+                    f"({covered[0].date()} to {covered[1].date()}); missing "
+                    f"slice(s) {', '.join(f'fy{l}_s{y}' for y, l in missing)}. "
+                    f"Run --stage=features for those first.")
+            if frac > 0.5:
+                raise SeasonUnavailable(
+                    f"harvest year {year}: {len(short)} of {len(windows)} unit(s) "
+                    f"({100 * frac:.0f}%) have a season outside this run's span "
+                    f"({covered[0].date()} to {covered[1].date()}), and every "
+                    f"needed slice is present -- so the season genuinely does not "
+                    f"fit at this lead. Run the AOI at a longer lead, or fix a "
+                    f"window with --season SOS:EOS.")
+            # A minority of outlier units: NaN them and say so. season_reduce
+            # already returns NaN for a window it cannot fill.
+            print(f"    {year}: {len(short)} of {len(windows)} unit(s) "
+                  f"({100 * frac:.1f}%) have a season outside "
+                  f"{covered[0].date()}..{covered[1].date()} -> NaN")
+            for u in short:
+                windows.pop(u, None)
 
         results = {name: np.full(len(unit_ids), np.nan) for name in names}
         for name in names:
@@ -976,6 +1064,7 @@ def stage_aggregate(lay, years, names, reduce, weighting, crop, cy_country, seas
     # the same harvest year are two different predictions and must not share a
     # filename. Empty for an observed run, so ERA5 filenames do not change.
     fy_tag = f"fy{lay.forecast_year}_" if lay.forecast_year else ""
+    skipped: list[int] = []
     for year in years:
         if reduce == "daily":
             out = lay.admin2 / f"features_{lay.aoi}_{fy_tag}daily_{year}.parquet"
@@ -986,16 +1075,27 @@ def stage_aggregate(lay, years, names, reduce, weighting, crop, cy_country, seas
         if out.exists() and not overwrite:
             print(f"  {year}: exists, skipping ({out.name})")
             continue
-        if reduce == "daily":
-            df = aggregate_daily(lay, year, w, names)
-        elif reduce == "blocks":
-            df = aggregate_blocks(lay, year, w, names, cal, fixed, n_blocks)
-        else:
-            df = aggregate_season(lay, year, w, names, cal, fixed)
+        try:
+            if reduce == "daily":
+                df = aggregate_daily(lay, year, w, names)
+            elif reduce == "blocks":
+                df = aggregate_blocks(lay, year, w, names, cal, fixed, n_blocks)
+            else:
+                df = aggregate_season(lay, year, w, names, cal, fixed)
+        except SeasonUnavailable as e:
+            # A boundary year whose neighbouring lead slice was never produced
+            # is normal at the ends of a run. Skip it and keep the other years
+            # rather than losing the whole AOI to one unbuildable season.
+            print(f"  {year}: SKIPPED -- {e}")
+            skipped.append(year)
+            continue
         df.to_parquet(out, index=False)
         value_cols = [c for c in df.columns if c.split("_m")[0] in names or c in names]
         filled = df[value_cols].notna().all(axis=1).sum()
         print(f"  {year}: wrote {out.name} ({len(df)} rows, {filled} complete)")
+    if skipped:
+        print(f"  {len(skipped)} harvest year(s) skipped as unbuildable: "
+              f"{', '.join(str(y) for y in skipped)}")
 
 
 # ==================================== cli ====================================

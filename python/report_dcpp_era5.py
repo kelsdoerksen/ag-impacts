@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import glob
 import html
+import json
 import os
 import re
 from pathlib import Path
@@ -270,6 +271,138 @@ def chart_grid(yearly: pd.DataFrame, metric: str, ylab, ylim=(-1, 1)) -> str:
     return f'<div class="grid">{"".join(figs)}</div>' if figs else '<p class="na">no per-year data</p>'
 
 
+# --------------------------------------------------------------------- maps --
+
+# Diverging ramp for a correlation: red through neutral to blue. Anchored at 0
+# so the sign is readable at a glance, which a sequential ramp would hide.
+_RAMP = [(-1.0, (178, 24, 43)), (-0.5, (214, 96, 77)), (0.0, (240, 240, 240)),
+         (0.5, (67, 147, 195)), (1.0, (33, 102, 172))]
+
+
+def ramp(v, lo=-1.0, hi=1.0):
+    if v is None or pd.isna(v):
+        return "#d9d9d9"
+    v = max(min(float(v), hi), lo)
+    for i in range(len(_RAMP) - 1):
+        a, ca = _RAMP[i]
+        b, cb = _RAMP[i + 1]
+        if a <= v <= b:
+            f = 0 if b == a else (v - a) / (b - a)
+            c = tuple(round(ca[k] + f * (cb[k] - ca[k])) for k in range(3))
+            return "#%02x%02x%02x" % c
+    return "#d9d9d9"
+
+
+def _rings(geom):
+    polys = list(geom.geoms) if geom.geom_type.startswith("Multi") else [geom]
+    for poly in polys:
+        if poly.is_empty:
+            continue
+        yield list(poly.exterior.coords)
+        for h in poly.interiors:
+            yield list(h.coords)
+
+
+def svg_map(gdf, values: dict, title: str, w=330, h=300, pad=6):
+    """Choropleth of one AOI, coloured by `values[adm_id]`. Inline SVG.
+
+    Geometry is projected to EPSG:6933 (equal area) before scaling, so unit
+    areas are not distorted by latitude the way a raw lon/lat plot would be.
+    """
+    x0, y0, x1, y1 = gdf.total_bounds
+    sx = (w - 2 * pad) / max(x1 - x0, 1e-9)
+    sy = (h - 2 * pad) / max(y1 - y0, 1e-9)
+    sc = min(sx, sy)
+    ox = pad + ((w - 2 * pad) - (x1 - x0) * sc) / 2
+    oy = pad + ((h - 2 * pad) - (y1 - y0) * sc) / 2
+    parts = [f'<svg viewBox="0 0 {w} {h}" class="map" role="img" '
+             f'aria-label="{html.escape(title)}">']
+    for row in gdf.itertuples():
+        d = []
+        for ring in _rings(row.geometry):
+            pts = " L".join(f"{ox + (x - x0) * sc:.1f},{oy + (y1 - y) * sc:.1f}"
+                            for x, y in ring)
+            d.append("M" + pts + "Z")
+        if not d:
+            continue
+        v = values.get(row.adm_id)
+        lab = "n/a" if v is None or pd.isna(v) else f"{v:+.2f}"
+        parts.append(f'<path d="{" ".join(d)}" fill="{ramp(v)}" fill-rule="evenodd" '
+                     f'stroke="#888" stroke-width="0.25"><title>{html.escape(str(row.adm_id))}: '
+                     f'{lab}</title></path>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def map_legend():
+    stops = "".join(
+        f'<stop offset="{(v + 1) / 2:.2%}" stop-color="{ramp(v)}"/>'
+        for v, _ in _RAMP)
+    return (f'<div class="maplegend"><svg viewBox="0 0 220 26" class="lg">'
+            f'<defs><linearGradient id="g">{stops}</linearGradient></defs>'
+            f'<rect x="10" y="2" width="200" height="9" fill="url(#g)" '
+            f'stroke="var(--line)"/>'
+            f'<text x="10" y="22" class="tick">-1</text>'
+            f'<text x="110" y="22" class="tick ta-mid">0</text>'
+            f'<text x="210" y="22" class="tick ta-end">+1</text>'
+            f'</svg><span class="sm">per-unit temporal correlation; '
+            f'grey = too few years</span></div>')
+
+
+def load_polygons(poly_dir: Path, aoi: str):
+    """cy-bench AOI polygons, projected equal-area and lightly simplified."""
+    import geopandas as gpd          # lazy: only the map path needs it
+    shp = poly_dir / aoi / f"{aoi}.shp"
+    if not shp.exists():
+        return None, f"no shapefile at {shp}"
+    g = gpd.read_file(shp)
+    if g.crs is None:                # Brazil ships without a .prj
+        g = g.set_crs("EPSG:4326")
+    g = g.to_crs("EPSG:6933")
+    # Simplify relative to the AOI's own extent: enough to keep the file small,
+    # far below the size of an admin-2 unit.
+    x0, y0, x1, y1 = g.total_bounds
+    tol = max(x1 - x0, y1 - y0) / 900.0
+    g["geometry"] = g.geometry.simplify(tol, preserve_topology=True)
+    idcol = "adm_id" if "adm_id" in g.columns else g.columns[0]
+    return g.rename(columns={idcol: "adm_id"})[["adm_id", "geometry"]], None
+
+
+def map_section(byunit: pd.DataFrame, poly_dir: Path, feature: str,
+                leads) -> str:
+    """One row of maps per AOI: the chosen feature's per-unit skill, by lead."""
+    blocks = []
+    for aoi, g in byunit.groupby("aoi", observed=True):
+        gg = g[g.feature == feature]
+        if gg.empty:
+            continue
+        polys, err = load_polygons(poly_dir, str(aoi))
+        if polys is None:
+            blocks.append(f'<p class="na">{html.escape(str(aoi))}: {html.escape(err)}</p>')
+            continue
+        figs = []
+        for fy in leads:
+            sub = gg[gg.forecast_year == fy]
+            if sub.empty:
+                continue
+            vals = dict(zip(sub.adm2_id, sub.r_time))
+            keep = polys[polys.adm_id.isin(vals)]
+            if keep.empty:
+                figs.append(f'<p class="na">FY{fy}: no unit ids matched the shapefile</p>')
+                continue
+            med = sub.r_time.median()
+            figs.append(
+                f'<figure class="fig"><figcaption>FY{fy}'
+                f'<span class="ylab">median {med:+.2f} &middot; {len(keep)} units</span>'
+                f'</figcaption>{svg_map(keep, vals, f"{aoi} FY{fy}")}</figure>')
+        if figs:
+            blocks.append(f'<h3>{html.escape(str(aoi))}</h3>'
+                          f'<div class="grid maps">{"".join(figs)}</div>')
+    if not blocks:
+        return '<p class="na">no per-unit data to map</p>'
+    return map_legend() + "".join(blocks)
+
+
 # --------------------------------------------------------------------- main --
 
 CSS = """
@@ -313,13 +446,17 @@ text.tick{fill:var(--mut);font-size:9.5px}
 .legend{padding:2px 6px 6px;font-size:11.5px;color:var(--mut)}
 .key{margin-right:10px}.key i{display:inline-block;width:9px;height:9px;border-radius:2px;
  margin-right:4px;vertical-align:-1px}
+.maps{grid-template-columns:repeat(auto-fill,minmax(250px,1fr))}
+.map{width:100%;height:auto;display:block;background:transparent}
+.maplegend{display:flex;align-items:center;gap:10px;margin:4px 0 10px}
+.lg{width:220px;height:26px;flex:0 0 auto}
 .note{background:var(--head);border-left:3px solid var(--mut);padding:12px 15px;
  margin:20px 0;font-size:13.5px;border-radius:0 5px 5px 0}
 @media(max-width:700px){body{padding:20px 14px}table{display:block;overflow-x:auto}
  .grid{grid-template-columns:1fr}}
 """
 
-def render_page(a, ens, mem, ey, leads, order, css):
+def render_page(a, ens, mem, ey, eu, poly_dir, leads, order, css):
     """Assemble the whole HTML document for one set of leads."""
     defs = "".join(
         f'<tr><td class="mono">{k}</td><td>{html.escape(v[0])}</td>'
@@ -412,6 +549,32 @@ def render_page(a, ens, mem, ey, leads, order, css):
         B.append(simple_table(ens, "aoi", ["feature", "forecast_year"],
                               "sd_ratio_anom", "AOI", dp=2))
 
+    if not eu.empty and poly_dir is not None and not a.no_maps:
+        feats_avail = list(dict.fromkeys(eu.feature))
+        mf = a.map_feature or feats_avail[0]
+        if mf not in feats_avail:
+            B.append(f'<h2>7b &middot; Maps</h2><p class="na">--map-feature '
+                     f'{html.escape(mf)} not in {", ".join(feats_avail)}</p>')
+        else:
+            B.append('<h2>7b &middot; Where the skill is &mdash; '
+                     f'<span class="mono">{html.escape(mf)}</span></h2>')
+            B.append('<p class="sub">Each unit is shaded by its own temporal '
+                     'correlation across years &mdash; the per-unit values that '
+                     '<span class="mono">r_time</span> averages. One map per lead, '
+                     'so geographic loss of skill with lead is visible directly. '
+                     'Hover a unit for its id and value. Equal-area projection '
+                     '(EPSG:6933); grey units have fewer than four years.</p>')
+            B.append(map_section(eu, poly_dir, mf, leads))
+            if len(feats_avail) > 1:
+                B.append(f'<p class="sub">Other features available: '
+                         f'<span class="mono">'
+                         f'{", ".join(f for f in feats_avail if f != mf)}</span> '
+                         f'&mdash; pass <span class="mono">--map-feature</span>.</p>')
+    elif not a.no_maps and not eu.empty:
+        B.append('<h2>7b &middot; Maps</h2>')
+        B.append('<p class="na">No polygon directory found. Pass '
+                 '<span class="mono">--polygons /path/to/cy-bench/polygons</span>.</p>')
+
     cov = ens.groupby("aoi", observed=True).agg(
         features=("feature", "nunique"), units=("n_units", "max"),
         years=("n_years", "max"), pairs=("n_pairs", "max"))
@@ -454,6 +617,12 @@ def main(argv=None):
     p.add_argument("--metric", default="r_anom", choices=SKILL_ORDER,
                    help="headline metric for the skill-vs-lead table")
     p.add_argument("--out", default=None)
+    p.add_argument("--polygons", default=None,
+                   help="cy-bench polygons dir for the maps "
+                        "(default: {data_root}/cy-bench/polygons from the run JSON)")
+    p.add_argument("--map-feature", default=None,
+                   help="feature to map (default: the first one present)")
+    p.add_argument("--no-maps", action="store_true", help="skip the map section")
     p.add_argument("--per-lead-pages", action="store_true",
                    help="also write one standalone HTML per lead, for slides")
     p.add_argument("--title", default="EC-Earth3 DCPP vs ERA5 — feature skill")
@@ -463,15 +632,31 @@ def main(argv=None):
     aois = [x.strip() for x in a.aois.split(",") if x.strip()] if a.aois else None
     summ = load(d, "dcpp_era5_corr_*.csv", aois)
     yearly = load(d, "dcpp_era5_year_*.csv", aois, required=False)
+    byunit = load(d, "dcpp_era5_unit_*.csv", aois, required=False)
     print(f"summary: {len(summ)} rows, AOIs {sorted(summ.aoi.unique())}, "
           f"leads {sorted(summ.forecast_year.unique())}")
     print(f"per-year: {len(yearly)} rows" if not yearly.empty
           else "per-year: none found (older run; rerun compare to get them)")
+    print(f"per-unit: {len(byunit)} rows" if not byunit.empty
+          else "per-unit: none found (older run; rerun compare to get them)")
 
     if a.out:
         out = Path(a.out)
     else:
         out = d / ("dcpp_skill_report" + (f"_{'-'.join(aois)}" if aois else "") + ".html")
+
+    poly_dir = Path(a.polygons) if a.polygons else None
+    if poly_dir is None and not a.no_maps:
+        # The run JSON records the data root stage 3 used, which is where
+        # cy-bench lives -- so the maps need no extra flag in the normal case.
+        for j in sorted(glob.glob(str(d / "*" / "dcpp_era5_corr_*.json"))):
+            try:
+                root = json.load(open(j)).get("run", {}).get("data_root")
+            except Exception:
+                continue
+            if root and (Path(root) / "cy-bench" / "polygons").is_dir():
+                poly_dir = Path(root) / "cy-bench" / "polygons"
+                break
 
     ens = summ[summ.member == "ENSMEAN"].copy()
     mem = summ[summ.member != "ENSMEAN"].copy()
@@ -485,7 +670,10 @@ def main(argv=None):
     if not ey.empty:
         ey["aoi"] = pd.Categorical(ey.aoi, categories=order, ordered=True)
 
-    page = render_page(a, ens, mem, ey, leads, order, CSS)
+    eu = byunit[byunit.member == "ENSMEAN"].copy() if not byunit.empty else byunit
+    if not eu.empty:
+        eu["aoi"] = pd.Categorical(eu.aoi, categories=order, ordered=True)
+    page = render_page(a, ens, mem, ey, eu, poly_dir, leads, order, CSS)
     out.write_text(page, encoding="utf-8")
     print(f"wrote {out}  ({out.stat().st_size/1024:.0f} KB)")
 
@@ -496,7 +684,8 @@ def main(argv=None):
             e1 = ens[ens.forecast_year == fy]
             m1 = mem[mem.forecast_year == fy] if not mem.empty else mem
             y1 = ey[ey.forecast_year == fy] if not ey.empty else ey
-            sub = render_page(a, e1, m1, y1, [fy], order, CSS)
+            u1 = eu[eu.forecast_year == fy] if not eu.empty else eu
+            sub = render_page(a, e1, m1, y1, u1, poly_dir, [fy], order, CSS)
             q = out.with_name(f"{out.stem}_FY{fy}.html")
             q.write_text(sub, encoding="utf-8")
             print(f"wrote {q}  ({q.stat().st_size/1024:.0f} KB)")
@@ -512,6 +701,13 @@ def main(argv=None):
         yearly.sort_values(["aoi", "forecast_year", "feature", "member",
                             "harvest_year"]).to_csv(yflat, index=False)
         print(f"wrote {yflat}")
+    if not byunit.empty:
+        # Joins to the cy-bench polygons on adm2_id -> adm_id, for mapping in
+        # QGIS or R rather than in the page.
+        uflat = out.with_name(out.stem + "_per_unit.csv")
+        byunit.sort_values(["aoi", "forecast_year", "feature", "member",
+                            "adm2_id"]).to_csv(uflat, index=False)
+        print(f"wrote {uflat}")
     return 0
 
 

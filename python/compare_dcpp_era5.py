@@ -165,6 +165,65 @@ def season_parquet(out_dir: Path, aoi: str, crop: str, forecast_year: int,
 # ================================ build variables =================================
 
 
+# A DCPP hindcast file for initialisation s(Y) at lead F spans exactly
+# 1 Nov (Y+F-1) to 31 Oct (Y+F) -- the same 365-day window at every lead. A
+# season window that reaches outside it cannot be built from that file, and
+# reaching into the neighbouring initialisation would splice a different
+# forecast's weather into one feature row. So this is a property of the crop
+# calendar, not something a rerun fixes.
+DCPP_NOV1, DCPP_OCT31 = 305, 304
+
+
+def calendar_fit(root: Path, crop: str, cy_country: str, season: str | None,
+                 fy: int) -> tuple[str, str]:
+    """(verdict, detail) for this AOI's calendar at lead `fy`.
+
+    Stage 3 assembles a season from consecutive lead slices of ONE
+    initialisation, so a season running past 31 Oct is fine -- it picks up lead
+    fy+1. The one thing no lead can fix is a season that starts before its own
+    initialisation: at fy=1 that needs lead 0, which does not exist. Those AOIs
+    have no valid FY1 and must be run at a longer lead.
+
+    verdict is "ok", "needs-next-slice", or "impossible".
+    """
+    if season:
+        sos, eos = (float(x) for x in season.split(":"))
+        if sos > eos and sos < DCPP_NOV1 and fy == 1:
+            return "impossible", (
+                f"--season {season} starts at DOY {sos:.0f}, before 1 Nov, so at "
+                f"FY1 it would need a lead-0 slice. Run this AOI at FY2 or later.")
+        return ("needs-next-slice" if eos > DCPP_OCT31 else "ok"), ""
+    path = (root / "cy-bench" / "cybench-data" / crop / cy_country
+            / f"crop_calendar_{crop}_{cy_country}.csv")
+    if not path.exists():
+        return "impossible", f"no crop calendar at {path}"
+    c = pd.read_csv(path)
+    if not {"sos", "eos"} <= set(c.columns):
+        return "impossible", f"{path.name} lacks sos/eos"
+    cross = c.sos > c.eos
+    early = cross & (c.sos < DCPP_NOV1)       # starts before 1 Nov
+    late = c.eos > DCPP_OCT31                 # ends after 31 Oct
+    # Only refuse when a MAJORITY cannot be covered; stage 3 NaNs a minority of
+    # outlier units and reports the count, which must not cost the whole AOI.
+    if fy == 1 and early.mean() > 0.5:
+        return "impossible", (
+            f"{int(early.sum())} of {len(c)} unit(s) sow before 1 Nov "
+            f"(median sos DOY {c.loc[early, 'sos'].median():.0f}), so at FY1 the "
+            f"season starts before the initialisation. No lead-0 slice exists. "
+            f"Run this AOI at FY2+, or clamp with --season "
+            f"{max(c.sos.quantile(0.10), DCPP_NOV1):.0f}:"
+            f"{min(c.eos.quantile(0.90), DCPP_OCT31):.0f}.")
+    need = []
+    if fy == 1 and early.any():
+        need.append(f"{int(early.sum())}/{len(c)} unit(s) sow before 1 Nov -> "
+                    f"not coverable at FY1, will be NaN")
+    if late.any():
+        need.append(f"{int(late.sum())} unit(s) harvest after 31 Oct -> lead {fy + 1}")
+    if fy > 1 and early.any():
+        need.append(f"{int(early.sum())} unit(s) sow before 1 Nov -> lead {fy - 1}")
+    return ("needs-next-slice" if need else "ok"), "; ".join(need)
+
+
 def years_spec(years: list[int]) -> str:
     """Compress a year list to the compact form era5_features.parse_years reads.
 
@@ -446,6 +505,35 @@ def metrics(df: pd.DataFrame) -> dict:
     return out
 
 
+def unit_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per admin unit: that unit's own temporal skill across years.
+
+    These are exactly the per-unit correlations that r_time averages over. The
+    average hides where the skill sits, which is what a map is for. Note that
+    within a single unit the raw and anomaly correlations are identical --
+    removing that unit's mean subtracts a constant -- so one column suffices.
+    """
+    d = add_anomalies(df)
+    rows = []
+    for uid, g in d.groupby("adm2_id"):
+        n = len(g)
+        ok = n >= MIN_N_PER_GROUP
+        e, p = g["era5"].to_numpy(float), g["dcpp"].to_numpy(float)
+        ea, da = g["e_anom"].to_numpy(float), g["d_anom"].to_numpy(float)
+        sd_e = float(np.std(ea))
+        rows.append({
+            "adm2_id": uid,
+            "n_years": int(n),
+            "r_time": _r(e, p) if ok else np.nan,
+            "bias": float(np.mean(p - e)),
+            "rmse": float(np.sqrt(np.mean((p - e) ** 2))),
+            "sd_ratio_anom": (float(np.std(da) / sd_e) if ok and sd_e > 0 else np.nan),
+            "era5_mean": float(np.mean(e)),
+            "dcpp_mean": float(np.mean(p)),
+        })
+    return pd.DataFrame(rows)
+
+
 def ensemble_mean(pairs: pd.DataFrame) -> pd.DataFrame:
     """Average the members, then compare. ERA5 is identical across members, so
     it is taken as the first value rather than averaged."""
@@ -481,18 +569,22 @@ METRIC_NOTES = {
 
 
 def write_aoi_outputs(aoi_out: Path, tag: str, rows: list[dict],
-                      yearly: pd.DataFrame, pairs: pd.DataFrame, meta: dict,
+                      yearly: pd.DataFrame, byunit: pd.DataFrame,
+                      pairs: pd.DataFrame, meta: dict,
                       failures: list) -> list[Path]:
-    """One AOI's four tables, side by side with that AOI's logs."""
+    """One AOI's five tables, side by side with that AOI's logs."""
     aoi_out.mkdir(parents=True, exist_ok=True)
     summary = order_columns(pd.DataFrame(rows)).sort_values(["feature", "member"])
     csv_p = aoi_out / f"dcpp_era5_corr_{tag}.csv"
     json_p = aoi_out / f"dcpp_era5_corr_{tag}.json"
     year_p = aoi_out / f"dcpp_era5_year_{tag}.csv"
+    unit_p = aoi_out / f"dcpp_era5_unit_{tag}.csv"
     pairs_p = aoi_out / f"dcpp_era5_pairs_{tag}.csv.gz"
     summary.to_csv(csv_p, index=False)
     if not yearly.empty:
         yearly.sort_values(["feature", "member", "harvest_year"]).to_csv(year_p, index=False)
+    if not byunit.empty:
+        byunit.sort_values(["feature", "member", "adm2_id"]).to_csv(unit_p, index=False)
     pairs.to_csv(pairs_p, index=False)
     with open(json_p, "w") as fh:
         json.dump({"run": meta, "metric_notes": METRIC_NOTES,
@@ -500,7 +592,12 @@ def write_aoi_outputs(aoi_out: Path, tag: str, rows: list[dict],
                                 for x in failures],
                    "results": json.loads(summary.to_json(orient="records"))},
                   fh, indent=2)
-    return [csv_p, json_p, year_p, pairs_p] if not yearly.empty else [csv_p, json_p, pairs_p]
+    out = [csv_p, json_p]
+    if not yearly.empty:
+        out.append(year_p)
+    if not byunit.empty:
+        out.append(unit_p)
+    return out + [pairs_p]
 
 
 # =================================== main =====================================
@@ -593,8 +690,9 @@ def main(argv=None):
     print(f"  features    : {','.join(feats)}   reduce={a.reduce} weight={a.weight}")
     print()
 
-    plan = []
+    plan, failures = [], []
     for aoi in aois:
+        cc = a.cy_country or ("US" if aoi == "CONUS" else aoi)
         mems = ([x.strip() for x in a.members.split(",")] if a.members
                 else discover_members(dcpp_root, aoi))
         if not mems:
@@ -605,7 +703,20 @@ def main(argv=None):
         if not e_dir.is_dir():
             print(f"  {aoi}: no ERA5 tree at {e_dir} -- skipping")
             continue
-        fys = fy_list if fy_list is not None else discover_leads(dcpp_root, aoi, mems)
+        fys_all = fy_list if fy_list is not None else discover_leads(dcpp_root, aoi, mems)
+        fys, notes = [], []
+        for fy in fys_all:
+            verdict, detail = calendar_fit(Path(a.root), a.crop, cc, a.season, fy)
+            if verdict == "impossible":
+                print(f"  {aoi} FY{fy}: SKIPPED -- {detail}")
+                failures.append((aoi, f"calendar FY{fy}", detail))
+                continue
+            if verdict == "needs-next-slice":
+                notes.append(f"FY{fy} also reads lead slices of the same "
+                             f"initialisation ({detail})")
+            fys.append(fy)
+        for n in notes:
+            print(f"      note: {n}")
         if not fys:
             print(f"  {aoi}: no fy*_s* files under "
                   f"{dcpp_dir(dcpp_root, aoi, mems[0])} -- skipping "
@@ -634,7 +745,7 @@ def main(argv=None):
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    all_rows, failures, written = [], [], []
+    all_rows, written = [], []
     for aoi, mems, fys in plan:
         print(f"\n--- {aoi} ---")
         e_dir = era5_dir(era5_root, aoi)
@@ -735,7 +846,7 @@ def main(argv=None):
             # of rows on its own.
             both = pd.concat([pairs, ens], ignore_index=True)
 
-            rows, yrows = [], []
+            rows, yrows, urows = [], [], []
             for member, mdf in both.groupby("member"):
                 for feat, fdf in mdf.groupby("feature"):
                     key = {"aoi": aoi, "member": member, "feature": feat,
@@ -749,8 +860,13 @@ def main(argv=None):
                     for k, v in reversed(list(key.items())):
                         ym.insert(0, k, v)
                     yrows.append(ym)
+                    um = unit_metrics(fdf)
+                    for k, v in reversed(list(key.items())):
+                        um.insert(0, k, v)
+                    urows.append(um)
             all_rows.extend(rows)
             yearly = pd.concat(yrows, ignore_index=True) if yrows else pd.DataFrame()
+            byunit = pd.concat(urows, ignore_index=True) if urows else pd.DataFrame()
 
             meta = dict(
                 created=time.strftime("%Y-%m-%d %H:%M:%S %Z"), argv=sys.argv,
@@ -765,7 +881,7 @@ def main(argv=None):
                 reduce=a.reduce, weight=a.weight, crop=a.crop,
                 era5_dir=str(e_dir), dcpp_root=str(dcpp_root), data_root=a.root,
             )
-            paths = write_aoi_outputs(aoi_out, tag, rows, yearly, both, meta,
+            paths = write_aoi_outputs(aoi_out, tag, rows, yearly, byunit, both, meta,
                                       [f for f in failures if f[0] == aoi])
             written.extend(paths)
             for q in paths:
