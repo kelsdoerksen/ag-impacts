@@ -303,62 +303,169 @@ def _rings(geom):
             yield list(h.coords)
 
 
-def path_defs(gdf, aoi: str, w=330, h=300, pad=6):
+def _ring_centroid(ring):
+    """Area-weighted centroid of one closed ring, or its bbox centre if
+    degenerate. Used to place the hover readout inside the unit."""
+    a = cx = cy = 0.0
+    for (x0, y0), (x1, y1) in zip(ring, ring[1:]):
+        cr = x0 * y1 - x1 * y0
+        a += cr
+        cx += (x0 + x1) * cr
+        cy += (y0 + y1) * cr
+    if abs(a) < 1e-12:
+        xs = [x for x, _ in ring]
+        ys = [y for _, y in ring]
+        return (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+    return cx / (3 * a), cy / (3 * a)
+
+
+def _ring_area(ring):
+    return abs(sum(x0 * y1 - x1 * y0
+                   for (x0, y0), (x1, y1) in zip(ring, ring[1:]))) / 2
+
+
+def view_extent(gdf, trim: bool = True, k: float = 6.0,
+                keep_frac: float = 0.75) -> tuple[tuple, int]:
+    """Bounding box to draw, and how many units fall outside it.
+
+    The cy-bench shapefiles carry everything a country administers, which for
+    some AOIs is most of a hemisphere: FR ships Guadeloupe, Guyane, Reunion and
+    Mayotte (lon -63 to +56, so metropolitan France is a tenth of the width),
+    and US ships American Samoa, the Northern Marianas and the Aleutians across
+    the antimeridian (lon -179 to +180, so CONUS is a sixth of the width).
+    Scaling to that extent draws the actual crop area as a postage stamp.
+
+    Outliers are found by median absolute deviation rather than by a quantile.
+    A quantile cut has to guess what fraction is remote -- 2% is too little for
+    FR, where five of 101 units are overseas, and too much for a compact AOI
+    like HU, where dropping one of twenty units was enough to trip a
+    span-ratio test. MAD asks the scale-free question instead: is this unit far
+    from the bulk in units of how spread the bulk is. For a compact AOI the
+    largest deviation is about 2 MAD, so k=6 never fires; the remote
+    territories sit at 8 to 25 MAD.
+
+    The trim is then applied only if it actually changes the picture -- if the
+    kept units still span `keep_frac` of the full extent there was nothing
+    pathological, and the full box is used so nothing is cropped for free. The
+    count of excluded units is returned so the caption can say so rather than
+    quietly dropping them.
+    """
+    x0, y0, x1, y1 = gdf.total_bounds
+    full = (x0, y0, x1, y1)
+    if not trim or len(gdf) < 8:
+        return full, 0
+
+    cs = [_ring_centroid(max(_rings(g), key=_ring_area, default=[(0, 0), (0, 0)]))
+          for g in gdf.geometry]
+    xs = [c[0] for c in cs]
+    ys = [c[1] for c in cs]
+
+    def keep_mask(v):
+        med = sorted(v)[len(v) // 2]
+        dev = sorted(abs(t - med) for t in v)
+        mad = dev[len(dev) // 2]
+        if mad <= 0:                 # degenerate: every centroid on one line
+            return [True] * len(v)
+        return [abs(t - med) <= k * mad for t in v]
+
+    kx, ky = keep_mask(xs), keep_mask(ys)
+    keep = [a and b for a, b in zip(kx, ky)]
+    if all(keep):
+        return full, 0
+
+    # Box over the kept units' GEOMETRY, not their centroids, so a kept unit is
+    # never clipped at the edge of its own view.
+    boxes = [g.bounds if hasattr(g, "bounds") else None
+             for g, kp in zip(gdf.geometry, keep) if kp]
+    if any(b is None for b in boxes) or not boxes:
+        bx0 = min(x for x, kp in zip(xs, keep) if kp)
+        bx1 = max(x for x, kp in zip(xs, keep) if kp)
+        by0 = min(y for y, kp in zip(ys, keep) if kp)
+        by1 = max(y for y, kp in zip(ys, keep) if kp)
+    else:
+        bx0 = min(b[0] for b in boxes); by0 = min(b[1] for b in boxes)
+        bx1 = max(b[2] for b in boxes); by1 = max(b[3] for b in boxes)
+
+    wf, hf = max(x1 - x0, 1e-9), max(y1 - y0, 1e-9)
+    if (bx1 - bx0) / wf >= keep_frac and (by1 - by0) / hf >= keep_frac:
+        return full, 0
+    return (bx0, by0, bx1, by1), sum(1 for kp in keep if not kp)
+
+
+def path_defs(gdf, aoi: str, w=330, pad=6, trim: bool = True,
+              k: float = 6.0):
     """Serialise this AOI's geometry ONCE, as a hidden <defs> of <path> ids.
 
     Every map of one AOI then references the same paths through <use>, which is
     the difference between a readable page and an unusable one: mapping six
-    features at two leads would otherwise write each of US maize's 3025 county
-    outlines twelve times -- tens of megabytes of identical coordinates.
+    features at two leads would otherwise write each of US maize's 3000-odd
+    county outlines twelve times -- tens of megabytes of identical coordinates.
 
-    The transform is computed from the WHOLE polygon set, not from whichever
-    units a given feature happened to match, so every map of an AOI shares one
-    extent. Side-by-side maps drawn at different zooms would invite exactly the
-    wrong comparison.
+    `gdf` must already be restricted to the units that will be mapped, so the
+    extent comes from the crop area rather than from every island the country
+    administers. All of an AOI's maps then share one transform; side-by-side
+    maps drawn at different zooms would invite exactly the wrong comparison.
+
+    The viewBox height follows the data's aspect ratio instead of being fixed,
+    so a wide AOI like CONUS fills its box rather than being letterboxed into
+    the middle third of it.
 
     Geometry is projected to EPSG:6933 (equal area) upstream, so unit areas are
     not distorted by latitude the way a raw lon/lat plot would be.
     """
-    x0, y0, x1, y1 = gdf.total_bounds
-    sc = min((w - 2 * pad) / max(x1 - x0, 1e-9), (h - 2 * pad) / max(y1 - y0, 1e-9))
-    ox = pad + ((w - 2 * pad) - (x1 - x0) * sc) / 2
-    oy = pad + ((h - 2 * pad) - (y1 - y0) * sc) / 2
+    (x0, y0, x1, y1), outside = view_extent(gdf, trim, k)
+    span_x, span_y = max(x1 - x0, 1e-9), max(y1 - y0, 1e-9)
+    inner = w - 2 * pad
+    # Clamped so one very tall or very wide AOI cannot wreck the grid rhythm.
+    h = min(max(inner * span_y / span_x, 150.0), 430.0) + 2 * pad
+    sc = min(inner / span_x, (h - 2 * pad) / span_y)
+    ox = pad + (inner - span_x * sc) / 2
+    oy = pad + ((h - 2 * pad) - span_y * sc) / 2
     slug = re.sub(r"[^A-Za-z0-9]+", "-", str(aoi)).strip("-")
+
     parts, ids = [], {}
     for i, row in enumerate(gdf.itertuples()):
-        d = []
+        d, rings = [], []
         for ring in _rings(row.geometry):
             pts = " L".join(f"{ox + (x - x0) * sc:.1f},{oy + (y1 - y) * sc:.1f}"
                             for x, y in ring)
             d.append("M" + pts + "Z")
+            rings.append([(ox + (x - x0) * sc, oy + (y1 - y) * sc) for x, y in ring])
         if not d:
             continue
         pid = f"p-{slug}-{i}"
-        ids[row.adm_id] = pid
+        lx, ly = _ring_centroid(max(rings, key=_ring_area))
+        ids[row.adm_id] = (pid, lx, ly)
         parts.append(f'<path id="{pid}" d="{" ".join(d)}"/>')
     defs = (f'<svg class="defs" aria-hidden="true" width="0" height="0">'
             f'<defs>{"".join(parts)}</defs></svg>')
-    return defs, ids, (w, h)
+    return defs, ids, (w, round(h, 1)), outside
 
 
-def svg_map(ids: dict, values: dict, title: str, box=(330, 300)):
+def svg_map(ids: dict, values: dict, title: str, box):
     """One choropleth as <use> references into this AOI's shared <defs>.
 
-    fill is set on the <use> rather than the <path>, so the same geometry can be
-    shaded differently by every map that references it. The per-unit <title>
-    gives the hover tooltip.
+    Each unit is a <g> holding a <title> and a hidden <text>. The <title> alone
+    was not enough: a tooltip declared inside a <use> is resolved
+    inconsistently, because the hover target is the shadow instance of the
+    referenced <path> rather than the <use> itself. On a <g> it is an ordinary
+    element and works everywhere. The <text> is the real readout -- it appears
+    immediately on hover instead of after the browser's tooltip delay, and it
+    is legible on a projector, which a native tooltip is not.
     """
     w, h = box
     parts = [f'<svg viewBox="0 0 {w} {h}" class="map" role="img" '
              f'aria-label="{html.escape(title)}">',
              '<g fill-rule="evenodd" stroke="#888" stroke-width="0.25">']
-    for aid, pid in ids.items():
+    for aid, (pid, lx, ly) in ids.items():
         if aid not in values:
             continue
         v = values[aid]
         lab = "n/a" if v is None or pd.isna(v) else f"{v:+.2f}"
-        parts.append(f'<use href="#{pid}" fill="{ramp(v)}">'
-                     f'<title>{html.escape(str(aid))}: {lab}</title></use>')
+        parts.append(
+            f'<g class="u"><title>{html.escape(str(aid))}: {lab}</title>'
+            f'<use href="#{pid}" fill="{ramp(v)}"/>'
+            f'<text class="lbl" x="{lx:.1f}" y="{ly:.1f}">{lab}</text></g>')
     parts.append("</g></svg>")
     return "".join(parts)
 
@@ -410,8 +517,7 @@ def map_figure(ids: dict, box, sub, aoi, feature, fy, back: str) -> str:
 
     Expansion is a :target rule, not script: clicking the caption navigates to
     this figure's id and the CSS gives the targeted figure the full grid width.
-    Nothing is overlaid on the map, so the per-unit tooltips still work when it
-    is expanded.
+    Nothing is overlaid on the map, so the hover readout still works expanded.
     """
     vals = {a: v for a, v in zip(sub.adm2_id, sub.r_time) if a in ids}
     if not vals:
@@ -433,8 +539,14 @@ def map_figure(ids: dict, box, sub, aoi, feature, fy, back: str) -> str:
             f'{svg_map(ids, vals, f"{aoi} {feature} FY{fy}", box)}</figure>')
 
 
-def map_section(byunit: pd.DataFrame, poly_dir: Path, features, leads) -> str:
+def map_section(byunit: pd.DataFrame, poly_dir: Path, features, leads,
+                trim: bool = True, k: float = 6.0) -> str:
     """Every feature mapped, side by side, one block per AOI.
+
+    The polygons are cut down to the units that actually appear in the data
+    BEFORE the extent is computed. Drawing to the shapefile's own extent is
+    what made FR and US unreadable: those files carry overseas departments and
+    Pacific territories, and the crop area is a small corner of the result.
 
     Ordered feature-major so the leads of one feature sit next to each other:
     the comparison these maps exist to support is FY1 against FY2 for the same
@@ -448,7 +560,15 @@ def map_section(byunit: pd.DataFrame, poly_dir: Path, features, leads) -> str:
             blocks.append(f'<h3>{html.escape(aoi)}</h3>'
                           f'<p class="na">{html.escape(err)}</p>')
             continue
-        defs, ids, box = path_defs(polys, aoi)
+        shown = set(g[g.feature.isin(features)].adm2_id)
+        drawn = polys[polys.adm_id.isin(shown)]
+        if drawn.empty:
+            blocks.append(
+                f'<h3>{html.escape(aoi)}</h3><p class="na">none of the '
+                f'{len(shown)} unit id(s) in the data matched the {len(polys)} '
+                f'id(s) in {aoi}.shp &mdash; check the adm_id spelling</p>')
+            continue
+        defs, ids, box, outside = path_defs(drawn, aoi, trim=trim, k=k)
         back = f"maps-{re.sub(r'[^A-Za-z0-9]+', '-', aoi).strip('-')}"
         figs = []
         for feat in features:
@@ -460,10 +580,16 @@ def map_section(byunit: pd.DataFrame, poly_dir: Path, features, leads) -> str:
                 if not sub.empty:
                     figs.append(map_figure(ids, box, sub, aoi, feat, fy, back))
         if figs:
+            miss = len(shown) - len(drawn)
+            notes = [f"{len(figs)} map(s)", f"{len(drawn)} units"]
+            if outside:
+                notes.append(f"{outside} outside view")
+            if miss:
+                notes.append(f"{miss} not in shapefile")
             blocks.append(
                 f'<h3 id="{back}">{html.escape(aoi)} '
-                f'<span class="dim">&middot; {len(figs)} map(s) &middot; '
-                f'{len(ids)} units</span></h3>{defs}'
+                f'<span class="dim">&middot; {" &middot; ".join(notes)}</span>'
+                f'</h3>{defs}'
                 f'<div class="grid maps">{"".join(figs)}</div>')
     if not blocks:
         return '<p class="na">no per-unit data to map</p>'
@@ -513,7 +639,18 @@ text.tick{fill:var(--mut);font-size:9.5px}
 .legend{padding:2px 6px 6px;font-size:11.5px;color:var(--mut)}
 .key{margin-right:10px}.key i{display:inline-block;width:9px;height:9px;border-radius:2px;
  margin-right:4px;vertical-align:-1px}
-.maps{grid-template-columns:repeat(auto-fill,minmax(228px,1fr));align-items:start}
+.maps{grid-template-columns:repeat(auto-fill,minmax(250px,1fr));align-items:start}
+/* The readout is sized in viewBox units, so its on-screen size depends on how
+   far the SVG is being scaled: a collapsed thumbnail is drawn at ~0.75x of the
+   330-unit viewBox and an expanded one at ~3x, hence the much smaller value
+   when targeted. paint-order puts the background-coloured stroke behind the
+   glyphs so the number stays legible over any fill in the ramp. */
+.u .lbl{display:none;pointer-events:none;text-anchor:middle;font-weight:700;
+ font-size:13px;fill:var(--fg);stroke:var(--bg);stroke-width:3px;paint-order:stroke;
+ font-variant-numeric:tabular-nums}
+.u:hover .lbl{display:block}
+.u:hover use{stroke:var(--fg);stroke-width:0.9}
+.maps .fig:target .u .lbl{font-size:5px;stroke-width:1.4px}
 .map{width:100%;height:auto;display:block;background:transparent}
 /* Click-to-expand without script: the caption link targets the figure, and a
    targeted figure takes the whole grid row. :target survives printing and
@@ -649,7 +786,10 @@ def render_page(a, ens, mem, ey, eu, poly_dir, leads, order, css):
                  'Maps sit side by side for comparison; <b>click a caption to '
                  'expand one to full width</b>, and the &times; to collapse it. '
                  'Hover a unit for its id and value. Equal-area projection '
-                 '(EPSG:6933); grey units have fewer than four paired years.</p>')
+                 '(EPSG:6933); grey units have fewer than four paired years. '
+                 'Remote units that would shrink the crop area to a corner of the frame '
+                 '&mdash; overseas departments, Pacific territories &mdash; are left out of '
+                 'the view and counted in each AOI heading; <span class="mono">--map-full-extent</span> keeps them.</p>')
         if missing:
             B.append(f'<p class="na">not in this run: '
                      f'<span class="mono">{html.escape(", ".join(missing))}</span> '
@@ -658,7 +798,8 @@ def render_page(a, ens, mem, ey, eu, poly_dir, leads, order, css):
         if not feats:
             B.append('<p class="na">no features left to map after filtering</p>')
         else:
-            B.append(map_section(eu, poly_dir, feats, leads))
+            B.append(map_section(eu, poly_dir, feats, leads,
+                                 trim=not a.map_full_extent, k=a.map_trim_k))
     elif not a.no_maps and not eu.empty:
         B.append('<h2>7b &middot; Maps</h2>')
         B.append('<p class="na">No polygon directory found. Pass '
@@ -714,6 +855,14 @@ def main(argv=None):
     p.add_argument("--map-feature", default=None,
                    help="deprecated single-feature alias for --map-features")
     p.add_argument("--no-maps", action="store_true", help="skip the map section")
+    p.add_argument("--map-full-extent", action="store_true",
+                   help="draw maps to the shapefile's full extent instead of "
+                        "trimming far-flung units (FR's overseas departments, "
+                        "US territories and the Aleutians) out of the view")
+    p.add_argument("--map-trim-k", type=float, default=6.0,
+                   help="how remote a unit must be to leave the map view, in "
+                        "median absolute deviations (default 6). Lower trims "
+                        "harder; at 6 only FR and US are affected at all")
     p.add_argument("--per-lead-pages", action="store_true",
                    help="also write one standalone HTML per lead, for slides")
     p.add_argument("--title", default="EC-Earth3 DCPP vs ERA5 — feature skill")
