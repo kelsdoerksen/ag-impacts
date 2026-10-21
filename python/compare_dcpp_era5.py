@@ -165,6 +165,51 @@ def season_parquet(out_dir: Path, aoi: str, crop: str, forecast_year: int,
 # ================================ build variables =================================
 
 
+def years_spec(years: list[int]) -> str:
+    """Compress a year list to the compact form era5_features.parse_years reads.
+
+    [2002,2003,2004,2007] -> "2002-2004,2007". Gaps are preserved rather than
+    spanned, which is the whole point: asking for a year with no cube on disk
+    aborts the entire invocation and loses every other year with it.
+    """
+    out, i = [], 0
+    while i < len(years):
+        j = i
+        while j + 1 < len(years) and years[j + 1] == years[j] + 1:
+            j += 1
+        out.append(str(years[i]) if j == i else f"{years[i]}-{years[j]}")
+        i = j + 1
+    return ",".join(out)
+
+
+def available_years(out_dir: Path, aoi: str, source: str, fy: int,
+                    wanted: list[int], stage: str) -> list[int]:
+    """Source years that actually have stage-1 (or stage-2) output on disk.
+
+    Mirrors era5_features.Layout.cube()/features() naming. A year absent from
+    the archive is dropped here so it is never requested; era5_features then
+    derives which harvest years remain fully covered and says how many it had
+    to drop. Without this, one gap in the middle of a 21-year range is a hard
+    SystemExit and the other 20 years are lost too.
+    """
+    cube_d, feat_d = out_dir / "pixel_daily", out_dir / "pixel_features"
+
+    def cube(y):
+        n = (f"era5_pixel_{aoi}_{y}.nc" if fy == 0
+             else f"pixel_{source}_{aoi}_fy{fy}_s{y}.nc")
+        return (cube_d / n).exists()
+
+    def feat(y):
+        n = f"features_{aoi}_{y}.nc" if fy == 0 else f"features_{aoi}_fy{fy}_s{y}.nc"
+        return (feat_d / n).exists()
+
+    if stage == "aggregate":          # stage 3 reads features, not cubes
+        return [y for y in wanted if feat(y)]
+    # stage 2 can be satisfied by either: a cube to compute from, or a feature
+    # file an earlier run already wrote.
+    return [y for y in wanted if cube(y) or feat(y)]
+
+
 def build_cmd(a, aoi: str, source: str, out_dir: Path, forecast_year: int,
               source_years: list[int]) -> list[str]:
     cmd = [
@@ -172,7 +217,7 @@ def build_cmd(a, aoi: str, source: str, out_dir: Path, forecast_year: int,
         f"--aoi={aoi}",
         f"--source={source}",
         f"--forecast-year={forecast_year}",
-        f"--years={source_years[0]}-{source_years[-1]}",
+        f"--years={years_spec(source_years)}",
         f"--stage={a.stage}",
         f"--reduce={a.reduce}",
         f"--weight={a.weight}",
@@ -602,8 +647,17 @@ def main(argv=None):
         # for every lead. Rebuilding it per lead would spawn a process per lead
         # that does nothing but print "exists, skipping".
         if not a.skip_build:
-            print("  building ERA5 features ...")
-            cmd = build_cmd(a, aoi, "ERA5", e_dir, 0, era5_src)
+            have_e = available_years(e_dir, aoi, "ERA5", 0, era5_src, a.stage)
+            gaps = sorted(set(era5_src) - set(have_e))
+            if gaps:
+                print(f"    ERA5: {len(gaps)} source year(s) absent from the "
+                      f"archive, skipped: {years_spec(gaps)}")
+            if not have_e:
+                print(f"    ERA5: no source years present under {e_dir} -- skipping AOI")
+                failures.append((aoi, "ERA5", "no source years on disk"))
+                continue
+            print(f"  building ERA5 features ({years_spec(have_e)}) ...")
+            cmd = build_cmd(a, aoi, "ERA5", e_dir, 0, have_e)
             if not run_build(cmd, aoi_out / "logs" / f"{aoi}_ERA5.log"):
                 failures.append((aoi, "ERA5", "build"))
                 continue
@@ -637,8 +691,16 @@ def main(argv=None):
                 d_dir = dcpp_dir(dcpp_root, aoi, mem)
                 label = f"{source} FY{fy}"
                 if not a.skip_build:
-                    print(f"    building {label} ...")
-                    cmd = build_cmd(a, aoi, source, d_dir, fy, dcpp_src)
+                    have_d = available_years(d_dir, aoi, source, fy, dcpp_src, a.stage)
+                    gaps = sorted(set(dcpp_src) - set(have_d))
+                    if gaps:
+                        print(f"      {label}: {len(gaps)} initialisation(s) absent, "
+                              f"skipped: s{years_spec(gaps)}")
+                    if not have_d:
+                        print(f"      {label}: no initialisations present -- skipping")
+                        failures.append((aoi, label, "no source years on disk"))
+                        continue
+                    cmd = build_cmd(a, aoi, source, d_dir, fy, have_d)
                     if not run_build(cmd, aoi_out / "logs" / f"{aoi}_{source}_fy{fy}.log"):
                         failures.append((aoi, label, "build"))
                         continue
@@ -697,6 +759,9 @@ def main(argv=None):
                 era5_source_years=[era5_src[0], era5_src[-1]],
                 dcpp_source_years=[dcpp_src[0], dcpp_src[-1]],
                 features_requested=feats, compared_columns=sorted(set(have)),
+                # Explicit, because gaps in either archive silently shrink this
+                # and "n_years" alone does not say WHICH years were compared.
+                compared_harvest_years=sorted(int(y) for y in pairs.harvest_year.unique()),
                 reduce=a.reduce, weight=a.weight, crop=a.crop,
                 era5_dir=str(e_dir), dcpp_root=str(dcpp_root), data_root=a.root,
             )
