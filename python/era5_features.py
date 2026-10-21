@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Per-pixel ERA5 features, then the cropland-weighted admin-2 aggregate.
-
 """
 
 from __future__ import annotations

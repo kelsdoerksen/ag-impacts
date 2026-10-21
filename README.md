@@ -47,11 +47,18 @@ Rscript R/dcpp-pixel-store.R --aoi=CONUS --forecast-year=1 1982-2018
 | `python/era5_features.py` | **Stages 2 and 3 for both sources.** Stage 2 computes per-pixel daily features; stage 3 takes the cropland-area-weighted admin-2 mean, optionally accumulated over a crop-calendar season (`--reduce season`) or season-relative blocks (`--reduce blocks`). `--source` selects the climate tree; `--forecast-year` the lead time. `--list-features` shows the registry. |
 | `python/degree_days.py` | The single-sine degree-day integral, shared by `era5_features.py` and `data_loader.py` so the feature definition cannot differ between the two. |
 | `python/run_cybench_era5.py` | Driver: runs stages 1 and 2 over many AOIs in sequence, deriving each AOI's year span from its cy-bench crop coverage. Dry-run by default; resumable; logs per AOI. |
+| `python/compare_dcpp_era5.py` | **Checks the hindcast against the reanalysis.** Drives `era5_features.py` for ERA5 and for each EC-Earth3 member, joins the two on `(adm2_id, harvest_year)`, and reports how well each member -- and the ensemble mean -- reproduces the ERA5 feature. `r_anom` (each unit's own mean removed from both sides) is the interannual skill; `r_pooled` is reported beside it but is inflated by between-unit climatology. Writes csv + json + every paired value. Members auto-discover from the DCPP tree; dry-run by default. |
+| `python/report_dcpp_era5.py` | Turns one or more `dcpp_era5_corr_*.csv` into a single self-contained HTML report -- headline skill per AOI, decay with lead time, what the ensemble mean adds, and calibration -- plus a tidy csv for slides. No plotting dependency; the bars are inline CSS. |
 
 ```sh
 python python/era5_features.py --aoi=US --years=2000-2023 --stage=features
 python python/era5_features.py --aoi=US --years=2000-2023 --stage=aggregate \
     --reduce=blocks --crop=maize
+
+# DCPP fy1 vs ERA5: plan and the exact commands first, then run
+python python/compare_dcpp_era5.py --aois ZM --harvest-years 2002-2022
+python python/compare_dcpp_era5.py --aois ZM --harvest-years 2002-2022 --go
+python python/report_dcpp_era5.py --dir /mnt/crl_storage/personal_folders/kdoerksen/comparisons
 ```
 
 ### Supporting data
