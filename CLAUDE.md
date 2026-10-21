@@ -109,6 +109,41 @@ lab PC more than once.
   are recorded in each cube's attributes. There is deliberately no fit-time
   flag, because by then the feature is a finished column.
 
+### ML experiments (`yield_features.py` + `run_yield_experiment.py`)
+
+- **Folds are whole years, never rows.** Districts share a year's weather, so
+  their residuals are correlated (r ~ 0.28 for ZM maize). A random row split
+  leaves ~70 near-duplicates of each test row in training, and the score it
+  reports has nothing to do with forecasting. Every CV inside a model
+  (`GroupedRidgeCV`, `GroupedMLP`, `logreg`) holds out years too.
+- **The feature source is the only thing an ERA5 run and a DCPP run may
+  differ in.** `--source era5 | dcpp:<member> | dcpp:ens`, same keys, same
+  covariates, same folds. Otherwise the difference in score measures plumbing.
+- **The DCPP ensemble mean is taken AFTER stage 3**, feature by feature, and
+  only over unit-years every member has. Averaging daily fields first would
+  flatten the tails a threshold feature exists to measure; a varying
+  membership would put a step in the series that reads as interannual signal.
+- **Lagged inputs and the direction reference must be at least the lead
+  time.** A lead-F forecast is issued before harvest year H-F+1 exists, so at
+  FY2 the most recent observable yield is H-2. `yield_lag{k}` starts at
+  `max(1, F)` and `--target-lags` is refused below F.
+- **`sd_ratio_anom < 1` is not a defect.** For a calibrated conditional-mean
+  predictor under squared error, `sd(pred)/sd(obs) ~= r`. Measured on a
+  synthetic panel: mlp 0.287 vs r_anom 0.297 (calibrated), rf-anomaly 0.442 vs
+  0.266 and rf-absolute 1.682 vs 0.901 (both over-dispersed). An MLP's weight
+  decay does not change this -- pinning alpha over six decades moved
+  sd_ratio_anom only 0.281-0.289. Wanting full amplitude means a different
+  loss, or the `direction` target, which discards amplitude.
+- **The direction band is `tau * sigma(u,k)`, fit on training rows only.**
+  Per unit, because a fixed kg/ha band means different things in a district
+  that swings 40% a year and one that swings 5%. Per lag, because the spread
+  of a k-year difference grows ~sqrt(k). Training-only, or the held-out year
+  sets its own class boundary. `tau = 0.5` gives roughly balanced thirds.
+- **Never quote direction accuracy alone.** Widening the band to 2 sigma took
+  accuracy from 0.318 to 0.934 purely by growing the flat class to 93% of
+  rows; the base-rate null rose with it and `hss` stayed at 0. Report
+  `acc_major`, `bacc` and `hss` beside it.
+
 ## Known gotchas
 
 - **cy-bench bounding boxes** are padded 0.5° around the polygons that have
@@ -123,6 +158,21 @@ lab PC more than once.
   January. CDS months land in `cds_nc/` and survive.
 - `jsonlite::write_json` defaults to 4 decimal places — the grid manifest needs
   `digits = NA` or resumed runs fail their own grid check.
+- **`data_loader.find_season_feature_files` cannot see a DCPP store.** It globs
+  `features_{aoi}_{tag}_{kind}_*` while stage 3 writes
+  `features_{aoi}_{tag}_fy{F}_{kind}_{year}`, so it silently finds nothing at
+  any lead. Observed (FY0) stores still match. `yield_features.py` globs the
+  lead token; the older runners (`run_loo_experiment.py`, the TST arms) are
+  still FY0-only.
+- **FR and US shapefiles span most of a hemisphere.** FR ships `FRY10/20/30/40/50`
+  (Guadeloupe, Martinique, Guyane, Réunion, Mayotte) and US ships FIPS 02/15/60/66/69
+  plus the Aleutians across the antimeridian. Drawing a map to the shapefile's own
+  extent puts metropolitan France at 12% of the frame and CONUS at 16%. Restrict
+  to the units in the data first; `report_dcpp_era5.py` then trims what is left by
+  MAD (k=6, the only value that touches nothing but FR and US).
+- **ET's processed-data directory is `ET_preprocessed_data`**, not
+  `ET_processed_data` (`R/crop-data-gen-cybench.R`). `Roots.aoi_targets`
+  accepts both rather than renaming a directory other scripts point at.
 
 ## Priorities
 

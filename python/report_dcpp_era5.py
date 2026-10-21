@@ -33,7 +33,7 @@ import pandas as pd
 METRICS = {
     "r_anom": ("Interannual, pooled",
                "corr over all (u,t) of [x(u,t) - x̄(u)] against [y(u,t) - ȳ(u)]",
-               "Does the hindcast track year-to-year variation? Variance-weighted "
+               "Does DCPP track year-to-year variation? Variance-weighted "
                "across units, so high-amplitude units dominate."),
     "r_time": ("Interannual, per unit",
                "mean over u of corr over t of x(u,·) against y(u,·)",
@@ -41,7 +41,7 @@ METRICS = {
                "skill is uniform or carried by a few units."),
     "r_acc": ("Spatial anomaly (ACC)",
               "mean over t of corr over u of [x(u,t) - x̄(u)] against [y(u,t) - ȳ(u)]",
-              "Within a single season, does the hindcast get the spatial pattern "
+              "Within a single season, does DCPP get the spatial pattern "
               "of the anomaly right? Independent of r_anom."),
     "r_space": ("Spatial, raw",
                 "mean over t of corr over u of x(u,t) against y(u,t)",
@@ -763,7 +763,7 @@ def render_page(a, ens, mem, ey, eu, poly_dir, leads, order, css):
     if "sd_ratio_anom" in ens.columns:
         B.append('<h2>7 &middot; Anomaly dispersion</h2>')
         B.append('<p class="sub">sd of DCPP anomalies over sd of ERA5 anomalies. Below 1 the '
-                 'hindcast under-varies. The ensemble mean is structurally low here: averaging '
+                 'DCPP under-varies. The ensemble mean is structurally low here: averaging '
                  'members damps variance, so this is not by itself a model defect.</p>')
         B.append(simple_table(ens, "aoi", ["feature", "forecast_year"],
                               "sd_ratio_anom", "AOI", dp=2))

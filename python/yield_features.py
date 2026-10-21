@@ -387,12 +387,42 @@ def yield_lag_features(yields: pd.DataFrame, n_lags: int,
 
 # ============================== assembly ==============================
 
+def reference_yields(yields: pd.DataFrame, lags) -> tuple[pd.DataFrame, list[str]]:
+    """y[u, t-k] for each requested k, as `yref{k}` columns.
+
+    These are TARGET metadata, not features: the direction label is
+    sign(y[u,t] - y[u,t-k]), so the reference has to be on the row before a
+    label can be formed. It is taken from the full yield table rather than from
+    the feature-joined frame, because year t-k often has no climate features
+    (outside --years, or skipped for a missing DCPP slice) while its yield is
+    perfectly well observed. Joining on the restricted frame would silently
+    drop those rows.
+
+    Whether y[u,t-k] may also be used as an INPUT is a separate question, and
+    the answer is yes -- it is known when a lead-F forecast is issued as long
+    as k >= F. That is what --add yield_history does; it is kept distinct so
+    the label and the feature set cannot be confused.
+    """
+    out = yields[["adm2_id", "harvest_year"]].copy()
+    src = yields.set_index(["adm2_id", "harvest_year"])["yield"]
+    names = []
+    for k in sorted({int(x) for x in lags}):
+        probe = pd.MultiIndex.from_arrays([out["adm2_id"], out["harvest_year"] - k])
+        out[f"yref{k}"] = src.reindex(probe).to_numpy()
+        names.append(f"yref{k}")
+    return out, names
+
+
 def build_aoi(roots: Roots, aoi: str, source: str, crop: str, forecast_year: int,
               reduce: str = "season", years=None, covariates=(),
               phenology_lag: int = 1, n_yield_lags: int = 3,
-              phenology_suffix: str | None = None,
+              phenology_suffix: str | None = None, ref_lags=(),
               verbose: bool = True) -> tuple[pd.DataFrame, list[str], dict]:
-    """One AOI's design matrix: climate + yield + requested covariates."""
+    """One AOI's design matrix: climate + yield + requested covariates.
+
+    `ref_lags` additionally attaches yref{k} columns for the direction target.
+    They are returned on the frame but never in the feature list.
+    """
     clim, feats, info = load_climate(roots, aoi, source, crop, forecast_year,
                                      reduce, years, verbose)
     y = load_yield(roots, aoi, crop)
@@ -410,6 +440,15 @@ def build_aoi(roots: Roots, aoi: str, source: str, crop: str, forecast_year: int
             f"  ids in common: {len(cu & yu)}\n"
             f"  zero ids in common means the adm2_id spellings differ between the "
             f"polygons and the cy-bench yield table.")
+
+    if ref_lags:
+        refs, refnames = reference_yields(y, ref_lags)
+        df = df.merge(refs, on=["adm2_id", "harvest_year"], how="left")
+        if verbose:
+            for nm in refnames:
+                have = int(df[nm].notna().sum())
+                print(f"  [{aoi}] {nm}: {have:,}/{len(df):,} rows have a "
+                      f"reference year")
 
     cols = list(feats)
     for cov in covariates:
@@ -449,7 +488,7 @@ def build_aoi(roots: Roots, aoi: str, source: str, crop: str, forecast_year: int
 def build(roots: Roots, aois, source: str, crop: str, forecast_year: int,
           reduce: str = "season", years=None, covariates=(),
           phenology_lag: int = 1, n_yield_lags: int = 3,
-          phenology_suffix: str | None = None,
+          phenology_suffix: str | None = None, ref_lags=(),
           verbose: bool = True) -> tuple[pd.DataFrame, list[str], list[dict]]:
     """Several AOIs stacked into one frame with an `aoi` column.
 
@@ -461,7 +500,7 @@ def build(roots: Roots, aois, source: str, crop: str, forecast_year: int,
     for aoi in aois:
         df, cols, info = build_aoi(roots, aoi, source, crop, forecast_year, reduce,
                                    years, covariates, phenology_lag, n_yield_lags,
-                                   phenology_suffix, verbose)
+                                   phenology_suffix, ref_lags, verbose)
         frames.append(df)
         colsets.append(cols)
         infos.append(info)
@@ -479,6 +518,7 @@ def build(roots: Roots, aois, source: str, crop: str, forecast_year: int,
 
     lead = ["aoi", "adm2_id", "harvest_year", "yield"]
     opt = [c for c in ("adm2", "adm1") if all(c in f.columns for f in frames)]
+    opt += [f"yref{int(k)}" for k in sorted({int(x) for x in ref_lags})]
     out = pd.concat([f[lead + opt + shared] for f in frames], ignore_index=True)
     # adm2_id is unique across cy-bench countries, but not guaranteed to be, and
     # a collision would merge two units' climatologies into one.

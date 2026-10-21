@@ -78,9 +78,9 @@ python python/report_dcpp_era5.py --dir /mnt/crl_storage/personal_folders/kdoerk
 | script | functionality |
 |---|---|
 | `python/yield_features.py` | **Picks the feature source.** Reads one stage-3 store -- `era5`, `dcpp:<member>` or `dcpp:ens` (the member mean, taken feature-by-feature after stage 3) -- attaches the cy-bench yield target and optionally prior-season NDVI/fPAR/soil moisture and the unit's own yield lags. Several AOIs stack into one frame on an intersected feature set, keyed `(adm2_id, harvest_year)` so an ERA5 run and a DCPP run differ only in the climate columns. |
-| `python/run_yield_experiment.py` | **Tabular model runner.** One model per AOI, or `--combine` for a pooled fit; `--test-year Y` or `--loo`. Folds are always whole years, never rows. Reports absolute RMSE/R2 beside the per-unit climatology null (`skill`), `r_anom` and the per-year spatial correlation, with the baseline re-fit on each fold's training rows. Writes predictions, per-fold / per-unit metrics, importances and `run_meta.json` per run. |
+| `python/run_yield_experiment.py` | **Tabular model runner.** One model per AOI, or `--combine` for a pooled fit; `--test-year Y` or `--loo`. Folds are always whole years, never rows. Three targets: `yield` (kg/ha), `anomaly` (unit-centred, baseline fit on training rows only), and `direction` -- up / flat / down against the yield of year t-k, with the flat band set to a multiple of each unit's own sd of its k-year differences. `--target-lags 1,2,3,5` fits one classifier per lag; each lag must be at least the lead time, since a lead-F forecast cannot reference a harvest that has not happened. Regression reports RMSE/R2 beside the climatology null, `r_anom` and `sd_ratio_anom`; direction reports accuracy beside the base-rate null, balanced accuracy and the Heidke skill score. Writes predictions, per-fold / per-unit metrics, importances and `run_meta.json` per run. |
 | `python/data_loader.py` | Assembles the design matrix: joins stage 3's admin-2 features to yield targets, and optionally appends yield history and phenology. `FEATURE_MODES` is `pixel` (whole-season) and `pixel_blocks` (season-relative windows) are fixed upstream. Note `find_season_feature_files` globs filenames without the `fy{n}` token stage 3 now writes, so the older runners below read observed (FY0) stores only. |
-| `python/models.py`, `python/train_eval.py` | Model definitions and the train/evaluate loop. |
+| `python/models.py`, `python/train_eval.py` | Model definitions and the train/evaluate loop. `YieldModel(model_type, task=...)` covers both jobs: regressors `rf gbm xgb ridge enet mlp`, classifiers `rf gbm xgb mlp logreg`. `GroupedRidgeCV` and `GroupedMLP` choose their penalty by holding out whole YEARS rather than rows -- the MLP also has sklearn's `early_stopping` off for the same reason, since its random row holdout leaves near-duplicates of each validation row in the training half. |
 | `python/run_loo_experiment.py` | Leave-one-out experiment runner. |
 | `python/tst/` | Time-series transformer arms. |
 | `python/climate_yield_information.py` | Information-theoretic analysis of climate–yield signal. |
@@ -99,6 +99,14 @@ python python/run_yield_experiment.py --aois US,HU --source dcpp:ens \
 # pool the small AOIs for sample count, hold out one year, add cy-bench covariates
 python python/run_yield_experiment.py --aois HU,RO,FR --combine --source era5 \
     --test-year 2018 --add ndvi,yield_history --target anomaly --go
+
+# will this year beat the year 1, 2, 3 or 5 years ago? one classifier per lag
+python python/run_yield_experiment.py --aois US --source era5 --loo \
+    --target direction --target-lags 1,2,3,5 --model mlp --add ndvi --go
+
+# binary up/down instead of three classes
+python python/run_yield_experiment.py --aois US --source era5 --loo \
+    --target direction --flat-band 0 --model logreg --go
 ```
 
 ---
