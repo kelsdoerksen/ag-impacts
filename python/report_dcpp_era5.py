@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""Turn compare_dcpp_era5.py output into one self-contained HTML report.
+"""Report on compare_dcpp_era5.py output: overall skill and per-year skill.
 
-Reads every dcpp_era5_corr_*.csv in a comparisons directory -- one per lead
-time -- and writes a single page: headline skill per AOI, how skill decays with
-lead, what the ensemble mean buys over one member, and the calibration terms.
+Reads, for each AOI folder under --dir:
+    dcpp_era5_corr_*.csv   one row per (member, feature)             -> overall
+    dcpp_era5_year_*.csv   one row per (member, feature, year)       -> per-year
 
-    python python/report_dcpp_era5.py --dir /mnt/crl_storage/.../comparisons
-    python python/report_dcpp_era5.py --dir ... --out ~/meeting/dcpp_skill.html
+and writes one self-contained HTML plus a tidy CSV.
 
-No plotting dependency: the bars are inline CSS, so the file opens anywhere and
-survives being emailed.
+    python python/report_dcpp_era5.py --dir .../comparisons --aois AR,ZM
+
+The five correlations are NOT interchangeable. The report states each one's
+definition next to its table rather than leaving the reader to infer it, because
+r_pooled and r_space are both near 1 on any realistic panel for reasons that
+have nothing to do with forecast skill.
+
+No plotting dependency: tables are plain numbers, charts are hand-built SVG.
 """
 
 from __future__ import annotations
@@ -23,250 +28,411 @@ from pathlib import Path
 
 import pandas as pd
 
-# Skill bands used to colour the headline cells. Deliberately coarse -- the
-# point in a meeting is "which AOIs are worth modelling", not the third decimal.
-BANDS = [(0.6, "#1a7f37", "strong"), (0.4, "#4a9c5d", "moderate"),
-         (0.2, "#b8860b", "weak"), (-1.0, "#c0392b", "none")]
+# The metrics, in the order a reader should meet them.
+METRICS = {
+    "r_anom": ("Interannual, pooled",
+               "corr over all (u,t) of [x(u,t) - x̄(u)] against [y(u,t) - ȳ(u)]",
+               "Does the hindcast track year-to-year variation? Variance-weighted "
+               "across units, so high-amplitude units dominate."),
+    "r_time": ("Interannual, per unit",
+               "mean over u of corr over t of x(u,·) against y(u,·)",
+               "Same question, each unit weighted equally. Its sd shows whether "
+               "skill is uniform or carried by a few units."),
+    "r_acc": ("Spatial anomaly (ACC)",
+              "mean over t of corr over u of [x(u,t) - x̄(u)] against [y(u,t) - ȳ(u)]",
+              "Within a single season, does the hindcast get the spatial pattern "
+              "of the anomaly right? Independent of r_anom."),
+    "r_space": ("Spatial, raw",
+                "mean over t of corr over u of x(u,t) against y(u,t)",
+                "Dominated by the shared climatological field. Near 1 whenever "
+                "both sources know which units are hot. Not a skill measure."),
+    "r_pooled": ("Pooled, raw",
+                 "corr over all (u,t) of x(u,t) against y(u,t)",
+                 "Mixes between-unit climatology with interannual signal. The "
+                 "between-unit part usually dominates. Reported to be dismissed."),
+}
+SKILL_ORDER = ["r_anom", "r_time", "r_acc", "r_space", "r_pooled"]
+LEAD_COLOURS = {1: "#2563eb", 2: "#059669", 3: "#d97706", 4: "#dc2626", 5: "#7c3aed"}
 
 
-def band(r):
+def colour_for(r):
     if pd.isna(r):
-        return "#999", "n/a"
-    for lo, colour, label in BANDS:
-        if r >= lo:
-            return colour, label
-    return "#c0392b", "none"
+        return "var(--mut)"
+    if r >= 0.6:
+        return "#15803d"
+    if r >= 0.4:
+        return "#4d7c0f"
+    if r >= 0.2:
+        return "#a16207"
+    if r >= 0.0:
+        return "#b45309"
+    return "#b91c1c"
 
 
-def find_files(d: Path, pattern: str, aois: list[str] | None) -> list[str]:
-    """Collect result CSVs from compare_dcpp_era5.py's per-AOI layout.
+def num(v, dp=3, signed=True):
+    if pd.isna(v):
+        return '<span class="na">&mdash;</span>'
+    fmt = f"{{:+.{dp}f}}" if signed else f"{{:.{dp}f}}"
+    return f'<span style="color:{colour_for(v)}">{fmt.format(v)}</span>'
 
-        {dir}/{AOI}/dcpp_era5_corr_*.csv
 
-    With --aois, only those folders are read, and a named AOI that has no
-    results is an error rather than a silent omission -- a report missing an
-    AOI someone asked about is worse than no report. Without --aois every
-    subfolder holding results is used. A flat directory (older runs, before
-    the per-AOI layout) still works.
-    """
+# ------------------------------------------------------------------ loading --
+
+def find_files(d: Path, pattern: str, aois):
     if aois:
         files, empty = [], []
         for aoi in aois:
             hit = sorted(glob.glob(str(d / aoi / pattern)))
-            if hit:
-                files += hit
-            else:
+            files += hit
+            if not hit:
                 empty.append(aoi)
-        if empty:
+        if empty and pattern.startswith("dcpp_era5_corr"):
             avail = sorted(x.name for x in d.iterdir()
                            if x.is_dir() and glob.glob(str(x / pattern)))
             raise SystemExit(
                 f"no results for {', '.join(empty)} under {d}\n"
                 f"  available: {', '.join(avail) or '(none)'}\n"
-                f"  run: python python/compare_dcpp_era5.py "
-                f"--aois {','.join(empty)} --go")
+                f"  run: python python/compare_dcpp_era5.py --aois {','.join(empty)} --go")
         return files
-    files = sorted(glob.glob(str(d / "*" / pattern)))
-    if files:
-        return files
-    return sorted(glob.glob(str(d / pattern)))      # flat legacy layout
+    nested = sorted(glob.glob(str(d / "*" / pattern)))
+    return nested or sorted(glob.glob(str(d / pattern)))
 
 
-def load(d: Path, pattern: str, aois: list[str] | None = None) -> pd.DataFrame:
+def load(d: Path, pattern: str, aois, required=True) -> pd.DataFrame:
     files = find_files(d, pattern, aois)
     if not files:
-        raise SystemExit(
-            f"no files matching {pattern} under {d} (or {d}/<AOI>/)\n"
-            f"Run compare_dcpp_era5.py first.")
+        if required:
+            raise SystemExit(f"no files matching {pattern} under {d}/<AOI>/")
+        return pd.DataFrame()
     frames = []
     for f in files:
         df = pd.read_csv(f)
-        # Lead comes from the filename when the column is absent (older runs).
         if "forecast_year" not in df.columns:
             m = re.search(r"_fy(\d+)_", os.path.basename(f))
             df["forecast_year"] = int(m.group(1)) if m else 0
-        df["source_file"] = os.path.basename(f)
-        # Folder name is the authority on which AOI a file belongs to; the
-        # column is only a fallback for the flat legacy layout.
         parent = os.path.basename(os.path.dirname(f))
         if parent != d.name:
             df["aoi"] = parent
         frames.append(df)
     out = pd.concat(frames, ignore_index=True)
-    print(f"loaded {len(files)} file(s), {len(out)} rows, "
-          f"AOIs {sorted(out.aoi.unique())}, "
-          f"leads {sorted(int(x) for x in out.forecast_year.unique())}")
+    out["forecast_year"] = out["forecast_year"].astype(int)
     return out
 
 
-def bar(r, width=90):
-    """A signed bar: negative skill is as informative as positive."""
-    if pd.isna(r):
-        return '<span class="na">n/a</span>'
-    colour, _ = band(r)
-    frac = max(min(r, 1.0), -1.0)
-    w = abs(frac) * width
-    off = width if frac >= 0 else width - w
-    return (f'<span class="bar"><span class="fill" style="left:{off}px;'
-            f'width:{w:.0f}px;background:{colour}"></span></span>'
-            f'<span class="num" style="color:{colour}">{r:+.2f}</span>')
+# ------------------------------------------------------------------- tables --
+
+def metric_table(ens: pd.DataFrame, fy: int) -> str:
+    """One row per AOI/feature, one column per correlation, at a single lead."""
+    sub = ens[ens.forecast_year == fy]
+    cols = [c for c in SKILL_ORDER if c in sub.columns]
+    head = "".join(f'<th class="r">{c}</th>' for c in cols)
+    rows = []
+    for (aoi, feat), g in sub.groupby(["aoi", "feature"], observed=True):
+        r = g.iloc[0]
+        cells = "".join(f'<td class="r">{num(r.get(c))}</td>' for c in cols)
+        sd = (f' <span class="sd">&plusmn;{r["r_time_sd"]:.2f}</span>'
+              if "r_time_sd" in r and not pd.isna(r["r_time_sd"]) else "")
+        rows.append(
+            f'<tr><td>{html.escape(str(aoi))}</td><td class="mono">{html.escape(str(feat))}</td>'
+            f'{cells}<td class="r dim">{int(r["n_units"])}</td>'
+            f'<td class="r dim">{int(r["n_years"])}</td></tr>'.replace(
+                f'<td class="r">{num(r.get("r_time"))}</td>',
+                f'<td class="r">{num(r.get("r_time"))}{sd}</td>'))
+    return (f'<table><thead><tr><th>AOI</th><th>feature</th>{head}'
+            f'<th class="r">units</th><th class="r">yrs</th></tr></thead>'
+            f'<tbody>{"".join(rows)}</tbody></table>')
 
 
-def table(df, index, columns, values, label):
-    p = df.pivot_table(index=index, columns=columns, values=values, aggfunc="mean")
+def lead_table(ens: pd.DataFrame, metric: str) -> str:
+    p = ens.pivot_table(index=["aoi", "feature"], columns="forecast_year",
+                        values=metric, aggfunc="mean", observed=True)
+    head = "".join(f'<th class="r">FY{c}</th>' for c in p.columns)
+    rows = []
+    for (aoi, feat), row in p.iterrows():
+        cells = "".join(f'<td class="r">{num(v)}</td>' for v in row)
+        rows.append(f'<tr><td>{html.escape(str(aoi))}</td>'
+                    f'<td class="mono">{html.escape(str(feat))}</td>{cells}</tr>')
+    return (f'<table><thead><tr><th>AOI</th><th>feature</th>{head}</tr></thead>'
+            f'<tbody>{"".join(rows)}</tbody></table>')
+
+
+def simple_table(df, index, columns, values, label, dp=3) -> str:
+    p = df.pivot_table(index=index, columns=columns, values=values,
+                       aggfunc="mean", observed=True)
     if p.empty:
-        return f"<p class='na'>no data for {label}</p>"
-    head = "".join(f"<th>{html.escape(str(c))}</th>" for c in p.columns)
+        return '<p class="na">no data</p>'
+    head = "".join(f'<th class="r">{html.escape(str(c))}</th>' for c in p.columns)
     rows = []
     for idx, row in p.iterrows():
-        cells = "".join(f"<td>{bar(v)}</td>" for v in row)
         name = " / ".join(str(x) for x in idx) if isinstance(idx, tuple) else str(idx)
-        rows.append(f"<tr><th class='rh'>{html.escape(name)}</th>{cells}</tr>")
-    return (f"<table><thead><tr><th class='rh'>{html.escape(label)}</th>{head}</tr>"
-            f"</thead><tbody>{''.join(rows)}</tbody></table>")
+        cells = "".join(f'<td class="r">{num(v, dp)}</td>' for v in row)
+        rows.append(f'<tr><td>{html.escape(name)}</td>{cells}</tr>')
+    return (f'<table><thead><tr><th>{html.escape(label)}</th>{head}</tr></thead>'
+            f'<tbody>{"".join(rows)}</tbody></table>')
 
+
+# ------------------------------------------------------------------- charts --
+
+def line_chart(series: dict, years, title, ylab, ylim=(-1, 1), zero=True,
+               w=440, h=150):
+    """series: {label: {year: value}}. Hand-built SVG, no dependency."""
+    pad_l, pad_r, pad_t, pad_b = 42, 8, 10, 24
+    iw, ih = w - pad_l - pad_r, h - pad_t - pad_b
+    y0, y1 = ylim
+    if y1 == y0:
+        y1 = y0 + 1
+    xs = sorted(years)
+    if len(xs) < 2:
+        return '<p class="na">need at least two years</p>'
+
+    def px(yr):
+        return pad_l + (xs.index(yr) / (len(xs) - 1)) * iw
+
+    def py(v):
+        return pad_t + (1 - (v - y0) / (y1 - y0)) * ih
+
+    parts = [f'<svg viewBox="0 0 {w} {h}" class="chart" role="img" '
+             f'aria-label="{html.escape(title)}">']
+    # y gridlines
+    ticks = [t for t in (-1, -0.5, 0, 0.5, 1) if y0 <= t <= y1] or [y0, (y0+y1)/2, y1]
+    for t in ticks:
+        strong = (t == 0 and zero)
+        parts.append(
+            f'<line x1="{pad_l}" y1="{py(t):.1f}" x2="{w-pad_r}" y2="{py(t):.1f}" '
+            f'class="{"zero" if strong else "grid"}"/>')
+        parts.append(f'<text x="{pad_l-6}" y="{py(t)+3.5:.1f}" class="tick ta-end">{t:g}</text>')
+    # x labels: first, last, and a middle one
+    for yr in {xs[0], xs[-1], xs[len(xs)//2]}:
+        parts.append(f'<text x="{px(yr):.1f}" y="{h-7}" class="tick ta-mid">{yr}</text>')
+    for label, data in series.items():
+        pts, colour = [], LEAD_COLOURS.get(label if isinstance(label, int) else 0, "#64748b")
+        for yr in xs:
+            v = data.get(yr)
+            if v is None or pd.isna(v):
+                continue
+            pts.append(f"{px(yr):.1f},{py(max(min(v, y1), y0)):.1f}")
+        if not pts:
+            continue
+        parts.append(f'<polyline points="{" ".join(pts)}" fill="none" '
+                     f'stroke="{colour}" stroke-width="1.8"/>')
+        for p in pts:
+            x, y = p.split(",")
+            parts.append(f'<circle cx="{x}" cy="{y}" r="2.1" fill="{colour}"/>')
+    parts.append("</svg>")
+    legend = " ".join(
+        f'<span class="key"><i style="background:'
+        f'{LEAD_COLOURS.get(l if isinstance(l,int) else 0, "#64748b")}"></i>FY{l}</span>'
+        for l in series)
+    return (f'<figure class="fig"><figcaption>{html.escape(title)}'
+            f'<span class="ylab">{html.escape(ylab)}</span></figcaption>'
+            f'{"".join(parts)}<div class="legend">{legend}</div></figure>')
+
+
+def chart_grid(yearly: pd.DataFrame, metric: str, ylab, ylim=(-1, 1)) -> str:
+    """One chart per (AOI, feature); one line per lead."""
+    figs = []
+    for (aoi, feat), g in yearly.groupby(["aoi", "feature"], observed=True):
+        series = {}
+        for fy, gg in g.groupby("forecast_year"):
+            series[int(fy)] = dict(zip(gg.harvest_year, gg[metric]))
+        years = sorted(g.harvest_year.unique())
+        figs.append(line_chart(series, years, f"{aoi} · {feat}", ylab, ylim))
+    return f'<div class="grid">{"".join(figs)}</div>' if figs else '<p class="na">no per-year data</p>'
+
+
+# --------------------------------------------------------------------- main --
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--dir", required=True,
-                   help="comparisons root; results are read from {dir}/{AOI}/")
-    p.add_argument("--aois", help="comma-separated AOIs to include; default: all found")
-    p.add_argument("--pattern", default="dcpp_era5_corr_*.csv")
-    p.add_argument("--out", default=None, help="output .html (default: {dir}/dcpp_skill_report.html)")
-    p.add_argument("--metric", default="r_anom",
-                   help="skill metric to headline (r_anom, r_time, r_space, r_pooled)")
-    p.add_argument("--title", default="EC-Earth3 DCPP vs ERA5 -- feature skill")
+    p.add_argument("--dir", required=True, help="comparisons root; reads {dir}/{AOI}/")
+    p.add_argument("--aois", help="comma-separated AOIs; default: all found")
+    p.add_argument("--metric", default="r_anom", choices=SKILL_ORDER,
+                   help="headline metric for the skill-vs-lead table")
+    p.add_argument("--out", default=None)
+    p.add_argument("--title", default="EC-Earth3 DCPP vs ERA5 — feature skill")
     a = p.parse_args(argv)
 
     d = Path(a.dir)
     aois = [x.strip() for x in a.aois.split(",") if x.strip()] if a.aois else None
-    df = load(d, a.pattern, aois)
+    summ = load(d, "dcpp_era5_corr_*.csv", aois)
+    yearly = load(d, "dcpp_era5_year_*.csv", aois, required=False)
+    print(f"summary: {len(summ)} rows, AOIs {sorted(summ.aoi.unique())}, "
+          f"leads {sorted(summ.forecast_year.unique())}")
+    print(f"per-year: {len(yearly)} rows" if not yearly.empty
+          else "per-year: none found (older run; rerun compare to get them)")
+
     if a.out:
         out = Path(a.out)
     else:
-        stem = "dcpp_skill_report" + (f"_{'-'.join(aois)}" if aois else "")
-        out = d / f"{stem}.html"
-    M = a.metric
+        out = d / ("dcpp_skill_report" + (f"_{'-'.join(aois)}" if aois else "") + ".html")
 
-    ens = df[df.member == "ENSMEAN"].copy()
-    mem = df[df.member != "ENSMEAN"].copy()
-    leads = sorted(df.forecast_year.unique())
+    ens = summ[summ.member == "ENSMEAN"].copy()
+    mem = summ[summ.member != "ENSMEAN"].copy()
+    if ens.empty:
+        raise SystemExit("no ENSMEAN rows found")
+    order = ens.groupby("aoi")[a.metric].mean().sort_values(ascending=False).index.tolist()
+    for f in (ens, mem):
+        f["aoi"] = pd.Categorical(f.aoi, categories=order, ordered=True)
+    leads = sorted(summ.forecast_year.unique())
+    ey = yearly[yearly.member == "ENSMEAN"].copy() if not yearly.empty else pd.DataFrame()
+    if not ey.empty:
+        ey["aoi"] = pd.Categorical(ey.aoi, categories=order, ordered=True)
 
-    # AOIs ordered best-first: lead with the ones worth modelling.
-    order = (ens.groupby("aoi")[M].mean().sort_values(ascending=False).index.tolist())
-    ens["aoi"] = pd.Categorical(ens.aoi, categories=order, ordered=True)
-    mem["aoi"] = pd.Categorical(mem.aoi, categories=order, ordered=True)
+    defs = "".join(
+        f'<tr><td class="mono">{k}</td><td>{html.escape(v[0])}</td>'
+        f'<td class="mono sm">{html.escape(v[1])}</td><td class="sm">{html.escape(v[2])}</td></tr>'
+        for k, v in METRICS.items())
 
-    # Ensemble gain: ENSMEAN minus the average single member, same (aoi, feature, lead).
-    k = ["aoi", "feature", "forecast_year"]
-    gain = (ens.set_index(k)[M] - mem.groupby(k)[M].mean()).reset_index(name="gain")
+    B = []
+    B.append('<h2>1 &middot; What each correlation is</h2>')
+    B.append('<p class="sub">x = ERA5, y = DCPP. u indexes admin-2 units, t indexes '
+             'harvest years. x̄(u) is unit u\'s mean over the compared years, computed '
+             'separately for each source so a constant bias cannot enter any anomaly '
+             'correlation.</p>')
+    B.append(f'<table class="defs"><thead><tr><th>column</th><th>name</th>'
+             f'<th>definition</th><th>what it answers</th></tr></thead>'
+             f'<tbody>{defs}</tbody></table>')
+    B.append('<p class="sub">Note that <span class="mono">r_time</span> needs no raw/anomaly '
+             'distinction: within one unit, removing that unit\'s mean subtracts a constant, '
+             'which leaves a correlation unchanged. Within one <em>year</em> the unit means '
+             'differ across units, so <span class="mono">r_space</span> and '
+             '<span class="mono">r_acc</span> are genuinely different quantities.</p>')
 
-    blocks = []
-    blocks.append(f"<h2>Headline skill &mdash; ensemble mean, {html.escape(M)}</h2>")
-    blocks.append("<p class='sub'>AOIs ordered best first. Each cell is one feature.</p>")
+    B.append('<h2>2 &middot; Overall skill, ensemble mean</h2>')
     for fy in leads:
-        sub = ens[ens.forecast_year == fy]
-        blocks.append(f"<h3>Lead time FY{fy}</h3>")
-        blocks.append(table(sub, "aoi", "feature", M, "AOI"))
+        B.append(f'<h3>Lead FY{fy}</h3>')
+        B.append(metric_table(ens, fy))
+
+    if not ey.empty and "r_acc" in ey.columns:
+        B.append('<h2>3 &middot; Per-year spatial anomaly correlation, ACC(t)</h2>')
+        B.append('<p class="sub">Each point is one harvest year: the correlation across '
+                 'admin units between the two anomaly fields in that year. This is the '
+                 'quantity averaged into <span class="mono">r_acc</span>. Scatter between '
+                 'years is expected &mdash; with N units the sampling sd of a single year\'s '
+                 'ACC is roughly 1/&radic;(N&minus;1).</p>')
+        B.append(chart_grid(ey, "r_acc", "ACC", (-1, 1)))
+
+        B.append('<h2>4 &middot; Per-year bias</h2>')
+        B.append('<p class="sub">mean(DCPP &minus; ERA5) across units, in each feature\'s '
+                 'own units. A flat non-zero line is a calibration offset; a trending line '
+                 'is drift.</p>')
+        lo = float(ey.bias.min()) if "bias" in ey else -1.0
+        hi = float(ey.bias.max()) if "bias" in ey else 1.0
+        span = max(abs(lo), abs(hi)) * 1.15 or 1.0
+        B.append(chart_grid(ey, "bias", "bias", (-span, span)))
 
     if len(leads) > 1:
-        blocks.append("<h2>Skill vs lead time</h2>")
-        blocks.append("<p class='sub'>FY1 is initialised at the start of its own "
-                      "target season, so it is close to an upper bound. The "
-                      "question is how fast this decays.</p>")
-        blocks.append(table(ens, ["aoi", "feature"], "forecast_year", M, "AOI / feature"))
+        B.append(f'<h2>5 &middot; Skill vs lead &mdash; <span class="mono">{a.metric}</span></h2>')
+        B.append('<p class="sub">FY1 is initialised in the November its own target season '
+                 'begins, so it carries almost no lead and should be read as an upper bound.</p>')
+        B.append(lead_table(ens, a.metric))
 
-    blocks.append("<h2>What the ensemble mean buys</h2>")
-    blocks.append("<p class='sub'>Ensemble mean minus the average single member. "
-                  "Positive means averaging members recovers signal.</p>")
-    blocks.append(table(gain, "aoi", "feature", "gain", "AOI"))
+    if not mem.empty:
+        k = ["aoi", "feature", "forecast_year"]
+        gain = (ens.set_index(k)[a.metric] - mem.groupby(k, observed=True)[a.metric].mean())
+        gain = gain.reset_index(name="gain")
+        B.append('<h2>6 &middot; Ensemble mean minus mean single member</h2>')
+        B.append('<p class="sub">Positive means averaging members recovers signal that '
+                 'individual realisations bury in internal variability.</p>')
+        B.append(simple_table(gain, "aoi", ["feature", "forecast_year"], "gain", "AOI"))
 
     if "sd_ratio_anom" in ens.columns:
-        blocks.append("<h2>Calibration</h2>")
-        blocks.append("<p class='sub'>sd(DCPP anomalies) / sd(ERA5 anomalies). "
-                      "Below 1 means the hindcast under-varies; the ensemble mean "
-                      "is always low here because averaging damps variance.</p>")
-        blocks.append(table(ens, "aoi", "feature", "sd_ratio_anom", "AOI"))
+        B.append('<h2>7 &middot; Anomaly dispersion</h2>')
+        B.append('<p class="sub">sd of DCPP anomalies over sd of ERA5 anomalies. Below 1 the '
+                 'hindcast under-varies. The ensemble mean is structurally low here: averaging '
+                 'members damps variance, so this is not by itself a model defect.</p>')
+        B.append(simple_table(ens, "aoi", ["feature", "forecast_year"],
+                              "sd_ratio_anom", "AOI", dp=2))
 
-    n = ens.groupby("aoi", observed=True).agg(
-        features=("feature", "nunique"), pairs=("n_pairs", "max"),
-        units=("n_units", "max"), years=("n_years", "max"),
-        members=("n_members", "max") if "n_members" in ens.columns else ("n_pairs", "size"))
-    cov = "".join(
-        f"<tr><td>{html.escape(str(i))}</td><td>{int(r.features)}</td>"
-        f"<td>{int(r.units)}</td><td>{int(r.years)}</td><td>{int(r.pairs)}</td>"
-        f"<td>{'' if pd.isna(r.members) else int(r.members)}</td></tr>"
-        for i, r in n.iterrows())
+    cov = ens.groupby("aoi", observed=True).agg(
+        features=("feature", "nunique"), units=("n_units", "max"),
+        years=("n_years", "max"), pairs=("n_pairs", "max"))
+    if "n_members" in ens.columns:
+        cov["members"] = ens.groupby("aoi", observed=True)["n_members"].max()
+    cov_rows = "".join(
+        "<tr><td>" + html.escape(str(i)) + "</td>"
+        + "".join(f'<td class="r">{"" if pd.isna(v) else int(v)}</td>' for v in r)
+        + "</tr>" for i, r in cov.iterrows())
+    B.append('<h2>8 &middot; Coverage</h2>')
+    B.append('<table><thead><tr><th>AOI</th>'
+             + "".join(f'<th class="r">{c}</th>' for c in cov.columns)
+             + f'</tr></thead><tbody>{cov_rows}</tbody></table>')
 
     css = """
-    :root{--bg:#fff;--fg:#1a1a1a;--mut:#666;--line:#e3e3e3;--head:#f6f6f6}
-    @media(prefers-color-scheme:dark){:root:not([data-theme=light]){
-      --bg:#15171a;--fg:#e8e8e8;--mut:#9aa0a6;--line:#2c2f34;--head:#1d2024}}
-    :root[data-theme=dark]{--bg:#15171a;--fg:#e8e8e8;--mut:#9aa0a6;--line:#2c2f34;--head:#1d2024}
-    *{box-sizing:border-box}
-    body{background:var(--bg);color:var(--fg);margin:0;padding:32px 16px;
-      font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
-    .wrap{max-width:1100px;margin:0 auto}
-    h1{font-size:25px;margin:0 0 4px} h2{font-size:19px;margin:34px 0 6px;
-      padding-top:14px;border-top:1px solid var(--line)}
-    h3{font-size:15px;margin:18px 0 6px;color:var(--mut);font-weight:600}
-    .sub{color:var(--mut);margin:0 0 12px;font-size:13.5px}
-    table{border-collapse:collapse;width:100%;margin:8px 0 4px;font-size:13.5px}
-    th,td{padding:5px 9px;text-align:left;border-bottom:1px solid var(--line);
-      white-space:nowrap}
-    thead th{background:var(--head);font-weight:600;font-size:12.5px}
-    .rh{font-weight:600}
-    .bar{position:relative;display:inline-block;width:180px;height:11px;
-      background:linear-gradient(90deg,transparent 89px,var(--line) 89px,
-      var(--line) 91px,transparent 91px);vertical-align:middle;border-radius:2px}
-    .fill{position:absolute;top:0;height:11px;border-radius:2px;opacity:.85}
-    .num{margin-left:9px;font-variant-numeric:tabular-nums;font-weight:600;font-size:12.5px}
-    .na{color:var(--mut)}
-    .meta{color:var(--mut);font-size:13px;margin:10px 0 0}
-    .note{background:var(--head);border-left:3px solid var(--line);
-      padding:11px 14px;margin:18px 0;font-size:13.5px;border-radius:0 4px 4px 0}
-    .note b{font-weight:600}
-    code{background:var(--head);padding:1px 5px;border-radius:3px;font-size:12.5px}
-    @media(max-width:700px){body{padding:20px 16px}
-      table{display:block;overflow-x:auto}.bar{width:120px;
-      background:linear-gradient(90deg,transparent 59px,var(--line) 59px,
-      var(--line) 61px,transparent 61px)}}
-    """
-
+:root{--bg:#fff;--fg:#17181a;--mut:#6b7280;--line:#e5e7eb;--head:#f9fafb;--card:#fff}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){
+ --bg:#121417;--fg:#e7e9ea;--mut:#9ba1a6;--line:#2a2e34;--head:#191c20;--card:#171a1e}}
+:root[data-theme=dark]{--bg:#121417;--fg:#e7e9ea;--mut:#9ba1a6;--line:#2a2e34;--head:#191c20;--card:#171a1e}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);margin:0;padding:34px 18px;
+ font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+.wrap{max-width:1180px;margin:0 auto}
+h1{font-size:26px;margin:0 0 4px;letter-spacing:-.01em}
+h2{font-size:18px;margin:40px 0 8px;padding-top:16px;border-top:2px solid var(--line)}
+h3{font-size:14px;margin:20px 0 6px;color:var(--mut);font-weight:600;
+ text-transform:uppercase;letter-spacing:.04em}
+.sub{color:var(--mut);font-size:13.5px;margin:0 0 14px;max-width:80ch}
+.meta{color:var(--mut);font-size:13px;margin:8px 0 0}
+table{border-collapse:collapse;width:100%;margin:10px 0 6px;font-size:13.5px}
+th,td{padding:6px 10px;border-bottom:1px solid var(--line);white-space:nowrap;text-align:left}
+thead th{background:var(--head);font-weight:600;font-size:12px;
+ text-transform:uppercase;letter-spacing:.03em;color:var(--mut)}
+td.r,th.r{text-align:right;font-variant-numeric:tabular-nums}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+.sm{font-size:12.5px;white-space:normal;color:var(--mut)}
+.defs td{white-space:normal;vertical-align:top}
+.dim{color:var(--mut)} .na{color:var(--mut)} .sd{color:var(--mut);font-size:11.5px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px;margin:12px 0}
+.fig{margin:0;background:var(--card);border:1px solid var(--line);border-radius:7px;padding:10px 8px 4px}
+figcaption{font-size:12.5px;font-weight:600;padding:0 6px 4px;display:flex;
+ justify-content:space-between;align-items:baseline}
+.ylab{color:var(--mut);font-weight:400;font-size:11.5px}
+.chart{width:100%;height:auto;display:block}
+.grid line.grid{stroke:var(--line);stroke-width:1}
+line.grid{stroke:var(--line);stroke-width:1}
+line.zero{stroke:var(--mut);stroke-width:1;stroke-dasharray:3 2}
+text.tick{fill:var(--mut);font-size:9.5px}
+.ta-end{text-anchor:end}.ta-mid{text-anchor:middle}
+.legend{padding:2px 6px 6px;font-size:11.5px;color:var(--mut)}
+.key{margin-right:10px}.key i{display:inline-block;width:9px;height:9px;border-radius:2px;
+ margin-right:4px;vertical-align:-1px}
+.note{background:var(--head);border-left:3px solid var(--mut);padding:12px 15px;
+ margin:20px 0;font-size:13.5px;border-radius:0 5px 5px 0}
+@media(max-width:700px){body{padding:20px 14px}table{display:block;overflow-x:auto}
+ .grid{grid-template-columns:1fr}}
+"""
     page = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DCPP Skill Report</title><style>{css}</style></head><body><div class="wrap">
+<title>DCPP Skill Report</title><style>{css}</style></head>
+<body><div class="wrap">
 <h1>{html.escape(a.title)}</h1>
-<p class="meta">Leads {', '.join(f'FY{l}' for l in leads)} &middot;
-{len(order)} AOI(s) &middot; {ens.feature.nunique()} feature(s) &middot;
-metric <code>{html.escape(M)}</code></p>
-<div class="note"><b>How to read this.</b> <code>r_anom</code> is the correlation
-between the hindcast and ERA5 after removing each admin unit's own mean from both
-sides &mdash; it measures whether the hindcast tracks <em>interannual</em> variation.
-The raw pooled correlation is far higher but mostly reflects units differing in
-mean climate, so it is not used here. Values are cropland-area-weighted admin-2
-features over each unit's crop-calendar season.</div>
-{''.join(blocks)}
-<h2>Coverage</h2>
-<table><thead><tr><th>AOI</th><th>features</th><th>units</th><th>years</th>
-<th>pairs</th><th>members</th></tr></thead><tbody>{cov}</tbody></table>
-<div class="note"><b>Caveat for discussion.</b> FY1 is initialised in the November
-its target season begins, so it has almost no lead and should be read as an upper
-bound rather than a forecast result. Skill at FY2&ndash;FY5 is the decadal-prediction
-question.</div>
+<p class="meta">{len(order)} AOI(s) &middot; {ens.feature.nunique()} feature(s) &middot;
+leads {', '.join(f'FY{l}' for l in leads)} &middot; cropland-area-weighted admin-2,
+crop-calendar season</p>
+{''.join(B)}
+<div class="note"><b>Reading order.</b> <span class="mono">r_anom</span> and
+<span class="mono">r_time</span> answer the temporal question, <span class="mono">r_acc</span>
+the spatial one, and they are independent: a model can reproduce a basin-wide
+year-to-year signal with no spatial anomaly skill, or the reverse.
+<span class="mono">r_space</span> and <span class="mono">r_pooled</span> are included
+so that nobody quotes them by accident.</div>
 </div></body></html>"""
-
     out.write_text(page, encoding="utf-8")
     print(f"wrote {out}  ({out.stat().st_size/1024:.0f} KB)")
 
     flat = out.with_suffix(".csv")
-    cols = [c for c in ["aoi", "feature", "forecast_year", "member", M, "r_time",
-                        "bias", "sd_ratio_anom", "n_pairs", "n_units", "n_years"]
-            if c in df.columns]
-    df.sort_values(["aoi", "forecast_year", "feature", "member"])[cols].to_csv(flat, index=False)
-    print(f"wrote {flat}  (tidy table for slides)")
+    cols = [c for c in ["aoi", "feature", "forecast_year", "member", *SKILL_ORDER,
+                        "r_time_sd", "r_acc_sd", "bias", "rmse", "sd_ratio_anom",
+                        "n_pairs", "n_units", "n_years"] if c in summ.columns]
+    summ.sort_values(["aoi", "forecast_year", "feature", "member"])[cols].to_csv(flat, index=False)
+    print(f"wrote {flat}")
+    if not yearly.empty:
+        yflat = out.with_name(out.stem + "_per_year.csv")
+        yearly.sort_values(["aoi", "forecast_year", "feature", "member",
+                            "harvest_year"]).to_csv(yflat, index=False)
+        print(f"wrote {yflat}")
     return 0
 
 

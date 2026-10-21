@@ -267,17 +267,59 @@ def _r(x: np.ndarray, y: np.ndarray) -> float:
     return float(np.corrcoef(x, y)[0, 1])
 
 
-def _grouped_r(df: pd.DataFrame, by: str) -> tuple[float, float, int]:
+def _grouped_r(df: pd.DataFrame, by: str, xcol: str = "era5",
+               ycol: str = "dcpp") -> tuple[float, float, int]:
     """Mean and sd of within-group r, plus the number of usable groups."""
     rs = []
     for _, g in df.groupby(by):
         if len(g) >= MIN_N_PER_GROUP:
-            r = _r(g["era5"].to_numpy(), g["dcpp"].to_numpy())
+            r = _r(g[xcol].to_numpy(dtype=float), g[ycol].to_numpy(dtype=float))
             if np.isfinite(r):
                 rs.append(r)
     if not rs:
         return np.nan, np.nan, 0
     return float(np.mean(rs)), float(np.std(rs)), len(rs)
+
+
+def add_anomalies(df: pd.DataFrame) -> pd.DataFrame:
+    """Subtract each unit's own temporal mean from each side separately.
+
+    Each source is centred on ITS OWN climatology, not on a shared one, so a
+    constant offset between the two (DCPP's warm bias, say) cannot leak into
+    any anomaly correlation. The bias is reported separately instead.
+    """
+    g = df.groupby("adm2_id")
+    return df.assign(e_anom=df["era5"] - g["era5"].transform("mean"),
+                     d_anom=df["dcpp"] - g["dcpp"].transform("mean"))
+
+
+def yearly_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per harvest year: the cross-unit (spatial) skill for that year.
+
+    r_acc is the anomaly correlation coefficient in the forecast-verification
+    sense: within a single year, correlate the two anomaly FIELDS across admin
+    units. r_space is the same correlation on raw values, which is dominated by
+    the shared climatological pattern and therefore nearly always high.
+    """
+    d = add_anomalies(df)
+    rows = []
+    for yr, g in d.groupby("harvest_year"):
+        n = len(g)
+        ok = n >= MIN_N_PER_GROUP
+        e, p = g["era5"].to_numpy(float), g["dcpp"].to_numpy(float)
+        rows.append({
+            "harvest_year": int(yr),
+            "n_units": int(n),
+            "r_acc": _r(g["e_anom"].to_numpy(float), g["d_anom"].to_numpy(float)) if ok else np.nan,
+            "r_space": _r(e, p) if ok else np.nan,
+            "bias": float(np.mean(p - e)),
+            "rmse": float(np.sqrt(np.mean((p - e) ** 2))),
+            "era5_mean": float(np.mean(e)),
+            "dcpp_mean": float(np.mean(p)),
+            "era5_sd": float(np.std(e)),
+            "dcpp_sd": float(np.std(p)),
+        })
+    return pd.DataFrame(rows)
 
 
 def metrics(df: pd.DataFrame) -> dict:
@@ -297,15 +339,16 @@ def metrics(df: pd.DataFrame) -> dict:
         out.update(r_pooled=np.nan, r_anom=np.nan, bias=np.nan, mae=np.nan,
                    rmse=np.nan, sd_ratio_anom=np.nan, sd_ratio_raw=np.nan,
                    r_time=np.nan, r_time_sd=np.nan, n_units_scored=0,
-                   r_space=np.nan, r_space_sd=np.nan, n_years_scored=0)
+                   r_space=np.nan, r_space_sd=np.nan, n_years_scored=0,
+                   r_acc=np.nan, r_acc_sd=np.nan, n_years_acc=0)
         return out
 
     out["r_pooled"] = _r(e, d)
     # Anomalies: remove each unit's own mean from BOTH sides. What is left is
     # the interannual variation, which is what a decadal hindcast is judged on.
-    g = df.groupby("adm2_id")
-    ea = (df["era5"] - g["era5"].transform("mean")).to_numpy(dtype=float)
-    da = (df["dcpp"] - g["dcpp"].transform("mean")).to_numpy(dtype=float)
+    anom = add_anomalies(df)
+    ea = anom["e_anom"].to_numpy(dtype=float)
+    da = anom["d_anom"].to_numpy(dtype=float)
     out["r_anom"] = _r(ea, da)
     out["bias"] = float(np.mean(d - e))
     out["mae"] = float(np.mean(np.abs(d - e)))
@@ -318,10 +361,17 @@ def metrics(df: pd.DataFrame) -> dict:
     out["sd_ratio_anom"] = (float(np.std(da) / np.std(ea))
                             if np.std(ea) > 0 else np.nan)
     out["sd_ratio_raw"] = (float(np.std(d) / np.std(e)) if np.std(e) > 0 else np.nan)
+    # Within one unit, removing that unit's mean subtracts a constant, which
+    # leaves correlation unchanged -- so r_time is already an anomaly
+    # correlation and needs no separate raw/anomaly pair.
     rt, rts, nu = _grouped_r(df, "adm2_id")
     out.update(r_time=rt, r_time_sd=rts, n_units_scored=nu)
+    # Within one YEAR the unit means differ across units, so raw and anomaly
+    # versions are genuinely different quantities. Both are reported.
     rs, rss, ny = _grouped_r(df, "harvest_year")
     out.update(r_space=rs, r_space_sd=rss, n_years_scored=ny)
+    ra, ras, nya = _grouped_r(anom, "harvest_year", "e_anom", "d_anom")
+    out.update(r_acc=ra, r_acc_sd=ras, n_years_acc=nya)
     return out
 
 
@@ -337,7 +387,7 @@ def ensemble_mean(pairs: pd.DataFrame) -> pd.DataFrame:
 
 
 LEAD_COLUMNS = ["aoi", "member", "feature", "forecast_year", "r_anom", "r_time",
-                "r_space", "r_pooled", "bias", "rmse", "sd_ratio_anom",
+                "r_acc", "r_space", "r_pooled", "bias", "rmse", "sd_ratio_anom",
                 "n_pairs", "n_units", "n_years"]
 
 
@@ -350,7 +400,8 @@ def order_columns(df: pd.DataFrame) -> pd.DataFrame:
 METRIC_NOTES = {
     "r_anom": "unit means removed from both sides; interannual skill (headline)",
     "r_time": "mean of per-unit temporal r; r_time_sd is its spread across units",
-    "r_space": "mean of per-year spatial r across units",
+    "r_acc": "anomaly correlation coefficient: per-year cross-unit r on anomalies, averaged over years",
+    "r_space": "per-year cross-unit r on RAW values, averaged; climatology-dominated",
     "r_pooled": "raw pooled r; inflated by between-unit climatology",
     "sd_ratio_anom": "sd(DCPP anom)/sd(ERA5 anom); <1 = underdispersed interannual amplitude",
     "sd_ratio_raw": "same on raw values; climatology-dominated, kept only for reference",
@@ -359,15 +410,18 @@ METRIC_NOTES = {
 
 
 def write_aoi_outputs(aoi_out: Path, tag: str, rows: list[dict],
-                      pairs: pd.DataFrame, meta: dict,
+                      yearly: pd.DataFrame, pairs: pd.DataFrame, meta: dict,
                       failures: list) -> list[Path]:
-    """One AOI's three tables, side by side with that AOI's logs."""
+    """One AOI's four tables, side by side with that AOI's logs."""
     aoi_out.mkdir(parents=True, exist_ok=True)
     summary = order_columns(pd.DataFrame(rows)).sort_values(["feature", "member"])
     csv_p = aoi_out / f"dcpp_era5_corr_{tag}.csv"
     json_p = aoi_out / f"dcpp_era5_corr_{tag}.json"
+    year_p = aoi_out / f"dcpp_era5_year_{tag}.csv"
     pairs_p = aoi_out / f"dcpp_era5_pairs_{tag}.csv.gz"
     summary.to_csv(csv_p, index=False)
+    if not yearly.empty:
+        yearly.sort_values(["feature", "member", "harvest_year"]).to_csv(year_p, index=False)
     pairs.to_csv(pairs_p, index=False)
     with open(json_p, "w") as fh:
         json.dump({"run": meta, "metric_notes": METRIC_NOTES,
@@ -375,7 +429,7 @@ def write_aoi_outputs(aoi_out: Path, tag: str, rows: list[dict],
                                 for x in failures],
                    "results": json.loads(summary.to_json(orient="records"))},
                   fh, indent=2)
-    return [csv_p, json_p, pairs_p]
+    return [csv_p, json_p, year_p, pairs_p] if not yearly.empty else [csv_p, json_p, pairs_p]
 
 
 # =================================== main =====================================
@@ -559,17 +613,22 @@ def main(argv=None):
         ens.insert(0, "aoi", aoi)
         # Pairs are written per AOI below, so nothing accumulates across AOIs:
         # a 10-member x 21-year x 1900-unit AOI is millions of rows on its own.
-        rows = []
+        rows, yrows = [], []
         for member, mdf in pd.concat([pairs, ens], ignore_index=True).groupby("member"):
             for feat, fdf in mdf.groupby("feature"):
-                rec = {"aoi": aoi, "member": member, "feature": feat,
-                       "forecast_year": a.forecast_year, "reduce": a.reduce,
-                       "weight": a.weight, "crop": a.crop}
+                key = {"aoi": aoi, "member": member, "feature": feat,
+                       "forecast_year": a.forecast_year}
+                rec = dict(key, reduce=a.reduce, weight=a.weight, crop=a.crop)
                 if member == "ENSMEAN":
                     rec["n_members"] = int(fdf["n_members"].max())
                 rec.update(metrics(fdf))
                 rows.append(rec)
+                ym = yearly_metrics(fdf)
+                for k, v in reversed(list(key.items())):
+                    ym.insert(0, k, v)
+                yrows.append(ym)
         all_rows.extend(rows)
+        yearly = pd.concat(yrows, ignore_index=True) if yrows else pd.DataFrame()
 
         meta = dict(
             created=time.strftime("%Y-%m-%d %H:%M:%S %Z"), argv=sys.argv,
@@ -582,7 +641,7 @@ def main(argv=None):
             reduce=a.reduce, weight=a.weight, crop=a.crop,
             era5_dir=str(e_dir), dcpp_root=str(dcpp_root), data_root=a.root,
         )
-        paths = write_aoi_outputs(aoi_out, tag, rows,
+        paths = write_aoi_outputs(aoi_out, tag, rows, yearly,
                                   pd.concat([pairs, ens], ignore_index=True),
                                   meta, [f for f in failures if f[0] == aoi])
         written.extend(paths)
