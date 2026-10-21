@@ -336,6 +336,48 @@ def ensemble_mean(pairs: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+LEAD_COLUMNS = ["aoi", "member", "feature", "forecast_year", "r_anom", "r_time",
+                "r_space", "r_pooled", "bias", "rmse", "sd_ratio_anom",
+                "n_pairs", "n_units", "n_years"]
+
+
+def order_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Headline metrics first, everything else after, nothing dropped."""
+    return df[[c for c in LEAD_COLUMNS if c in df.columns]
+              + [c for c in df.columns if c not in LEAD_COLUMNS]]
+
+
+METRIC_NOTES = {
+    "r_anom": "unit means removed from both sides; interannual skill (headline)",
+    "r_time": "mean of per-unit temporal r; r_time_sd is its spread across units",
+    "r_space": "mean of per-year spatial r across units",
+    "r_pooled": "raw pooled r; inflated by between-unit climatology",
+    "sd_ratio_anom": "sd(DCPP anom)/sd(ERA5 anom); <1 = underdispersed interannual amplitude",
+    "sd_ratio_raw": "same on raw values; climatology-dominated, kept only for reference",
+    "bias": "mean(DCPP - ERA5) in the feature's own units",
+}
+
+
+def write_aoi_outputs(aoi_out: Path, tag: str, rows: list[dict],
+                      pairs: pd.DataFrame, meta: dict,
+                      failures: list) -> list[Path]:
+    """One AOI's three tables, side by side with that AOI's logs."""
+    aoi_out.mkdir(parents=True, exist_ok=True)
+    summary = order_columns(pd.DataFrame(rows)).sort_values(["feature", "member"])
+    csv_p = aoi_out / f"dcpp_era5_corr_{tag}.csv"
+    json_p = aoi_out / f"dcpp_era5_corr_{tag}.json"
+    pairs_p = aoi_out / f"dcpp_era5_pairs_{tag}.csv.gz"
+    summary.to_csv(csv_p, index=False)
+    pairs.to_csv(pairs_p, index=False)
+    with open(json_p, "w") as fh:
+        json.dump({"run": meta, "metric_notes": METRIC_NOTES,
+                   "failures": [{"aoi": x[0], "source": x[1], "why": x[2]}
+                                for x in failures],
+                   "results": json.loads(summary.to_json(orient="records"))},
+                  fh, indent=2)
+    return [csv_p, json_p, pairs_p]
+
+
 # =================================== main =====================================
 
 
@@ -448,15 +490,19 @@ def main(argv=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     tag = a.tag or f"fy{a.forecast_year}_{a.reduce}_{harvest_years[0]}-{harvest_years[-1]}"
 
-    all_pairs, rows, failures = [], [], []
+    all_rows, failures, written = [], [], []
     for aoi, mems in plan:
         print(f"\n--- {aoi} ---")
         e_dir = era5_dir(era5_root, aoi)
+        # One directory per AOI, holding that AOI's tables and its build logs.
+        # report_dcpp_era5.py reads the same layout back by AOI name.
+        aoi_out = out_dir / aoi
+        (aoi_out / "logs").mkdir(parents=True, exist_ok=True)
 
         if not a.skip_build:
             print("  building ERA5 features ...")
             cmd = build_cmd(a, aoi, "ERA5", e_dir, 0, era5_src)
-            if not run_build(cmd, out_dir / "logs" / f"{aoi}_ERA5.log"):
+            if not run_build(cmd, aoi_out / "logs" / f"{aoi}_ERA5.log"):
                 failures.append((aoi, "ERA5", "build"))
                 continue
 
@@ -484,7 +530,7 @@ def main(argv=None):
             if not a.skip_build:
                 print(f"  building {source} ...")
                 cmd = build_cmd(a, aoi, source, d_dir, a.forecast_year, dcpp_src)
-                if not run_build(cmd, out_dir / "logs" / f"{aoi}_{source}.log"):
+                if not run_build(cmd, aoi_out / "logs" / f"{aoi}_{source}.log"):
                     failures.append((aoi, source, "build"))
                     continue
             dcpp = _load_side(d_dir, aoi, a.crop, a.forecast_year, harvest_years,
@@ -511,9 +557,9 @@ def main(argv=None):
         pairs.insert(0, "aoi", aoi)
         ens = ensemble_mean(pairs.drop(columns="aoi"))
         ens.insert(0, "aoi", aoi)
-        all_pairs.append(pairs)
-        all_pairs.append(ens)
-
+        # Pairs are written per AOI below, so nothing accumulates across AOIs:
+        # a 10-member x 21-year x 1900-unit AOI is millions of rows on its own.
+        rows = []
         for member, mdf in pd.concat([pairs, ens], ignore_index=True).groupby("member"):
             for feat, fdf in mdf.groupby("feature"):
                 rec = {"aoi": aoi, "member": member, "feature": feat,
@@ -523,57 +569,37 @@ def main(argv=None):
                     rec["n_members"] = int(fdf["n_members"].max())
                 rec.update(metrics(fdf))
                 rows.append(rec)
+        all_rows.extend(rows)
 
-    if not rows:
+        meta = dict(
+            created=time.strftime("%Y-%m-%d %H:%M:%S %Z"), argv=sys.argv,
+            model=MODEL, aoi=aoi, members=mems,
+            forecast_year=a.forecast_year,
+            harvest_years=[harvest_years[0], harvest_years[-1]],
+            era5_source_years=[era5_src[0], era5_src[-1]],
+            dcpp_source_years=[dcpp_src[0], dcpp_src[-1]],
+            features_requested=feats, compared_columns=sorted(set(have)),
+            reduce=a.reduce, weight=a.weight, crop=a.crop,
+            era5_dir=str(e_dir), dcpp_root=str(dcpp_root), data_root=a.root,
+        )
+        paths = write_aoi_outputs(aoi_out, tag, rows,
+                                  pd.concat([pairs, ens], ignore_index=True),
+                                  meta, [f for f in failures if f[0] == aoi])
+        written.extend(paths)
+        for q in paths:
+            print(f"    -> {q}")
+
+    if not all_rows:
         raise SystemExit("no comparable data produced -- see the logs in "
                          f"{out_dir / 'logs'}")
 
-    summary = pd.DataFrame(rows)
-    lead = ["aoi", "member", "feature", "forecast_year", "r_anom", "r_time",
-            "r_space", "r_pooled", "bias", "rmse", "sd_ratio_anom",
-            "n_pairs", "n_units", "n_years"]
-    summary = summary[[c for c in lead if c in summary.columns]
-                      + [c for c in summary.columns if c not in lead]]
-    summary = summary.sort_values(["aoi", "feature", "member"])
-
-    csv_p = out_dir / f"dcpp_era5_corr_{tag}.csv"
-    json_p = out_dir / f"dcpp_era5_corr_{tag}.json"
-    pairs_p = out_dir / f"dcpp_era5_pairs_{tag}.csv.gz"
-    summary.to_csv(csv_p, index=False)
-    pd.concat(all_pairs, ignore_index=True).to_csv(pairs_p, index=False)
-    with open(json_p, "w") as fh:
-        json.dump({
-            "run": {
-                "created": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
-                "argv": sys.argv,
-                "model": MODEL,
-                "forecast_year": a.forecast_year,
-                "harvest_years": [harvest_years[0], harvest_years[-1]],
-                "era5_source_years": [era5_src[0], era5_src[-1]],
-                "dcpp_source_years": [dcpp_src[0], dcpp_src[-1]],
-                "features_requested": feats,
-                "reduce": a.reduce, "weight": a.weight, "crop": a.crop,
-                "era5_root": str(era5_root), "dcpp_root": str(dcpp_root),
-                "data_root": a.root,
-                "aois": {aoi: mems for aoi, mems in plan},
-            },
-            "metric_notes": {
-                "r_anom": "unit means removed from both sides; interannual skill (headline)",
-                "r_time": "mean of per-unit temporal r; r_time_sd is its spread across units",
-                "r_space": "mean of per-year spatial r across units",
-                "r_pooled": "raw pooled r; inflated by between-unit climatology",
-                "sd_ratio_anom": "sd(DCPP anom)/sd(ERA5 anom); <1 = underdispersed interannual amplitude",
-                "sd_ratio_raw": "same on raw values; climatology-dominated, kept only for reference",
-                "bias": "mean(DCPP - ERA5) in the feature's own units",
-            },
-            "failures": [{"aoi": a_, "source": s, "why": w} for a_, s, w in failures],
-            "results": json.loads(summary.to_json(orient="records")),
-        }, fh, indent=2)
+    summary = pd.DataFrame(all_rows)
+    summary = order_columns(summary).sort_values(["aoi", "feature", "member"])
 
     print("\n" + "=" * 78)
-    print(f"wrote {csv_p}")
-    print(f"      {json_p}")
-    print(f"      {pairs_p}  (every paired value, for re-analysis)")
+    print(f"wrote {len(written)} file(s) under {out_dir}/<AOI>/")
+    print(f"report with: python python/report_dcpp_era5.py --dir {out_dir} "
+          f"--aois {','.join(aoi for aoi, _ in plan)}")
     if failures:
         print(f"\n{len(failures)} failure(s):")
         for a_, s, w in failures:

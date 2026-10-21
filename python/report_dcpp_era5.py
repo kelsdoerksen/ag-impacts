@@ -38,10 +38,46 @@ def band(r):
     return "#c0392b", "none"
 
 
-def load(d: Path, pattern: str) -> pd.DataFrame:
-    files = sorted(glob.glob(str(d / pattern)))
+def find_files(d: Path, pattern: str, aois: list[str] | None) -> list[str]:
+    """Collect result CSVs from compare_dcpp_era5.py's per-AOI layout.
+
+        {dir}/{AOI}/dcpp_era5_corr_*.csv
+
+    With --aois, only those folders are read, and a named AOI that has no
+    results is an error rather than a silent omission -- a report missing an
+    AOI someone asked about is worse than no report. Without --aois every
+    subfolder holding results is used. A flat directory (older runs, before
+    the per-AOI layout) still works.
+    """
+    if aois:
+        files, empty = [], []
+        for aoi in aois:
+            hit = sorted(glob.glob(str(d / aoi / pattern)))
+            if hit:
+                files += hit
+            else:
+                empty.append(aoi)
+        if empty:
+            avail = sorted(x.name for x in d.iterdir()
+                           if x.is_dir() and glob.glob(str(x / pattern)))
+            raise SystemExit(
+                f"no results for {', '.join(empty)} under {d}\n"
+                f"  available: {', '.join(avail) or '(none)'}\n"
+                f"  run: python python/compare_dcpp_era5.py "
+                f"--aois {','.join(empty)} --go")
+        return files
+    files = sorted(glob.glob(str(d / "*" / pattern)))
+    if files:
+        return files
+    return sorted(glob.glob(str(d / pattern)))      # flat legacy layout
+
+
+def load(d: Path, pattern: str, aois: list[str] | None = None) -> pd.DataFrame:
+    files = find_files(d, pattern, aois)
     if not files:
-        raise SystemExit(f"no files matching {pattern} in {d}")
+        raise SystemExit(
+            f"no files matching {pattern} under {d} (or {d}/<AOI>/)\n"
+            f"Run compare_dcpp_era5.py first.")
     frames = []
     for f in files:
         df = pd.read_csv(f)
@@ -50,10 +86,16 @@ def load(d: Path, pattern: str) -> pd.DataFrame:
             m = re.search(r"_fy(\d+)_", os.path.basename(f))
             df["forecast_year"] = int(m.group(1)) if m else 0
         df["source_file"] = os.path.basename(f)
+        # Folder name is the authority on which AOI a file belongs to; the
+        # column is only a fallback for the flat legacy layout.
+        parent = os.path.basename(os.path.dirname(f))
+        if parent != d.name:
+            df["aoi"] = parent
         frames.append(df)
     out = pd.concat(frames, ignore_index=True)
     print(f"loaded {len(files)} file(s), {len(out)} rows, "
-          f"leads {sorted(out.forecast_year.unique())}")
+          f"AOIs {sorted(out.aoi.unique())}, "
+          f"leads {sorted(int(x) for x in out.forecast_year.unique())}")
     return out
 
 
@@ -87,7 +129,9 @@ def table(df, index, columns, values, label):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--dir", required=True, help="directory holding dcpp_era5_corr_*.csv")
+    p.add_argument("--dir", required=True,
+                   help="comparisons root; results are read from {dir}/{AOI}/")
+    p.add_argument("--aois", help="comma-separated AOIs to include; default: all found")
     p.add_argument("--pattern", default="dcpp_era5_corr_*.csv")
     p.add_argument("--out", default=None, help="output .html (default: {dir}/dcpp_skill_report.html)")
     p.add_argument("--metric", default="r_anom",
@@ -96,8 +140,13 @@ def main(argv=None):
     a = p.parse_args(argv)
 
     d = Path(a.dir)
-    df = load(d, a.pattern)
-    out = Path(a.out) if a.out else d / "dcpp_skill_report.html"
+    aois = [x.strip() for x in a.aois.split(",") if x.strip()] if a.aois else None
+    df = load(d, a.pattern, aois)
+    if a.out:
+        out = Path(a.out)
+    else:
+        stem = "dcpp_skill_report" + (f"_{'-'.join(aois)}" if aois else "")
+        out = d / f"{stem}.html"
     M = a.metric
 
     ens = df[df.member == "ENSMEAN"].copy()
