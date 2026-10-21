@@ -442,7 +442,8 @@ def path_defs(gdf, aoi: str, w=330, pad=6, trim: bool = True,
     return defs, ids, (w, round(h, 1)), outside
 
 
-def svg_map(ids: dict, values: dict, title: str, box):
+def svg_map(ids: dict, values: dict, title: str, box,
+            lo: float = -1.0, hi: float = 1.0):
     """One choropleth as <use> references into this AOI's shared <defs>.
 
     Each unit is a <g> holding a <title> and a hidden <text>. The <title> alone
@@ -464,25 +465,26 @@ def svg_map(ids: dict, values: dict, title: str, box):
         lab = "n/a" if v is None or pd.isna(v) else f"{v:+.2f}"
         parts.append(
             f'<g class="u"><title>{html.escape(str(aid))}: {lab}</title>'
-            f'<use href="#{pid}" fill="{ramp(v)}"/>'
+            f'<use href="#{pid}" fill="{ramp(v, lo, hi)}"/>'
             f'<text class="lbl" x="{lx:.1f}" y="{ly:.1f}">{lab}</text></g>')
     parts.append("</g></svg>")
     return "".join(parts)
 
 
-def map_legend():
+def map_legend(lo: float = -1.0, hi: float = 1.0, label: str | None = None,
+               gid: str = "g"):
     stops = "".join(
         f'<stop offset="{(v + 1) / 2:.2%}" stop-color="{ramp(v)}"/>'
         for v, _ in _RAMP)
+    txt = label or "per-unit temporal correlation; grey = too few years"
     return (f'<div class="maplegend"><svg viewBox="0 0 220 26" class="lg">'
-            f'<defs><linearGradient id="g">{stops}</linearGradient></defs>'
-            f'<rect x="10" y="2" width="200" height="9" fill="url(#g)" '
+            f'<defs><linearGradient id="{gid}">{stops}</linearGradient></defs>'
+            f'<rect x="10" y="2" width="200" height="9" fill="url(#{gid})" '
             f'stroke="var(--line)"/>'
-            f'<text x="10" y="22" class="tick">-1</text>'
+            f'<text x="10" y="22" class="tick">{lo:+g}</text>'
             f'<text x="110" y="22" class="tick ta-mid">0</text>'
-            f'<text x="210" y="22" class="tick ta-end">+1</text>'
-            f'</svg><span class="sm">per-unit temporal correlation; '
-            f'grey = too few years</span></div>')
+            f'<text x="210" y="22" class="tick ta-end">{hi:+g}</text>'
+            f'</svg><span class="sm">{html.escape(txt)}</span></div>')
 
 
 def load_polygons(poly_dir: Path, aoi: str):
