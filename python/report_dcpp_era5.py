@@ -303,21 +303,29 @@ def _rings(geom):
             yield list(h.coords)
 
 
-def svg_map(gdf, values: dict, title: str, w=330, h=300, pad=6):
-    """Choropleth of one AOI, coloured by `values[adm_id]`. Inline SVG.
+def path_defs(gdf, aoi: str, w=330, h=300, pad=6):
+    """Serialise this AOI's geometry ONCE, as a hidden <defs> of <path> ids.
 
-    Geometry is projected to EPSG:6933 (equal area) before scaling, so unit
-    areas are not distorted by latitude the way a raw lon/lat plot would be.
+    Every map of one AOI then references the same paths through <use>, which is
+    the difference between a readable page and an unusable one: mapping six
+    features at two leads would otherwise write each of US maize's 3025 county
+    outlines twelve times -- tens of megabytes of identical coordinates.
+
+    The transform is computed from the WHOLE polygon set, not from whichever
+    units a given feature happened to match, so every map of an AOI shares one
+    extent. Side-by-side maps drawn at different zooms would invite exactly the
+    wrong comparison.
+
+    Geometry is projected to EPSG:6933 (equal area) upstream, so unit areas are
+    not distorted by latitude the way a raw lon/lat plot would be.
     """
     x0, y0, x1, y1 = gdf.total_bounds
-    sx = (w - 2 * pad) / max(x1 - x0, 1e-9)
-    sy = (h - 2 * pad) / max(y1 - y0, 1e-9)
-    sc = min(sx, sy)
+    sc = min((w - 2 * pad) / max(x1 - x0, 1e-9), (h - 2 * pad) / max(y1 - y0, 1e-9))
     ox = pad + ((w - 2 * pad) - (x1 - x0) * sc) / 2
     oy = pad + ((h - 2 * pad) - (y1 - y0) * sc) / 2
-    parts = [f'<svg viewBox="0 0 {w} {h}" class="map" role="img" '
-             f'aria-label="{html.escape(title)}">']
-    for row in gdf.itertuples():
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", str(aoi)).strip("-")
+    parts, ids = [], {}
+    for i, row in enumerate(gdf.itertuples()):
         d = []
         for ring in _rings(row.geometry):
             pts = " L".join(f"{ox + (x - x0) * sc:.1f},{oy + (y1 - y) * sc:.1f}"
@@ -325,12 +333,33 @@ def svg_map(gdf, values: dict, title: str, w=330, h=300, pad=6):
             d.append("M" + pts + "Z")
         if not d:
             continue
-        v = values.get(row.adm_id)
+        pid = f"p-{slug}-{i}"
+        ids[row.adm_id] = pid
+        parts.append(f'<path id="{pid}" d="{" ".join(d)}"/>')
+    defs = (f'<svg class="defs" aria-hidden="true" width="0" height="0">'
+            f'<defs>{"".join(parts)}</defs></svg>')
+    return defs, ids, (w, h)
+
+
+def svg_map(ids: dict, values: dict, title: str, box=(330, 300)):
+    """One choropleth as <use> references into this AOI's shared <defs>.
+
+    fill is set on the <use> rather than the <path>, so the same geometry can be
+    shaded differently by every map that references it. The per-unit <title>
+    gives the hover tooltip.
+    """
+    w, h = box
+    parts = [f'<svg viewBox="0 0 {w} {h}" class="map" role="img" '
+             f'aria-label="{html.escape(title)}">',
+             '<g fill-rule="evenodd" stroke="#888" stroke-width="0.25">']
+    for aid, pid in ids.items():
+        if aid not in values:
+            continue
+        v = values[aid]
         lab = "n/a" if v is None or pd.isna(v) else f"{v:+.2f}"
-        parts.append(f'<path d="{" ".join(d)}" fill="{ramp(v)}" fill-rule="evenodd" '
-                     f'stroke="#888" stroke-width="0.25"><title>{html.escape(str(row.adm_id))}: '
-                     f'{lab}</title></path>')
-    parts.append("</svg>")
+        parts.append(f'<use href="#{pid}" fill="{ramp(v)}">'
+                     f'<title>{html.escape(str(aid))}: {lab}</title></use>')
+    parts.append("</g></svg>")
     return "".join(parts)
 
 
@@ -368,36 +397,74 @@ def load_polygons(poly_dir: Path, aoi: str):
     return g.rename(columns={idcol: "adm_id"})[["adm_id", "geometry"]], None
 
 
-def map_section(byunit: pd.DataFrame, poly_dir: Path, feature: str,
-                leads) -> str:
-    """One row of maps per AOI: the chosen feature's per-unit skill, by lead."""
+def _fig_id(aoi, feature, fy) -> str:
+    """A DOM id safe to put in an href. Feature names are plain tokens, but
+    adm/feature spellings vary enough that anything outside [A-Za-z0-9] is
+    folded rather than trusted."""
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", f"{aoi}-{feature}-fy{fy}")
+    return f"m-{slug.strip('-')}"
+
+
+def map_figure(ids: dict, box, sub, aoi, feature, fy, back: str) -> str:
+    """One choropleth, collapsed by default and expandable in place.
+
+    Expansion is a :target rule, not script: clicking the caption navigates to
+    this figure's id and the CSS gives the targeted figure the full grid width.
+    Nothing is overlaid on the map, so the per-unit tooltips still work when it
+    is expanded.
+    """
+    vals = {a: v for a, v in zip(sub.adm2_id, sub.r_time) if a in ids}
+    if not vals:
+        return (f'<figure class="fig"><figcaption>{html.escape(feature)} '
+                f'&middot; FY{fy}</figcaption>'
+                f'<p class="na sm">no unit ids matched the shapefile</p></figure>')
+    fid = _fig_id(aoi, feature, fy)
+    med = sub.r_time.median()
+    n_na = int(pd.isna(pd.Series(list(vals.values()))).sum())
+    note = f" &middot; {n_na} n/a" if n_na else ""
+    return (f'<figure class="fig" id="{fid}">'
+            f'<figcaption>'
+            f'<a class="exp" href="#{fid}" title="expand">'
+            f'<span class="mono">{html.escape(feature)}</span> FY{fy} '
+            f'<span class="zi">&#9974;</span></a>'
+            f'<span class="ylab">median {med:+.2f} &middot; {len(vals)} units{note}'
+            f'<a class="col" href="#{back}" title="collapse">&times;</a></span>'
+            f'</figcaption>'
+            f'{svg_map(ids, vals, f"{aoi} {feature} FY{fy}", box)}</figure>')
+
+
+def map_section(byunit: pd.DataFrame, poly_dir: Path, features, leads) -> str:
+    """Every feature mapped, side by side, one block per AOI.
+
+    Ordered feature-major so the leads of one feature sit next to each other:
+    the comparison these maps exist to support is FY1 against FY2 for the same
+    quantity, not two quantities at the same lead.
+    """
     blocks = []
     for aoi, g in byunit.groupby("aoi", observed=True):
-        gg = g[g.feature == feature]
-        if gg.empty:
-            continue
-        polys, err = load_polygons(poly_dir, str(aoi))
+        aoi = str(aoi)
+        polys, err = load_polygons(poly_dir, aoi)
         if polys is None:
-            blocks.append(f'<p class="na">{html.escape(str(aoi))}: {html.escape(err)}</p>')
+            blocks.append(f'<h3>{html.escape(aoi)}</h3>'
+                          f'<p class="na">{html.escape(err)}</p>')
             continue
+        defs, ids, box = path_defs(polys, aoi)
+        back = f"maps-{re.sub(r'[^A-Za-z0-9]+', '-', aoi).strip('-')}"
         figs = []
-        for fy in leads:
-            sub = gg[gg.forecast_year == fy]
-            if sub.empty:
+        for feat in features:
+            gg = g[g.feature == feat]
+            if gg.empty:
                 continue
-            vals = dict(zip(sub.adm2_id, sub.r_time))
-            keep = polys[polys.adm_id.isin(vals)]
-            if keep.empty:
-                figs.append(f'<p class="na">FY{fy}: no unit ids matched the shapefile</p>')
-                continue
-            med = sub.r_time.median()
-            figs.append(
-                f'<figure class="fig"><figcaption>FY{fy}'
-                f'<span class="ylab">median {med:+.2f} &middot; {len(keep)} units</span>'
-                f'</figcaption>{svg_map(keep, vals, f"{aoi} FY{fy}")}</figure>')
+            for fy in leads:
+                sub = gg[gg.forecast_year == fy]
+                if not sub.empty:
+                    figs.append(map_figure(ids, box, sub, aoi, feat, fy, back))
         if figs:
-            blocks.append(f'<h3>{html.escape(str(aoi))}</h3>'
-                          f'<div class="grid maps">{"".join(figs)}</div>')
+            blocks.append(
+                f'<h3 id="{back}">{html.escape(aoi)} '
+                f'<span class="dim">&middot; {len(figs)} map(s) &middot; '
+                f'{len(ids)} units</span></h3>{defs}'
+                f'<div class="grid maps">{"".join(figs)}</div>')
     if not blocks:
         return '<p class="na">no per-unit data to map</p>'
     return map_legend() + "".join(blocks)
@@ -446,8 +513,23 @@ text.tick{fill:var(--mut);font-size:9.5px}
 .legend{padding:2px 6px 6px;font-size:11.5px;color:var(--mut)}
 .key{margin-right:10px}.key i{display:inline-block;width:9px;height:9px;border-radius:2px;
  margin-right:4px;vertical-align:-1px}
-.maps{grid-template-columns:repeat(auto-fill,minmax(250px,1fr))}
+.maps{grid-template-columns:repeat(auto-fill,minmax(228px,1fr));align-items:start}
 .map{width:100%;height:auto;display:block;background:transparent}
+/* Click-to-expand without script: the caption link targets the figure, and a
+   targeted figure takes the whole grid row. :target survives printing and
+   works with the file opened straight off disk. */
+.maps .fig{scroll-margin-top:14px}
+svg.defs{position:absolute;width:0;height:0;overflow:hidden}
+.maps .fig:target{grid-column:1/-1;border-color:var(--mut);box-shadow:0 2px 14px rgba(0,0,0,.12)}
+.maps .fig:target .map{max-height:76vh;margin:0 auto}
+.maps .fig:target .col{display:inline}
+.maps .fig:target .zi{display:none}
+a.exp{color:inherit;text-decoration:none;display:inline-flex;gap:5px;align-items:baseline}
+a.exp:hover{text-decoration:underline}
+.zi{color:var(--mut);font-size:11px}
+a.col{display:none;color:var(--mut);text-decoration:none;font-size:15px;
+ line-height:1;padding-left:8px}
+a.col:hover{color:var(--fg)}
 .maplegend{display:flex;align-items:center;gap:10px;margin:4px 0 10px}
 .lg{width:220px;height:26px;flex:0 0 auto}
 .note{background:var(--head);border-left:3px solid var(--mut);padding:12px 15px;
@@ -551,25 +633,32 @@ def render_page(a, ens, mem, ey, eu, poly_dir, leads, order, css):
 
     if not eu.empty and poly_dir is not None and not a.no_maps:
         feats_avail = list(dict.fromkeys(eu.feature))
-        mf = a.map_feature or feats_avail[0]
-        if mf not in feats_avail:
-            B.append(f'<h2>7b &middot; Maps</h2><p class="na">--map-feature '
-                     f'{html.escape(mf)} not in {", ".join(feats_avail)}</p>')
+        # Default is every feature. --map-features narrows it, for a run with
+        # twenty features where a slide only needs three.
+        want = a.map_features or a.map_feature
+        if want:
+            asked = [x.strip() for x in want.split(",") if x.strip()]
+            feats = [f for f in feats_avail if f in asked]
+            missing = [f for f in asked if f not in feats_avail]
         else:
-            B.append('<h2>7b &middot; Where the skill is &mdash; '
-                     f'<span class="mono">{html.escape(mf)}</span></h2>')
-            B.append('<p class="sub">Each unit is shaded by its own temporal '
-                     'correlation across years &mdash; the per-unit values that '
-                     '<span class="mono">r_time</span> averages. One map per lead, '
-                     'so geographic loss of skill with lead is visible directly. '
-                     'Hover a unit for its id and value. Equal-area projection '
-                     '(EPSG:6933); grey units have fewer than four years.</p>')
-            B.append(map_section(eu, poly_dir, mf, leads))
-            if len(feats_avail) > 1:
-                B.append(f'<p class="sub">Other features available: '
-                         f'<span class="mono">'
-                         f'{", ".join(f for f in feats_avail if f != mf)}</span> '
-                         f'&mdash; pass <span class="mono">--map-feature</span>.</p>')
+            feats, missing = feats_avail, []
+        B.append('<h2>7b &middot; Where the skill is</h2>')
+        B.append('<p class="sub">Every feature, mapped per lead. Each unit is '
+                 'shaded by its own temporal correlation across years &mdash; the '
+                 'per-unit values that <span class="mono">r_time</span> averages. '
+                 'Maps sit side by side for comparison; <b>click a caption to '
+                 'expand one to full width</b>, and the &times; to collapse it. '
+                 'Hover a unit for its id and value. Equal-area projection '
+                 '(EPSG:6933); grey units have fewer than four paired years.</p>')
+        if missing:
+            B.append(f'<p class="na">not in this run: '
+                     f'<span class="mono">{html.escape(", ".join(missing))}</span> '
+                     f'&mdash; available: '
+                     f'<span class="mono">{html.escape(", ".join(feats_avail))}</span></p>')
+        if not feats:
+            B.append('<p class="na">no features left to map after filtering</p>')
+        else:
+            B.append(map_section(eu, poly_dir, feats, leads))
     elif not a.no_maps and not eu.empty:
         B.append('<h2>7b &middot; Maps</h2>')
         B.append('<p class="na">No polygon directory found. Pass '
@@ -620,8 +709,10 @@ def main(argv=None):
     p.add_argument("--polygons", default=None,
                    help="cy-bench polygons dir for the maps "
                         "(default: {data_root}/cy-bench/polygons from the run JSON)")
+    p.add_argument("--map-features", default=None,
+                   help="comma-separated features to map; default: all of them")
     p.add_argument("--map-feature", default=None,
-                   help="feature to map (default: the first one present)")
+                   help="deprecated single-feature alias for --map-features")
     p.add_argument("--no-maps", action="store_true", help="skip the map section")
     p.add_argument("--per-lead-pages", action="store_true",
                    help="also write one standalone HTML per lead, for slides")

@@ -48,7 +48,7 @@ Rscript R/dcpp-pixel-store.R --aoi=CONUS --forecast-year=1 1982-2018
 | `python/degree_days.py` | The single-sine degree-day integral, shared by `era5_features.py` and `data_loader.py` so the feature definition cannot differ between the two. |
 | `python/run_cybench_era5.py` | Driver: runs stages 1 and 2 over many AOIs in sequence, deriving each AOI's year span from its cy-bench crop coverage. Dry-run by default; resumable; logs per AOI. |
 | `python/compare_dcpp_era5.py` | **Checks the hindcast against the reanalysis.** Drives `era5_features.py` for ERA5 and for each EC-Earth3 member, joins the two on `(adm2_id, harvest_year)`, and reports how well each member -- and the ensemble mean -- reproduces the ERA5 feature. `r_anom` (each unit's own mean removed from both sides) is the interannual skill; `r_pooled` is reported beside it but is inflated by between-unit climatology. Writes csv + json + every paired value. Members auto-discover from the DCPP tree; dry-run by default. |
-| `python/report_dcpp_era5.py` | Turns one or more `dcpp_era5_corr_*.csv` into a single self-contained HTML report -- headline skill per AOI, decay with lead time, what the ensemble mean adds, and calibration -- plus a tidy csv for slides. No plotting dependency; the bars are inline CSS. |
+| `python/report_dcpp_era5.py` | Turns one or more `dcpp_era5_corr_*.csv` into a single self-contained HTML report -- metric definitions, headline skill per AOI, decay with lead time, what the ensemble mean adds, calibration, per-year charts -- plus a tidy csv for slides. **Maps every feature** per lead as side-by-side admin-2 choropleths; click a caption to expand one to full width (a `:target` rule, no script). Each AOI's geometry is serialised once into an SVG `<defs>` and referenced by `<use>`, so adding features costs fills rather than coordinates. `--map-features` narrows the set, `--no-maps` skips it. No plotting dependency. |
 
 ```sh
 python python/era5_features.py --aoi=US --years=2000-2023 --stage=features
@@ -58,7 +58,8 @@ python python/era5_features.py --aoi=US --years=2000-2023 --stage=aggregate \
 # DCPP fy1 vs ERA5: plan and the exact commands first, then run
 python python/compare_dcpp_era5.py --aois ZM --harvest-years 2002-2022
 python python/compare_dcpp_era5.py --aois ZM --harvest-years 2002-2022 --go
-python python/report_dcpp_era5.py --dir /mnt/crl_storage/personal_folders/kdoerksen/comparisons
+python python/report_dcpp_era5.py --dir /mnt/crl_storage/personal_folders/kdoerksen/comparisons \
+    --polygons /mnt/crl_storage/personal_folders/kdoerksen/cy-bench/polygons
 ```
 
 ### Supporting data
@@ -76,7 +77,9 @@ python python/report_dcpp_era5.py --dir /mnt/crl_storage/personal_folders/kdoerk
 
 | script | functionality |
 |---|---|
-| `python/data_loader.py` | Assembles the design matrix: joins stage 3's admin-2 features to yield targets, and optionally appends yield history and phenology. `FEATURE_MODES` is `pixel` (whole-season) and `pixel_blocks` (season-relative windows) are fixed upstream. |
+| `python/yield_features.py` | **Picks the feature source.** Reads one stage-3 store -- `era5`, `dcpp:<member>` or `dcpp:ens` (the member mean, taken feature-by-feature after stage 3) -- attaches the cy-bench yield target and optionally prior-season NDVI/fPAR/soil moisture and the unit's own yield lags. Several AOIs stack into one frame on an intersected feature set, keyed `(adm2_id, harvest_year)` so an ERA5 run and a DCPP run differ only in the climate columns. |
+| `python/run_yield_experiment.py` | **Tabular model runner.** One model per AOI, or `--combine` for a pooled fit; `--test-year Y` or `--loo`. Folds are always whole years, never rows. Reports absolute RMSE/R2 beside the per-unit climatology null (`skill`), `r_anom` and the per-year spatial correlation, with the baseline re-fit on each fold's training rows. Writes predictions, per-fold / per-unit metrics, importances and `run_meta.json` per run. |
+| `python/data_loader.py` | Assembles the design matrix: joins stage 3's admin-2 features to yield targets, and optionally appends yield history and phenology. `FEATURE_MODES` is `pixel` (whole-season) and `pixel_blocks` (season-relative windows) are fixed upstream. Note `find_season_feature_files` globs filenames without the `fy{n}` token stage 3 now writes, so the older runners below read observed (FY0) stores only. |
 | `python/models.py`, `python/train_eval.py` | Model definitions and the train/evaluate loop. |
 | `python/run_loo_experiment.py` | Leave-one-out experiment runner. |
 | `python/tst/` | Time-series transformer arms. |
@@ -84,6 +87,19 @@ python python/report_dcpp_era5.py --dir /mnt/crl_storage/personal_folders/kdoerk
 | `python/compare_feature_spaces.py`, `python/bin_analysis.py` | Feature-space and binned-response comparisons. |
 | `python/aggregate_seed_runs.py` | Pools replicate seeds into one result table. |
 | `python/plot_*.py`, `python/make_*.py` | Figures and summary tables. |
+
+```sh
+# observed features, one model per AOI, leave-one-year-out
+python python/run_yield_experiment.py --aois US,HU --source era5 --loo --go
+
+# the same experiment on the FY1 hindcast ensemble mean -- only the source changes
+python python/run_yield_experiment.py --aois US,HU --source dcpp:ens \
+    --forecast-year 1 --loo --go
+
+# pool the small AOIs for sample count, hold out one year, add cy-bench covariates
+python python/run_yield_experiment.py --aois HU,RO,FR --combine --source era5 \
+    --test-year 2018 --add ndvi,yield_history --target anomaly --go
+```
 
 ---
 
