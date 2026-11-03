@@ -410,8 +410,9 @@ def path_defs(gdf, aoi: str, w=330, pad=6, trim: bool = True,
     so a wide AOI like CONUS fills its box rather than being letterboxed into
     the middle third of it.
 
-    Geometry is projected to EPSG:6933 (equal area) upstream, so unit areas are
-    not distorted by latitude the way a raw lon/lat plot would be.
+    Geometry arrives already projected to an equal-area Albers fitted to this
+    AOI (see local_equal_area), so unit areas are preserved and the country
+    keeps its familiar shape.
     """
     (x0, y0, x1, y1), outside = view_extent(gdf, trim, k)
     span_x, span_y = max(x1 - x0, 1e-9), max(y1 - y0, 1e-9)
@@ -471,6 +472,16 @@ def svg_map(ids: dict, values: dict, title: str, box,
     return "".join(parts)
 
 
+def _tick(v: float) -> str:
+    """Legend tick: signed for a diverging scale around zero, plain and
+    thousands-separated for a magnitude like kg/ha."""
+    if v == 0:
+        return "0"
+    if abs(v) >= 100:
+        return f"{v:,.0f}"
+    return f"{v:+g}" if abs(v) <= 1.0 else f"{v:g}"
+
+
 def map_legend(lo: float = -1.0, hi: float = 1.0, label: str | None = None,
                gid: str = "g"):
     stops = "".join(
@@ -487,8 +498,52 @@ def map_legend(lo: float = -1.0, hi: float = 1.0, label: str | None = None,
             f'</svg><span class="sm">{html.escape(txt)}</span></div>')
 
 
-def load_polygons(poly_dir: Path, aoi: str):
-    """cy-bench AOI polygons, projected equal-area and lightly simplified."""
+def local_equal_area(bounds) -> str:
+    """An Albers equal-area conic fitted to one AOI, as a proj string.
+
+    Area has to be preserved -- every feature in this pipeline is a
+    cropland-AREA-weighted mean, so a map that distorts area misrepresents what
+    was averaged. But EPSG:6933, the obvious global equal-area choice, is
+    CYLINDRICAL with its standard parallel at 30 degrees: it preserves area
+    everywhere and shape nowhere, and the error grows with distance from 30.
+    Measured on the 2153 CONUS counties in these runs it renders the country at
+    aspect 2.17 against Albers' 1.63 -- a third too wide, visibly wrong to
+    anyone who knows the shape of the US.
+
+    An Albers conic with its two standard parallels set at 1/6 and 5/6 of the
+    AOI's own latitude span is the textbook fit, minimising distortion across
+    the middle of the region while staying exactly equal-area. Deriving it from
+    the data means every AOI gets a sensible projection with no lookup table --
+    for CONUS it lands essentially on EPSG:5070, and for ZM or BR it adapts
+    rather than inheriting a parallel chosen for somewhere else.
+    """
+    minx, miny, maxx, maxy = bounds
+    lon0, lat0 = (minx + maxx) / 2.0, (miny + maxy) / 2.0
+    span = maxy - miny
+    if span < 1.0:                      # a single-latitude AOI: widen so the
+        lat1, lat2 = lat0 - 1.0, lat0 + 1.0   # two parallels stay distinct
+    else:
+        lat1, lat2 = miny + span / 6.0, maxy - span / 6.0
+    return (f"+proj=aea +lat_1={lat1:.4f} +lat_2={lat2:.4f} +lat_0={lat0:.4f} "
+            f"+lon_0={lon0:.4f} +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs")
+
+
+def load_polygons(poly_dir: Path, aoi: str, crs: str | None = None,
+                  keep: set | None = None, simplify_div: float = 2500.0):
+    """cy-bench AOI polygons, projected equal-area and lightly simplified.
+
+    `keep` restricts to the units that will actually be drawn BEFORE the
+    projection is fitted, so the parallels follow the crop area rather than
+    every island the country administers. `crs` overrides the fitted projection
+    (e.g. "EPSG:5070").
+
+    The simplify tolerance is a fraction of the AOI's extent. At the previous
+    extent/900 a CONUS county -- about 50 km across -- was being simplified at
+    4.8 km, which visibly chunks its borders; the maps are drawn up to 1560 px
+    wide, where one pixel is under 3 km. Geometry is now emitted once per AOI
+    into a shared <defs>, so the finer tolerance costs one copy, not one per
+    map.
+    """
     import geopandas as gpd          # lazy: only the map path needs it
     shp = poly_dir / aoi / f"{aoi}.shp"
     if not shp.exists():
@@ -496,14 +551,17 @@ def load_polygons(poly_dir: Path, aoi: str):
     g = gpd.read_file(shp)
     if g.crs is None:                # Brazil ships without a .prj
         g = g.set_crs("EPSG:4326")
-    g = g.to_crs("EPSG:6933")
-    # Simplify relative to the AOI's own extent: enough to keep the file small,
-    # far below the size of an admin-2 unit.
-    x0, y0, x1, y1 = g.total_bounds
-    tol = max(x1 - x0, y1 - y0) / 900.0
-    g["geometry"] = g.geometry.simplify(tol, preserve_topology=True)
     idcol = "adm_id" if "adm_id" in g.columns else g.columns[0]
-    return g.rename(columns={idcol: "adm_id"})[["adm_id", "geometry"]], None
+    g = g.rename(columns={idcol: "adm_id"})[["adm_id", "geometry"]]
+    if keep:
+        sub = g[g.adm_id.isin(keep)]
+        if not sub.empty:
+            g = sub
+    g = g.to_crs(crs or local_equal_area(g.to_crs("EPSG:4326").total_bounds))
+    x0, y0, x1, y1 = g.total_bounds
+    tol = max(x1 - x0, y1 - y0) / float(simplify_div)
+    g["geometry"] = g.geometry.simplify(tol, preserve_topology=True)
+    return g, None
 
 
 def _fig_id(aoi, feature, fy) -> str:
@@ -542,7 +600,8 @@ def map_figure(ids: dict, box, sub, aoi, feature, fy, back: str) -> str:
 
 
 def map_section(byunit: pd.DataFrame, poly_dir: Path, features, leads,
-                trim: bool = True, k: float = 6.0) -> str:
+                trim: bool = True, k: float = 6.0,
+                crs: str | None = None) -> str:
     """Every feature mapped, side by side, one block per AOI.
 
     The polygons are cut down to the units that actually appear in the data
@@ -557,12 +616,12 @@ def map_section(byunit: pd.DataFrame, poly_dir: Path, features, leads,
     blocks = []
     for aoi, g in byunit.groupby("aoi", observed=True):
         aoi = str(aoi)
-        polys, err = load_polygons(poly_dir, aoi)
+        shown = set(g[g.feature.isin(features)].adm2_id)
+        polys, err = load_polygons(poly_dir, aoi, crs=crs, keep=shown)
         if polys is None:
             blocks.append(f'<h3>{html.escape(aoi)}</h3>'
                           f'<p class="na">{html.escape(err)}</p>')
             continue
-        shown = set(g[g.feature.isin(features)].adm2_id)
         drawn = polys[polys.adm_id.isin(shown)]
         if drawn.empty:
             blocks.append(
@@ -788,7 +847,8 @@ def render_page(a, ens, mem, ey, eu, poly_dir, leads, order, css):
                  'Maps sit side by side for comparison; <b>click a caption to '
                  'expand one to full width</b>, and the &times; to collapse it. '
                  'Hover a unit for its id and value. Equal-area projection '
-                 '(EPSG:6933); grey units have fewer than four paired years. '
+                 '(Albers equal-area, fitted per AOI); grey units have fewer '
+                 'than four paired years. '
                  'Remote units that would shrink the crop area to a corner of the frame '
                  '&mdash; overseas departments, Pacific territories &mdash; are left out of '
                  'the view and counted in each AOI heading; <span class="mono">--map-full-extent</span> keeps them.</p>')
@@ -801,7 +861,8 @@ def render_page(a, ens, mem, ey, eu, poly_dir, leads, order, css):
             B.append('<p class="na">no features left to map after filtering</p>')
         else:
             B.append(map_section(eu, poly_dir, feats, leads,
-                                 trim=not a.map_full_extent, k=a.map_trim_k))
+                                 trim=not a.map_full_extent, k=a.map_trim_k,
+                                 crs=a.map_crs))
     elif not a.no_maps and not eu.empty:
         B.append('<h2>7b &middot; Maps</h2>')
         B.append('<p class="na">No polygon directory found. Pass '
@@ -861,6 +922,9 @@ def main(argv=None):
                    help="draw maps to the shapefile's full extent instead of "
                         "trimming far-flung units (FR's overseas departments, "
                         "US territories and the Aleutians) out of the view")
+    p.add_argument("--map-crs", default=None,
+                   help="force one CRS for every map (e.g. EPSG:5070); the "
+                        "default fits an equal-area Albers per AOI")
     p.add_argument("--map-trim-k", type=float, default=6.0,
                    help="how remote a unit must be to leave the map view, in "
                         "median absolute deviations (default 6). Lower trims "

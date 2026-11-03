@@ -34,6 +34,7 @@ Reads, per run directory:
 
 The map machinery is imported from report_dcpp_era5.py rather than copied, so
 both reports project, trim and shade identically and a fix lands in one place.
+Projection is an equal-area Albers fitted to each AOI's own extent.
 
     python python/report_yield_experiment.py \\
         --dir /mnt/crl_storage/personal_folders/kdoerksen/experiments \\
@@ -169,7 +170,7 @@ def table(df: pd.DataFrame, cols, ref: str | None = None) -> str:
     return "".join(out) or '<p class="na">nothing to tabulate</p>'
 
 
-def year_charts(runs, metric: str, ylab: str, ylim) -> str:
+def year_charts(runs, metric: str, ylab: str, ylim, w=760, h=300) -> str:
     """One chart per scope; one line per run, so runs overlay for comparison."""
     scopes: dict = {}
     for r in runs:
@@ -185,17 +186,76 @@ def year_charts(runs, metric: str, ylab: str, ylim) -> str:
         years = sorted({y for s in series.values() for y in s})
         if len(years) < 2:
             continue
-        figs.append(line_chart(series, years, scope, ylab, ylim))
+        figs.append(line_chart(series, years, scope, ylab, ylim, w=w, h=h))
     return (f'<div class="grid">{"".join(figs)}</div>' if figs
             else '<p class="na">no per-year rows</p>')
 
 
 # ------------------------------------------------------------------- maps --
 
+# How each mappable quantity behaves. "diverging" means zero is the meaningful
+# midpoint and the scale is symmetric; "magnitude" means it is a positive
+# quantity with no natural centre, scaled from the data. `good` says which
+# direction is better, so blue can mean "good" on every map rather than
+# "large" on some and "small" on others.
+METRIC_KINDS = {
+    "skill":      ("diverging", "up",   "skill vs each district's own climatology"),
+    "acc":        ("magnitude", "up",   "direction accuracy"),
+    "rmse":       ("magnitude", "down", "RMSE (kg/ha)"),
+    "rmse_clim":  ("magnitude", "down", "climatology RMSE (kg/ha)"),
+    "rmse_pct":   ("magnitude", "down", "RMSE as % of the district's mean yield"),
+    "mean_yield": ("magnitude", "up",   "mean yield (kg/ha)"),
+    "n":          ("magnitude", "up",   "held-out years scored"),
+}
+
+
+def derive(u: pd.DataFrame) -> pd.DataFrame:
+    """Add the columns worth mapping that the runner does not write directly.
+
+    rmse_pct is the one to reach for: raw RMSE is dominated by yield LEVEL --
+    a 10 t/ha county in Iowa will out-error a 2 t/ha county in Zambia whatever
+    the model does -- so an RMSE map mostly redraws the yield map. Dividing by
+    the district's own mean makes the errors comparable across the panel.
+    """
+    u = u.copy()
+    if {"rmse", "mean_yield"} <= set(u.columns):
+        u["rmse_pct"] = 100.0 * u["rmse"] / u["mean_yield"].replace(0, pd.NA)
+    return u
+
+
+def metric_scale(metric: str, vals, diff: bool = False) -> tuple:
+    """(lo, hi, label) for the colour ramp.
+
+    A difference is always diverging and symmetric, whatever the underlying
+    metric. For a magnitude the range comes from the 5th-95th percentile across
+    every run so the maps are comparable, trimmed because a handful of extreme
+    districts would otherwise flatten the rest to one colour. When lower is
+    better the range is handed over INVERTED, which maps small values onto the
+    blue end -- so blue means "good" on every map in the report.
+    """
+    kind, good, label = METRIC_KINDS.get(metric, ("magnitude", "up", metric))
+    s = pd.Series(list(vals), dtype=float).dropna()
+    if s.empty:
+        return -1.0, 1.0, label
+    if diff:
+        m = float(s.abs().quantile(0.95)) or float(s.abs().max()) or 1.0
+        return (m, -m, label) if good == "down" else (-m, m, label)
+    if kind == "diverging":
+        m = max(float(s.abs().quantile(0.95)), 1e-9)
+        return -m, m, label
+    lo, hi = float(s.quantile(0.05)), float(s.quantile(0.95))
+    if hi <= lo:
+        hi = lo + max(abs(lo) * 0.1, 1e-9)
+    return (hi, lo, label) if good == "down" else (lo, hi, label)
+
+
 def unit_values(run, aoi: str, metric: str) -> dict:
     """{adm2_id: value} for one run and one AOI."""
     u = run["unit"]
-    if u.empty or "aoi" not in u.columns or metric not in u.columns:
+    if u.empty or "aoi" not in u.columns:
+        return {}
+    u = derive(u)
+    if metric not in u.columns:
         return {}
     g = u[u.aoi == aoi]
     if g.empty:
@@ -220,36 +280,50 @@ def fig(ids, box, vals: dict, title: str, sub: str, fid: str, back: str,
             f'</figcaption>{svg_map(ids, vals, title, box, lo, hi)}</figure>')
 
 
+def _fmt(v, signed: bool = False) -> str:
+    if pd.isna(v):
+        return "n/a"
+    if abs(v) >= 100:
+        return f"{v:+,.0f}" if signed else f"{v:,.0f}"
+    return f"{v:+.3f}" if signed else f"{v:.3f}"
+
+
 def _slug(*parts) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "-", "-".join(str(p) for p in parts)).strip("-")
 
 
-def map_section(runs, poly_dir: Path, metric: str, lo: float, hi: float,
-                ref: str | None, diff_scale: float, trim: bool, k: float) -> str:
-    """Per-district skill for every run, plus difference maps against `ref`.
+def map_section(runs, poly_dir: Path, metrics, ref: str | None,
+                trim: bool, k: float, crs: str | None = None,
+                scale: float | None = None,
+                diff_scale: float | None = None) -> str:
+    """Per-district maps for every metric and run, plus differences vs `ref`.
 
-    Both the absolute and the difference map for one AOI reference the same
-    geometry, emitted once into a hidden <defs>, so adding runs costs fills
-    rather than coordinates.
+    AOI-major, with the metrics nested inside: the geometry is emitted ONCE per
+    AOI into a hidden <defs> and every map of that AOI -- all metrics, all runs,
+    absolute and difference -- references the same paths. Looping metric-major
+    would re-serialise 2000-odd district outlines per metric.
     """
     aois = sorted({a for r in runs for a in
-                   (r["unit"].aoi.unique() if not r["unit"].empty
+                   (derive(r["unit"]).aoi.unique() if not r["unit"].empty
                     and "aoi" in r["unit"].columns else [])})
     if not aois:
         return '<p class="na">no per-unit metrics in these runs</p>'
 
     blocks = []
     for aoi in aois:
-        have = [(r, unit_values(r, aoi, metric)) for r in runs]
-        have = [(r, v) for r, v in have if v]
-        if not have:
+        per_metric = {m: [(r, v) for r, v in
+                          ((r, unit_values(r, aoi, m)) for r in runs) if v]
+                      for m in metrics}
+        per_metric = {m: h for m, h in per_metric.items() if h}
+        if not per_metric:
             continue
-        polys, err = load_polygons(poly_dir, aoi)
+        drawn_ids = {a for h in per_metric.values() for _, v in h for a in v}
+        polys, err = load_polygons(poly_dir, aoi, crs=crs, keep=drawn_ids)
         if polys is None:
             blocks.append(f'<h3>{html.escape(aoi)}</h3>'
                           f'<p class="na">{html.escape(err)}</p>')
             continue
-        drawn = polys[polys.adm_id.isin({a for _, v in have for a in v})]
+        drawn = polys[polys.adm_id.isin(drawn_ids)]
         if drawn.empty:
             blocks.append(
                 f'<h3>{html.escape(aoi)}</h3><p class="na">no district id in '
@@ -258,42 +332,68 @@ def map_section(runs, poly_dir: Path, metric: str, lo: float, hi: float,
         defs, ids, box, outside = path_defs(drawn, aoi, trim=trim, k=k)
         back = f"maps-{_slug(aoi)}"
 
-        figs = []
-        for r, vals in have:
-            s = pd.Series(vals, dtype=float)
-            figs.append(fig(ids, box, vals, r["label"],
-                            f"median {s.median():+.3f} · {len(vals)} districts",
-                            _slug("m", aoi, r["name"]), back, lo, hi))
-        absolute = "".join(x for x in figs if x)
+        notes = [f"{len(drawn)} districts"]
+        if outside:
+            notes.append(f"{outside} outside view")
+        body = [f'<h3 id="{back}">{html.escape(aoi)} '
+                f'<span class="dim">&middot; {" &middot; ".join(notes)}</span>'
+                f'</h3>{defs}']
 
-        diffs = []
-        refrun = next((r for r, _ in have if r["label"] == ref), None)
-        if refrun is not None and len(have) > 1:
-            base = unit_values(refrun, aoi, metric)
+        for m, have in per_metric.items():
+            allv = [x for _, v in have for x in v.values()]
+            lo, hi, label = metric_scale(m, allv)
+            if scale is not None and METRIC_KINDS.get(m, ("", "", ""))[0] == "diverging":
+                lo, hi = -scale, scale
+            body.append(f'<h4 class="tight"><span class="mono">{html.escape(m)}'
+                        f'</span> &mdash; {html.escape(label)}</h4>')
+            body.append(map_legend(lo, hi, f"{label} · blue is better",
+                                   _slug("lg", aoi, m)))
+            figs = []
+            for r, vals in have:
+                sv = pd.Series(vals, dtype=float)
+                figs.append(fig(ids, box, vals, r["label"],
+                                f"median {_fmt(sv.median())} · {len(vals)} districts",
+                                _slug("m", aoi, m, r["name"]), back, lo, hi))
+            body.append(f'<div class="grid maps">{"".join(x for x in figs if x)}</div>')
+
+            refrun = next((r for r, _ in have if r["label"] == ref), None)
+            if refrun is None or len(have) < 2:
+                continue
+            base = unit_values(refrun, aoi, m)
+            dvs = {}
             for r, vals in have:
                 if r["label"] == ref:
                     continue
                 dv = {a: vals[a] - base[a] for a in vals if a in base}
-                if not dv:
-                    continue
-                s = pd.Series(dv, dtype=float)
-                better = 100.0 * (s > 0).mean()
-                diffs.append(fig(
+                if dv:
+                    dvs[r["name"]] = (r, dv)
+            if not dvs:
+                continue
+            dlo, dhi, _ = metric_scale(
+                m, [x for _, d in dvs.values() for x in d.values()], diff=True)
+            if diff_scale is not None and METRIC_KINDS.get(m, ("", "", ""))[0] == "diverging":
+                good = METRIC_KINDS.get(m, ("", "up", ""))[1]
+                dlo, dhi = ((diff_scale, -diff_scale) if good == "down"
+                            else (-diff_scale, diff_scale))
+            dfigs = []
+            for name, (r, dv) in dvs.items():
+                sv = pd.Series(dv, dtype=float)
+                good = METRIC_KINDS.get(m, ("", "up", ""))[1]
+                better = 100.0 * ((sv < 0) if good == "down" else (sv > 0)).mean()
+                dfigs.append(fig(
                     ids, box, dv, f"{r['label']}  −  {ref}",
-                    f"median {s.median():+.3f} · {better:.0f}% of districts better",
-                    _slug("d", aoi, r["name"]), back, -diff_scale, diff_scale))
-
-        notes = [f"{len(drawn)} districts"]
-        if outside:
-            notes.append(f"{outside} outside view")
-        blocks.append(
-            f'<h3 id="{back}">{html.escape(aoi)} '
-            f'<span class="dim">&middot; {" &middot; ".join(notes)}</span></h3>'
-            f'{defs}<div class="grid maps">{absolute}</div>'
-            + (f'<h4 class="tight">difference against <span class="mono">'
-               f'{html.escape(ref)}</span></h4>'
-               f'{map_legend(-diff_scale, diff_scale, "blue = this run beats the reference district by district", _slug("lgd", aoi))}'
-               f'<div class="grid maps">{"".join(diffs)}</div>' if diffs else ""))
+                    f"median {_fmt(sv.median(), signed=True)} · "
+                    f"{better:.0f}% of districts better",
+                    _slug("d", aoi, m, name), back, dlo, dhi))
+            body.append(f'<h4 class="tight">difference in <span class="mono">'
+                        f'{html.escape(m)}</span> against <span class="mono">'
+                        f'{html.escape(ref)}</span></h4>')
+            body.append(map_legend(dlo, dhi,
+                                   "blue = this run beats the reference district "
+                                   "by district", _slug("lgd", aoi, m)))
+            body.append(f'<div class="grid maps">'
+                        f'{"".join(x for x in dfigs if x)}</div>')
+        blocks.append("".join(body))
     return "".join(blocks) or '<p class="na">nothing mappable</p>'
 
 
@@ -326,9 +426,13 @@ def main(argv=None):
     p.add_argument("--runs", default=None,
                    help="comma-separated run directory names or globs "
                         "(e.g. 'era5_*,dcpp-ens_*'); default: all")
+    p.add_argument("--metrics", default=None,
+                   help="comma-separated per-district quantities to map. "
+                        f"Available: {', '.join(METRIC_KINDS)}. Default "
+                        "skill,rmse_pct,rmse for a regression run, acc for "
+                        "a direction run")
     p.add_argument("--metric", default=None,
-                   help="per-district quantity to map; default skill "
-                        "(regression) or acc (direction)")
+                   help="single-metric alias for --metrics")
     p.add_argument("--reference", default=None,
                    help="run label or directory name to difference against; "
                         "default: the oldest run")
@@ -340,7 +444,17 @@ def main(argv=None):
     p.add_argument("--no-maps", action="store_true")
     p.add_argument("--map-full-extent", action="store_true")
     p.add_argument("--map-trim-k", type=float, default=6.0)
-    p.add_argument("--out", default=None)
+    p.add_argument("--map-crs", default=None,
+                   help="override the per-AOI fitted Albers projection, e.g. "
+                        "EPSG:5070 for CONUS or EPSG:3035 for Europe")
+    p.add_argument("--out", default=None,
+                   help="default {dir}/yield_experiments.html, i.e. beside the runs")
+    p.add_argument("--map-min", type=int, default=620,
+                   help="minimum width in px of each map/chart cell. Bigger means "
+                        "fewer per row and larger figures (default 620: two per "
+                        "row on a wide screen). 900+ gives one per row")
+    p.add_argument("--page-width", type=int, default=1560,
+                   help="max page width in px (default 1560)")
     p.add_argument("--title", default="Yield experiments — skill and geography")
     a = p.parse_args(argv)
 
@@ -358,7 +472,15 @@ def main(argv=None):
         print(f"note: mixing targets {sorted(targets)} -- the metric columns "
               f"differ, so the tables are split by target")
     is_dir = targets == {"direction"}
-    metric = a.metric or ("acc" if is_dir else "skill")
+    want = a.metrics or a.metric
+    if want:
+        metrics = [x.strip() for x in want.split(",") if x.strip()]
+        bad = [m for m in metrics if m not in METRIC_KINDS]
+        if bad:
+            raise SystemExit(f"unknown --metrics {bad}; "
+                             f"choose from {list(METRIC_KINDS)}")
+    else:
+        metrics = ["acc"] if is_dir else ["skill", "rmse_pct", "rmse"]
 
     ref = a.reference
     if ref is not None:
@@ -412,7 +534,8 @@ def main(argv=None):
              'that is good on average but swings between folds is carried by a few '
              'years &mdash; with ~20 years that is worth knowing before quoting the '
              'average.</p>')
-    B.append(year_charts(runs, "skill", "skill", (-1, 1)))
+    B.append(year_charts(runs, "skill", "skill", (-1, 1),
+                         w=max(a.map_min + 140, 700), h=330))
 
     if not is_dir:
         B.append('<h2>4 &middot; Predicted vs observed amplitude</h2>')
@@ -450,18 +573,31 @@ def main(argv=None):
         B.append('<p class="na">Pass <span class="mono">--polygons '
                  '/path/to/cy-bench/polygons</span> for the maps.</p>')
     else:
-        B.append(f'<p class="sub">Each district shaded by its own '
-                 f'<span class="mono">{html.escape(metric)}</span> across the '
-                 f'held-out years. <b>Click a caption to expand a map</b>; hover a '
-                 f'district for its value. The second block differences each run '
+        B.append(f'<p class="sub">Each district shaded by its own value across '
+                 f'the held-out years, one block per metric: '
+                 f'<span class="mono">{html.escape(", ".join(metrics))}</span>. '
+                 f'<b>Click a caption to expand a map</b>; hover a district for its '
+                 f'value. After each metric, the same quantity is differenced '
                  f'against <span class="mono">{html.escape(ref)}</span> district by '
-                 f'district &mdash; that is the spatial comparison: blue where this '
-                 f'configuration beats the reference, red where it loses. '
-                 f'Equal-area projection (EPSG:6933).</p>')
-        B.append(map_legend(-a.scale, a.scale,
-                            f"per-district {metric}", "lgabs"))
-        B.append(map_section(runs, poly_dir, metric, -a.scale, a.scale, ref,
-                             a.diff_scale, not a.map_full_extent, a.map_trim_k))
+                 f'district &mdash; that is the spatial comparison. '
+                 f'<b>Blue is always better</b>, including for RMSE, where the '
+                 f'scale is reversed so low error reads blue. Albers equal-area '
+                 f'projection fitted to each AOI; colour ranges are the 5th&ndash;'
+                 f'95th percentile across runs, so maps of one metric are '
+                 f'comparable with each other.</p>')
+        B.append('<div class="note"><b>On RMSE maps.</b> Raw '
+                 '<span class="mono">rmse</span> is dominated by yield LEVEL: a '
+                 '10 t/ha county out-errors a 2 t/ha one whatever the model does, '
+                 'so the map largely redraws the yield map. '
+                 '<span class="mono">rmse_pct</span> divides by each district\'s own '
+                 'mean and is the one to compare across the panel; '
+                 '<span class="mono">skill</span> divides by that district\'s '
+                 'climatology error and is the one that says whether the model '
+                 'helped at all.</div>')
+        B.append(map_section(runs, poly_dir, metrics, ref,
+                             not a.map_full_extent, a.map_trim_k, a.map_crs,
+                             a.scale if a.scale != 1.0 else None,
+                             a.diff_scale if a.diff_scale != 0.3 else None))
 
     B.append('<h2>6 &middot; What the models used</h2>')
     B.append('<p class="sub">Mean over folds. Tree importance is impurity '
@@ -471,17 +607,45 @@ def main(argv=None):
     B.append(importance_table(runs))
 
     out = Path(a.out) if a.out else root / "yield_experiments.html"
+
+    # The figures are the point of this page, so they get the width. Overridden
+    # here rather than in report_dcpp_era5.CSS so the feature-skill report keeps
+    # its own proportions.
+    #
+    # The hover readout is sized in viewBox units, so its on-screen size depends
+    # on how far the SVG is scaled -- a bigger thumbnail needs a SMALLER number
+    # here, and an expanded map smaller still. These are tuned for a
+    # {a.map_min}px cell against the 330-unit viewBox.
+    # rendered_px = font_size_in_viewBox_units * (rendered_width / 330), so
+    # font_size = desired_px * 330 / rendered_width. A collapsed map is drawn at
+    # roughly one cell wide; an expanded one spans the page.
+    lbl = 12.0 * 330.0 / max(a.map_min, 120)
+    lbl_x = 14.0 * 330.0 / max(a.page_width, 400)
+    big = f"""
+h4.tight{{font-size:14px;margin:26px 0 6px;color:var(--mut);font-weight:600}}
+.wrap{{max-width:{a.page_width}px}}
+.grid{{grid-template-columns:repeat(auto-fill,minmax({a.map_min}px,1fr));gap:22px}}
+.maps{{grid-template-columns:repeat(auto-fill,minmax({a.map_min}px,1fr));gap:22px}}
+.maps .fig{{padding:14px 12px 8px}}
+figcaption{{font-size:14px;padding:0 6px 8px}}
+.ylab{{font-size:12.5px}}
+.u .lbl{{font-size:{lbl:.2f}px;stroke-width:{lbl/4.5:.2f}px}}
+.maps .fig:target .u .lbl{{font-size:{lbl_x:.2f}px;stroke-width:{lbl_x/4.5:.2f}px}}
+.maps .fig:target .map{{max-height:88vh}}
+.map{{min-height:0}}
+.maplegend .lg{{width:300px;height:32px}}
+h2{{font-size:20px;margin:48px 0 10px}}
+@media(max-width:760px){{.grid,.maps{{grid-template-columns:1fr}}}}
+"""
     page = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Yield Experiments</title><style>{CSS}
-h4.tight{{font-size:13px;margin:18px 0 4px;color:var(--mut);font-weight:600}}
-</style></head>
+<title>Yield Experiments</title><style>{CSS}{big}</style></head>
 <body><div class="wrap">
 <h1>{html.escape(a.title)}</h1>
 <p class="meta">{len(runs)} run(s) &middot; reference
-<span class="mono">{html.escape(ref)}</span> &middot; mapped metric
-<span class="mono">{html.escape(metric)}</span></p>
+<span class="mono">{html.escape(ref)}</span> &middot; mapped
+<span class="mono">{html.escape(", ".join(metrics))}</span></p>
 {''.join(B)}
 <div class="note"><b>Reading order.</b> Section 2 says which configuration wins
 overall; section 5 says whether it wins everywhere or in one region. A positive
