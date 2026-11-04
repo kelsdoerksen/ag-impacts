@@ -65,6 +65,7 @@ from compare_dcpp_era5 import (
     discover_members,
     era5_dir,
 )
+from era5_features import DEFAULT_SLICE_POLICY, SLICE_POLICIES, lead_tag
 
 # cy-bench spells the crop "maize"; the yield tables and --crop use the US name.
 # Stage 3 tags its filenames with whatever era5_features.py --crop was given.
@@ -161,14 +162,17 @@ def members_for(roots: Roots, aoi: str, member: str) -> list[str]:
 
 
 def season_files(fdir: Path, aoi: str, crop: str, forecast_year: int,
-                 reduce: str = "season") -> tuple[list[Path], str | None]:
-    """Stage-3 parquets for this AOI/crop/lead, and the crop tag that matched.
+                 reduce: str = "season",
+                 slice_policy: str = DEFAULT_SLICE_POLICY
+                 ) -> tuple[list[Path], str | None]:
+    """Stage-3 parquets for this AOI/crop/lead/policy, and the crop tag matched.
 
     The lead token is part of the filename, so an FY1 store cannot be picked up
-    by an FY2 run. 'fixed' is tried last, for a store built with
-    era5_features.py --season SOS:EOS instead of a crop calendar.
+    by an FY2 run, and a newest-run store (fy1n_) cannot be picked up by a
+    fixed-init run at the same lead. 'fixed' is tried last, for a store built
+    with era5_features.py --season SOS:EOS instead of a crop calendar.
     """
-    fy = f"fy{forecast_year}_" if forecast_year else ""
+    fy = lead_tag(forecast_year, slice_policy)
     kind = "blocks" if reduce == "blocks" else "season"
     tags = [crop] + ([CY_CROP_NAMES[crop]] if crop in CY_CROP_NAMES else []) + ["fixed"]
     for tag in tags:
@@ -182,11 +186,12 @@ def season_files(fdir: Path, aoi: str, crop: str, forecast_year: int,
 # ============================== reading the stores ==============================
 
 def _read_store(fdir: Path, aoi: str, crop: str, forecast_year: int,
-                reduce: str, years=None, label: str = "") -> pd.DataFrame:
+                reduce: str, years=None, label: str = "",
+                slice_policy: str = DEFAULT_SLICE_POLICY) -> pd.DataFrame:
     """One source's stage-3 table, concatenated over years."""
-    paths, tag = season_files(fdir, aoi, crop, forecast_year, reduce)
+    paths, tag = season_files(fdir, aoi, crop, forecast_year, reduce, slice_policy)
     if not paths:
-        fy = f"fy{forecast_year}_" if forecast_year else ""
+        fy = lead_tag(forecast_year, slice_policy)
         kind = "blocks" if reduce == "blocks" else "season"
         listing = sorted(p.name for p in (fdir / "features_admin2").glob("*.parquet")) \
             if (fdir / "features_admin2").is_dir() else []
@@ -226,7 +231,9 @@ def feature_columns(df: pd.DataFrame) -> list[str]:
 
 def load_climate(roots: Roots, aoi: str, source: str, crop: str,
                  forecast_year: int, reduce: str = "season",
-                 years=None, verbose: bool = True) -> tuple[pd.DataFrame, list[str], dict]:
+                 years=None, verbose: bool = True,
+                 slice_policy: str = DEFAULT_SLICE_POLICY
+                 ) -> tuple[pd.DataFrame, list[str], dict]:
     """Climate features for one AOI from one source, keyed (adm2_id, harvest_year).
 
     For 'dcpp:ens' every member is read and the feature columns are averaged on
@@ -238,6 +245,7 @@ def load_climate(roots: Roots, aoi: str, source: str, crop: str,
     kind, member = parse_source(source)
     if kind == "era5":
         fdir = features_dir(roots, aoi, kind, "")
+        # The ERA5 side is observed (fy=0), so no policy applies to it.
         df = _read_store(fdir, aoi, crop, forecast_year, reduce, years, "ERA5")
         feats = feature_columns(df)
         info = {"source": "era5", "members": [], "n_members": 0, "dir": str(fdir)}
@@ -250,7 +258,8 @@ def load_climate(roots: Roots, aoi: str, source: str, crop: str,
     frames = []
     for mem in mems:
         fdir = features_dir(roots, aoi, kind, mem)
-        d = _read_store(fdir, aoi, crop, forecast_year, reduce, years, mem)
+        d = _read_store(fdir, aoi, crop, forecast_year, reduce, years, mem,
+                        slice_policy)
         frames.append(d.assign(_member=mem))
     both = pd.concat(frames, ignore_index=True)
     feats = [c for c in feature_columns(both) if c != "_member"]
@@ -272,9 +281,11 @@ def load_climate(roots: Roots, aoi: str, source: str, crop: str,
                   f"{len(mems)} member(s) before averaging")
 
     info = {"source": f"dcpp:{member}", "members": mems, "n_members": len(mems),
+            "slice_policy": slice_policy,
             "dir": str(features_dir(roots, aoi, kind, mems[0]))}
     if verbose:
-        print(f"  [{aoi}] dcpp fy{forecast_year} ({len(mems)} member(s)"
+        print(f"  [{aoi}] dcpp {lead_tag(forecast_year, slice_policy).rstrip('_')} "
+              f"({len(mems)} member(s)"
               f"{': mean' if len(mems) > 1 else f': {mems[0]}'}): {len(out):,} rows, "
               f"{len(feats)} feature(s), harvest years "
               f"{out.harvest_year.min()}-{out.harvest_year.max()}")
@@ -417,14 +428,15 @@ def build_aoi(roots: Roots, aoi: str, source: str, crop: str, forecast_year: int
               reduce: str = "season", years=None, covariates=(),
               phenology_lag: int = 1, n_yield_lags: int = 3,
               phenology_suffix: str | None = None, ref_lags=(),
-              verbose: bool = True) -> tuple[pd.DataFrame, list[str], dict]:
+              verbose: bool = True, slice_policy: str = DEFAULT_SLICE_POLICY
+              ) -> tuple[pd.DataFrame, list[str], dict]:
     """One AOI's design matrix: climate + yield + requested covariates.
 
     `ref_lags` additionally attaches yref{k} columns for the direction target.
     They are returned on the frame but never in the feature list.
     """
     clim, feats, info = load_climate(roots, aoi, source, crop, forecast_year,
-                                     reduce, years, verbose)
+                                     reduce, years, verbose, slice_policy)
     y = load_yield(roots, aoi, crop)
 
     keep = ["adm2_id", "harvest_year"] + \
@@ -489,7 +501,8 @@ def build(roots: Roots, aois, source: str, crop: str, forecast_year: int,
           reduce: str = "season", years=None, covariates=(),
           phenology_lag: int = 1, n_yield_lags: int = 3,
           phenology_suffix: str | None = None, ref_lags=(),
-          verbose: bool = True) -> tuple[pd.DataFrame, list[str], list[dict]]:
+          verbose: bool = True, slice_policy: str = DEFAULT_SLICE_POLICY
+          ) -> tuple[pd.DataFrame, list[str], list[dict]]:
     """Several AOIs stacked into one frame with an `aoi` column.
 
     The feature set is intersected across AOIs, not unioned. A union would
@@ -500,7 +513,7 @@ def build(roots: Roots, aois, source: str, crop: str, forecast_year: int,
     for aoi in aois:
         df, cols, info = build_aoi(roots, aoi, source, crop, forecast_year, reduce,
                                    years, covariates, phenology_lag, n_yield_lags,
-                                   phenology_suffix, ref_lags, verbose)
+                                   phenology_suffix, ref_lags, verbose, slice_policy)
         frames.append(df)
         colsets.append(cols)
         infos.append(info)

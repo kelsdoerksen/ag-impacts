@@ -44,7 +44,7 @@ Rscript R/dcpp-pixel-store.R --aoi=CONUS --forecast-year=1 1982-2018
 
 | script | functionality |
 |---|---|
-| `python/era5_features.py` | **Stages 2 and 3 for both sources.** Stage 2 computes per-pixel daily features; stage 3 takes the cropland-area-weighted admin-2 mean, optionally accumulated over a crop-calendar season (`--reduce season`) or season-relative blocks (`--reduce blocks`). `--source` selects the climate tree; `--forecast-year` the lead time. `--list-features` shows the registry. |
+| `python/era5_features.py` | **Stages 2 and 3 for both sources.** Stage 2 computes per-pixel daily features; stage 3 takes the cropland-area-weighted admin-2 mean, optionally accumulated over a crop-calendar season (`--reduce season`) or season-relative blocks (`--reduce blocks`). `--source` selects the climate tree; `--forecast-year` the lead time; `--slice-policy` how a season spanning more than one 12-month slice is stitched together (see [docs/dcpp-forecast-arms.md](docs/dcpp-forecast-arms.md)). `--list-features` shows the registry. |
 | `python/degree_days.py` | The single-sine degree-day integral, shared by `era5_features.py` and `data_loader.py` so the feature definition cannot differ between the two. |
 | `python/run_cybench_era5.py` | Driver: runs stages 1 and 2 over many AOIs in sequence, deriving each AOI's year span from its cy-bench crop coverage. Dry-run by default; resumable; logs per AOI. |
 | `python/compare_dcpp_era5.py` | **Checks the hindcast against the reanalysis.** Drives `era5_features.py` for ERA5 and for each EC-Earth3 member, joins the two on `(adm2_id, harvest_year)`, and reports how well each member -- and the ensemble mean -- reproduces the ERA5 feature. `r_anom` (each unit's own mean removed from both sides) is the interannual skill; `r_pooled` is reported beside it but is inflated by between-unit climatology. Writes csv + json + every paired value. Members auto-discover from the DCPP tree; dry-run by default. |
@@ -58,6 +58,10 @@ python python/era5_features.py --aoi=US --years=2000-2023 --stage=aggregate \
 # DCPP fy1 vs ERA5: plan and the exact commands first, then run
 python python/compare_dcpp_era5.py --aois ZM --harvest-years 2002-2022
 python python/compare_dcpp_era5.py --aois ZM --harvest-years 2002-2022 --go
+
+# the FY1 arm with the season maximally at lead 1 (AR, ET, Brazil's RS need it)
+python python/compare_dcpp_era5.py --aois AR,ET --forecast-years 1 \
+    --slice-policy newest-run --harvest-years 2002-2022 --go
 python python/report_dcpp_era5.py --dir /mnt/crl_storage/personal_folders/kdoerksen/comparisons \
     --polygons /mnt/crl_storage/personal_folders/kdoerksen/cy-bench/polygons
 ```

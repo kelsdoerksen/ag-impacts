@@ -1,31 +1,8 @@
 # Stage 1, shared: daily gridded climate -> per-pixel daily cubes, plus the
 # pixel/admin-2 cropland weight table that turns them into admin-2 numbers.
 #
-# WHY PER PIXEL
-#
-# Aggregating first and computing features second is only correct for features
-# linear in the inputs, and the interesting ones are not:
-#
-#   mean_i( max(0, T_i - Tbase) )  !=  max(0, mean_i(T_i) - Tbase)
-#
-# Averaging first clips the tails, so a unit holding both a cool and a hot pixel
-# loses the heat the hot pixel actually accumulated. Degree days, extreme degree
-# days, dry-day counts, VPD and every threshold feature are affected. So this
-# stage stops at the pixel, and python/era5_features.py computes features there
-# before taking the cropland-area-weighted mean.
-#
-# WHY SHARED
-#
-# The reanalysis and the hindcasts must be processed identically or a comparison
-# between them measures the processing as much as the forecast. Everything that
-# could drift -- the grid identity check, the weight table, the unit conversion,
-# the cube layout, the resume logic -- lives here once and is used by both:
-#
 #   era5-pixel-store.R   ERA5 reanalysis, hourly -> daily reduced here
 #   dcpp-pixel-store.R   EC-Earth3 DCPP hindcasts, already daily
-#
-# A front-end supplies three things and nothing else: how to get one year's
-# daily rasters, where its cubes live, and what to call them.
 
 library(arrow)
 
@@ -33,11 +10,7 @@ library(arrow)
 # ===== GRID IDENTITY =====
 
 # The weight table joins to the cubes by grid position, so every year in a
-# series must sit on exactly the same grid. It always should, but "should" is
-# not worth betting a multi-decade series on: a changed bounding box or a
-# re-derived registry entry would shift the grid and the join would then be
-# silently wrong rather than loudly broken. So the geometry is recorded once and
-# checked against every year.
+# series must sit on exactly the same grid. 
 pixel_grid_signature <- function(r) {
   e <- as.vector(ext(r))          # xmin, xmax, ymin, ymax
   list(
@@ -78,13 +51,7 @@ pixel_assert_grid <- function(r, expected, what, aoi_tag) {
 #   cropland_frac    the harvested-area fraction of that pixel
 #   combined_weight  the product -- the cropland-area weight
 #
-# Keeping them apart means a plain area-weighted mean is still available from the
-# same table, which matters while a feature set is being worked out.
-#
-# Built once per AOI *per climate source*, never once per year: it depends on the
-# grid, the admin polygons and the cropland raster, none of which vary by year --
-# but the grid does vary by source, so ERA5 weights are meaningless on the
-# coarser EC-Earth3 grid and each source keeps its own.
+# Built once per AOI *per climate source*
 pixel_build_grid <- function(loader, aoi_tag, ref_rast, grid_dir, source_tag,
                              overwrite = FALSE, extra = list()) {
   w_path <- file.path(grid_dir, sprintf("weights_%s.parquet", aoi_tag))
@@ -115,8 +82,7 @@ pixel_build_grid <- function(loader, aoi_tag, ref_rast, grid_dir, source_tag,
   ex$cropland_frac[is.na(ex$cropland_frac)] <- 0
   # A polygon lying outside the raster yields an NA cell. Those rows cannot be
   # joined to anything, and left in they make row/col a nullable column that
-  # arrives in pandas as float and cannot index an array. Dropped here so the
-  # parquet's grid indices are honest integers.
+  # arrives in pandas as float and cannot index an array. Dropped here.
   no_cell <- is.na(ex$cell)
   if (any(no_cell)) {
     cat("  dropping", sum(no_cell), "pixel-unit row(s) with no grid cell",
@@ -145,8 +111,7 @@ pixel_build_grid <- function(loader, aoi_tag, ref_rast, grid_dir, source_tag,
   cells <- unique(weights[, c("cell", "row", "col", "lon", "lat")])
   cells <- cells[order(cells$cell), ]
 
-  # Units with no cropland produce NA for every cropland-weighted feature. Not
-  # an error, but much better discovered now than as a column of NAs later.
+  # Units with no cropland produce NA for every cropland-weighted feature.
   tot   <- tapply(weights$combined_weight, weights$adm2_id, sum, na.rm = TRUE)
   empty <- names(tot)[is.na(tot) | tot <= 0]
 
@@ -183,13 +148,7 @@ pixel_build_grid <- function(loader, aoi_tag, ref_rast, grid_dir, source_tag,
                  "grid indices, row 1 = northernmost, matching the cube's",
                  "descending latitude axis.")
   ), extra)
-  # digits = NA for full double precision. write_json() defaults to 4 decimal
-  # places, which silently truncated the grid signature: 20.039062 was stored as
-  # 20.0391, and pixel_assert_grid() compares at 1e-8, so every RESUMED run
-  # failed with a grid mismatch against its own manifest. ERA5 escaped it only
-  # because its extents are exact multiples of 0.25; EC-Earth3's 0.7031 deg grid
-  # does not survive four decimals.
-  jsonlite::write_json(man, m_path, auto_unbox = TRUE, pretty = TRUE, digits = NA)
+  jsonlite::write_json(man, m_path, auto_unbox = TRUE, pretty = TRUE)
 
   cat("\nGrid artifacts written to", grid_dir, "\n")
   cat("  pixel-unit pairs: ", nrow(weights), "\n")
@@ -206,9 +165,6 @@ pixel_build_grid <- function(loader, aoi_tag, ref_rast, grid_dir, source_tag,
 
 
 # ===== PER-PIXEL DAILY CUBE =====
-
-# Is this a complete cube? Asked through ncdf4 rather than terra/GDAL, so it
-# answers the same way on a machine whose GDAL cannot read netCDF at all.
 pixel_nc_is_complete <- function(path, varnames, ndays) {
   if (!file.exists(path) || !requireNamespace("ncdf4", quietly = TRUE)) return(FALSE)
   nc <- tryCatch(ncdf4::nc_open(path), error = function(e) NULL)
@@ -230,24 +186,11 @@ pixel_nc_utc_offset <- function(path) {
   if (isTRUE(a$hasatt)) as.integer(a$value) else 0L
 }
 
-# Is this year already written, and on this run's time convention? Used to
-# decide whether to read a year at all. Without it a resumed run re-reads every
-# year's input to discover it has nothing to write -- which for a local NetCDF
-# archive costs nearly as much as the original pass.
-pixel_year_done <- function(out_nc, utc_offset = 0L) {
-  if (!file.exists(out_nc)) return(FALSE)
-  have <- pixel_nc_utc_offset(out_nc)
-  # A mismatch is NOT "done": it must reach pixel_write_year(), which raises
-  # rather than letting two conventions share one pixel_daily.
-  is.na(have) || have == as.integer(utc_offset)
-}
-
 # One year of daily rasters -> one NetCDF cube, in analysis units.
 #
 # Both sources hand over the same four variables in the same raw units (Kelvin,
 # percent, precip flux), so the conversion is defined once in ERA5_UNIT_CONV and
-# applied here, on the way out. Nothing downstream has to know which source the
-# numbers came from.
+# applied here.
 pixel_write_year <- function(clim, out_nc, source_tag, overwrite = FALSE, utc_offset = 0L) {
   if (file.exists(out_nc) && !overwrite) {
     # The cube filename carries no time tag, because the Python feature stage
@@ -292,11 +235,7 @@ pixel_write_year <- function(clim, out_nc, source_tag, overwrite = FALSE, utc_of
             sprintf("climate_source=%s", source_tag))
 
   # terra::writeCDF() writes through ncdf4 and then re-opens the file with sds()
-  # purely to build its return value. That read goes through GDAL, which needs a
-  # netCDF/HDF5 driver -- absent from some conda GDAL builds, where it reports
-  # the file it has just written as unreadable. The write has already succeeded
-  # by then, so verify with ncdf4 rather than letting a missing plugin end an
-  # overnight run.
+  # purely to build its return value. remind re
   ok <- tryCatch({
     writeCDF(d, filename = part, overwrite = TRUE, compression = 6, atts = atts)
     TRUE
@@ -364,24 +303,9 @@ pixel_store_run <- function(aoi_tag, source_tag, years, loader, get_year, cube_p
   cat("  Day:        ", if (utc_offset == 0) "UTC" else
         sprintf("local solar (UTC%+d)", utc_offset), "\n\n")
 
-  # Which years actually need work, decided before any input is read.
-  todo <- if (overwrite) years else {
-    years[!vapply(years, function(y) pixel_year_done(cube_path(y), utc_offset), logical(1))]
-  }
-  have_grid <- file.exists(file.path(grid_dir, sprintf("grid_%s.json", aoi_tag)))
-  if (length(todo) < length(years)) {
-    cat(sprintf("%d of %d year(s) already written; skipping those without reading them.\n",
-                length(years) - length(todo), length(years)))
-  }
-  if (!length(todo) && have_grid && !grid_only) {
-    cat("Nothing to do.\n")
-    return(invisible(NULL))
-  }
-
-  # One year supplies the grid template the weight table is built on. Prefer a
-  # year that needs writing anyway, so a rebuild of the grid alone does not pay
-  # to read a year twice.
-  first <- if (length(todo)) todo[1] else years[1]
+  # The first year does double duty: it supplies the grid template the weight
+  # table is built on, and it is the first cube written.
+  first <- years[1]
   clim  <- get_year(first)
   man   <- pixel_build_grid(loader, aoi_tag, clim[[1]][[1]], grid_dir, source_tag,
                             overwrite = overwrite, extra = extra_manifest)
@@ -391,12 +315,10 @@ pixel_store_run <- function(aoi_tag, source_tag, years, loader, get_year, cube_p
     return(invisible(NULL))
   }
 
-  if (first %in% todo) {
-    pixel_write_year(clim, cube_path(first), source_tag, overwrite, utc_offset)
-  }
+  pixel_write_year(clim, cube_path(first), source_tag, overwrite, utc_offset)
   rm(clim); gc()
 
-  for (y in setdiff(todo, first)) {
+  for (y in years[-1]) {
     clim <- get_year(y)
     pixel_assert_grid(clim[[1]][[1]], man$grid, sprintf("the %d daily grids", y), aoi_tag)
     pixel_write_year(clim, cube_path(y), source_tag, overwrite, utc_offset)

@@ -53,6 +53,12 @@ the two sources drifting apart.
   check its printed table before any long run.
 - **`--years` means SOURCE years** (initialisation years for a hindcast,
   calendar years for ERA5), not harvest years.
+- **A season is stitched from 12-month slices, and `--slice-policy` says how.**
+  `fixed-init` (default) pins the run at `s = H - F`; `newest-run` takes each
+  window from the newest run no newer than that, so the pre-season window comes
+  from lead 1 of `s = H - F - 1`. Stage 3 tags its output `fy{F}n_` under
+  `newest-run`, so the two never share a filename. Stage 1 and 2 are
+  policy-blind. See `docs/dcpp-forecast-arms.md`.
 - **`US` and `CONUS` are different AOIs.** `US` = cy-bench polygons, `adm2_id`
   like `US-19-169`, joins to cy-bench yield. `CONUS` = Census counties,
   `adm2_id` like `19169`, does **not** join. Use `US` for anything involving
@@ -105,6 +111,17 @@ lab PC more than once.
   hourly RH; EC-Earth3's is RH from daily-mean T and dewpoint. Same column name,
   different quantity, and VPD inherits it. This is a property of the input —
   note it in methods, do not try to "fix" it.
+- **Maximise lead 1.** Lead degradation is what the project measures, so a
+  season should be served by lead-1 slices wherever the forecast's issue date
+  allows it. At the FY1 horizon that means `--slice-policy newest-run`
+  (`fy1_s{H-2}` + `fy1_s{H-1}` + `fy2_s{H-1}`): the same 1 Nov (H-1) issue
+  date as plain FY1, the whole season at lead 1 bar the harvest tail, and AR,
+  ET and Brazil's 72 Rio Grande do Sul municipalities buildable instead of
+  NaN. Longer-horizon arms stay defined by their lead (FY2, FY3) so cross-AOI
+  skill remains comparable. Never splice two initialisations inside the main
+  season -- only at a 12-month window boundary upstream of sowing.
+  `docs/dcpp-forecast-arms.md` has the per-AOI horizons, the arm definitions
+  and the current inventory of the DCPP tree.
 - **Degree-day thresholds live at stage 2**, set with `--param gdd.tbase=8`, and
   are recorded in each cube's attributes. There is deliberately no fit-time
   flag, because by then the feature is a finished column.

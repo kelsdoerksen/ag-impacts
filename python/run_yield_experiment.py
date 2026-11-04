@@ -73,6 +73,7 @@ import pandas as pd
 
 from data_loader import CountyBaseline
 from models import CLASSIFIERS, REGRESSORS, SUPPORTED_MODELS, YieldModel
+from era5_features import DEFAULT_SLICE_POLICY, SLICE_POLICIES, lead_tag
 from yield_features import COVARIATES, DEFAULT_SHARE, Roots, build, parse_source
 
 # A fold with a handful of rows produces a correlation that is mostly noise.
@@ -462,6 +463,12 @@ def main(argv=None):
                    help="era5 | dcpp:<member> | dcpp:ens")
     g.add_argument("--forecast-year", type=int, default=None,
                    help="DCPP lead time; default 0 for era5, 1 for dcpp")
+    g.add_argument("--slice-policy", choices=list(SLICE_POLICIES),
+                   default=DEFAULT_SLICE_POLICY,
+                   help="which stage-3 DCPP store to read: fixed-init (fy{F}_) or "
+                        "newest-run (fy{F}n_, the season assembled from the newest "
+                        "run no newer than s = H - F, so more of it sits at lead 1). "
+                        "Build the store with era5_features.py --slice-policy first.")
     g.add_argument("--crop", default="corn")
     g.add_argument("--reduce", choices=["season", "blocks"], default="season",
                    help="whole-season aggregates, or season-relative windows")
@@ -531,6 +538,9 @@ def main(argv=None):
         raise SystemExit("ERA5 is observed: --forecast-year must be 0")
     if kind == "dcpp" and a.forecast_year < 1:
         raise SystemExit("a hindcast needs --forecast-year >= 1")
+    if kind == "era5" and a.slice_policy != DEFAULT_SLICE_POLICY:
+        raise SystemExit("--slice-policy applies to a hindcast only; ERA5 is "
+                         "observed and has no initialisation")
 
     allowed = CLASSIFIERS if a.target == "direction" else REGRESSORS
     if a.model not in allowed:
@@ -574,7 +584,9 @@ def main(argv=None):
         tgt = (f"dir-lag{'-'.join(str(k) for k in tlags)}"
                f"-b{a.flat_band:g}".replace(".", "p"))
     run_id = "_".join(filter(None, [
-        a.source.replace(":", "-"), f"fy{a.forecast_year}", a.model, tgt,
+        a.source.replace(":", "-"),
+        lead_tag(a.forecast_year, a.slice_policy).rstrip("_") or "fy0",
+        a.model, tgt,
         scope_tag, split, "-".join(aois) if len(aois) <= 4 else f"{len(aois)}aois",
         a.tag, stamp]))
     run_dir = out_root / run_id
@@ -584,7 +596,8 @@ def main(argv=None):
     print("=" * 78)
     print(f"  AOIs          : {', '.join(aois)}"
           f"{'  (pooled into one model)' if a.combine else '  (one model each)'}")
-    print(f"  source        : {a.source}   forecast year {a.forecast_year}")
+    print(f"  source        : {a.source}   forecast year {a.forecast_year}"
+          + (f"   slice policy {a.slice_policy}" if kind == "dcpp" else ""))
     print(f"  features      : {a.reduce}"
           f"{'  + ' + ', '.join(covs) if covs else ''}")
     print(f"  harvest years : {years[0]}-{years[-1]}")
@@ -609,7 +622,7 @@ def main(argv=None):
         df, feats, infos = build(roots, aois, a.source, a.crop, a.forecast_year,
                                  a.reduce, years, covs, a.phenology_lag,
                                  a.yield_lags, a.phenology_suffix,
-                                 ref_lags=tlags)
+                                 ref_lags=tlags, slice_policy=a.slice_policy)
     except (FileNotFoundError, ValueError) as exc:
         raise SystemExit(f"\ncannot assemble the design matrix:\n{exc}")
 
@@ -685,7 +698,8 @@ def main(argv=None):
 
     meta = {"run_id": run_id, "created": stamp, "argv": sys.argv[1:],
             "aois": aois, "combine": bool(a.combine), "source": a.source,
-            "forecast_year": a.forecast_year, "crop": a.crop, "reduce": a.reduce,
+            "forecast_year": a.forecast_year, "slice_policy": a.slice_policy,
+            "crop": a.crop, "reduce": a.reduce,
             "covariates": covs, "model": a.model, "target": a.target,
             "detrend": bool(a.detrend), "seed": a.seed,
             "target_lags": tlags, "flat_band": a.flat_band,

@@ -19,10 +19,22 @@
 #
 # Pass --init-years instead to name initialisation years directly.
 #
+# --slice-policy newest-run shifts that arithmetic. Stage 3 then assembles a
+# season from the newest run no newer than s = H - ARM, so the window BEFORE
+# the main season comes from lead 1 of s = H - ARM - 1. Per lead that means
+#
+#     lead 1      s = (lo - ARM - 1) .. (hi - ARM)      one extra, older run
+#     lead >= 2   s = (lo - ARM)     .. (hi - ARM)
+#
+# with ARM from --arm (default 1). Stage 1 and 2 are policy-blind -- a slice is
+# just (initialisation, lead) and both policies read the same files -- so this
+# flag changes only WHICH years are fetched, never what a file contains.
+#
 #   ./run-dcpp.sh --aois ZM,ET,BF                       # plan only
 #   ./run-dcpp.sh --aois ZM,ET,BF --go
 #   ./run-dcpp.sh --aois ZM --forecast-years 1,2,3,4,5 --go
 #   ./run-dcpp.sh --aois ZM --members r1i4p1f1,r2i4p1f1 --go
+#   ./run-dcpp.sh --aois AR,ET --forecast-years 1,2 --slice-policy newest-run --go
 #
 # Each member gets its own output tree, tagged EC-Earth3_{member}: the cube
 # filename carries no member token, so members sharing a tree would overwrite
@@ -54,9 +66,10 @@ MODEL=EC-Earth3
 
 AOIS=""; MEMBERS=""; TARGET_YEARS="2002-2022"; INIT_YEARS=""
 FORECAST_YEARS="1"; STAGE="both"; GO=0
+SLICE_POLICY="fixed-init"; ARM=1
 FEATURES="gdd,edd,tavg,vpd,pr,hot_days"
 
-usage() { sed -n '2,32p' "${BASH_SOURCE[0]}" | sed -E 's/^# ?//'; exit "${1:-0}"; }
+usage() { sed -n '2,45p' "${BASH_SOURCE[0]}" | sed -E 's/^# ?//'; exit "${1:-0}"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -65,6 +78,8 @@ while [ $# -gt 0 ]; do
     --target-years)   TARGET_YEARS="$2"; shift 2 ;;
     --init-years)     INIT_YEARS="$2"; shift 2 ;;
     --forecast-years) FORECAST_YEARS="$2"; shift 2 ;;
+    --slice-policy)   SLICE_POLICY="$2"; shift 2 ;;
+    --arm)            ARM="$2"; shift 2 ;;
     --features)       FEATURES="$2"; shift 2 ;;
     --stage)          STAGE="$2"; shift 2 ;;
     --go)             GO=1; shift ;;
@@ -73,6 +88,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$AOIS" ] || { echo "--aois is required (e.g. --aois ZM,ET,BF)" >&2; exit 2; }
+case "$SLICE_POLICY" in
+  fixed-init|newest-run) ;;
+  *) echo "--slice-policy must be fixed-init or newest-run (got $SLICE_POLICY)" >&2; exit 2 ;;
+esac
 
 # ── the share ────────────────────────────────────────────────────────────────
 # Mounted is not the same as readable: an SMB share can be present and still
@@ -119,6 +138,14 @@ IFS=',' read -ra FY_LIST   <<< "$FORECAST_YEARS"
 
 init_range_for_fy() {   # target lo-hi, lead -> "lo-hi" of initialisation years
   local lo=${TARGET_YEARS%%-*} hi=${TARGET_YEARS##*-} fy=$1
+  if [ "$SLICE_POLICY" = "newest-run" ]; then
+    # Each window comes from the newest run no newer than s = H - ARM, so lead 1
+    # is wanted for one extra, older initialisation and every longer lead is
+    # pinned to the arm's own run rather than to its own lead.
+    if [ "$fy" -eq 1 ]; then echo "$((lo - ARM - 1))-$((hi - ARM))"
+    else                     echo "$((lo - ARM))-$((hi - ARM))"; fi
+    return
+  fi
   echo "$((lo - fy))-$((hi - fy))"
 }
 
@@ -130,12 +157,15 @@ echo "  output     : $OUT_ROOT/{AOI}_processed_data/${MODEL}_{member}"
 echo "  AOIs       : ${AOI_LIST[*]}"
 echo "  members    : ${MEM_LIST[*]}"
 echo "  lead times : ${FY_LIST[*]}"
+echo "  slice pol. : $SLICE_POLICY$([ "$SLICE_POLICY" = newest-run ] \
+        && echo "   (arm FY$ARM; lead 1 also fetched for s = H-$((ARM + 1)))")"
 echo
 printf '  %-4s %-12s %s\n' FY "init years" "target years"
 total=0
 for fy in "${FY_LIST[@]}"; do
   if [ -n "$INIT_YEARS" ]; then ir=$INIT_YEARS
-                                tl=$(( ${INIT_YEARS%%-*} + fy )); th=$(( ${INIT_YEARS##*-} + fy ))
+                                lab=$fy; [ "$SLICE_POLICY" = newest-run ] && lab=$ARM
+                                tl=$(( ${INIT_YEARS%%-*} + lab )); th=$(( ${INIT_YEARS##*-} + lab ))
   else ir=$(init_range_for_fy "$fy"); tl=${TARGET_YEARS%%-*}; th=${TARGET_YEARS##*-}; fi
   n=$(( ${ir##*-} - ${ir%%-*} + 1 ))
   printf '  %-4s %-12s %s   (%d years)\n' "$fy" "$ir" "$tl-$th" "$n"

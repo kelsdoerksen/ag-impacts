@@ -99,6 +99,34 @@ def find_files(d: Path, pattern: str, aois):
     return nested or sorted(glob.glob(str(d / pattern)))
 
 
+# Written by compare_dcpp_era5.py since the --slice-policy flag existed; absent
+# from anything older, which was all fixed-init by definition.
+DEFAULT_SLICE_POLICY = "fixed-init"
+
+
+def policies_in(df: pd.DataFrame) -> list[str]:
+    if df.empty or "slice_policy" not in df.columns:
+        return [DEFAULT_SLICE_POLICY] if not df.empty else []
+    return sorted(df["slice_policy"].fillna(DEFAULT_SLICE_POLICY).unique())
+
+
+def pick_policy(df: pd.DataFrame, want: str) -> pd.DataFrame:
+    """Keep the rows of one slice policy.
+
+    Two policies at the same lead are two different forecasts of the same
+    harvest year. Every table here pivots on forecast_year with a mean
+    aggregation, so leaving both in would average arm A with arm D and label
+    the result FY1 -- which is why main() refuses to continue without a choice
+    rather than picking one.
+    """
+    if df.empty:
+        return df
+    if "slice_policy" not in df.columns:
+        return df if want == DEFAULT_SLICE_POLICY else df.iloc[0:0]
+    pol = df["slice_policy"].fillna(DEFAULT_SLICE_POLICY)
+    return df[pol == want].copy()
+
+
 def load(d: Path, pattern: str, aois, required=True) -> pd.DataFrame:
     files = find_files(d, pattern, aois)
     if not files:
@@ -907,6 +935,11 @@ def main(argv=None):
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--dir", required=True, help="comparisons root; reads {dir}/{AOI}/")
     p.add_argument("--aois", help="comma-separated AOIs; default: all found")
+    p.add_argument("--slice-policy", default=None,
+                   help="which stage-3 stitching to report when the directory "
+                        "holds both: fixed-init or newest-run. Required only if "
+                        "both are present, since the tables pivot on the lead "
+                        "and would otherwise average the two.")
     p.add_argument("--metric", default="r_anom", choices=SKILL_ORDER,
                    help="headline metric for the skill-vs-lead table")
     p.add_argument("--out", default=None)
@@ -939,8 +972,23 @@ def main(argv=None):
     summ = load(d, "dcpp_era5_corr_*.csv", aois)
     yearly = load(d, "dcpp_era5_year_*.csv", aois, required=False)
     byunit = load(d, "dcpp_era5_unit_*.csv", aois, required=False)
+    pols = policies_in(summ)
+    if a.slice_policy:
+        if a.slice_policy not in pols:
+            raise SystemExit(f"--slice-policy {a.slice_policy} is not in these "
+                             f"tables; they hold {', '.join(pols)}")
+        policy = a.slice_policy
+    elif len(pols) > 1:
+        raise SystemExit(
+            f"{d} holds more than one slice policy ({', '.join(pols)}), and the "
+            f"lead-indexed tables would average them into one FY column.\n"
+            f"  pick one: --slice-policy {pols[0]}")
+    else:
+        policy = pols[0] if pols else DEFAULT_SLICE_POLICY
+    summ, yearly, byunit = (pick_policy(x, policy) for x in (summ, yearly, byunit))
     print(f"summary: {len(summ)} rows, AOIs {sorted(summ.aoi.unique())}, "
-          f"leads {sorted(summ.forecast_year.unique())}")
+          f"leads {sorted(summ.forecast_year.unique())}, "
+          f"slice policy {policy}")
     print(f"per-year: {len(yearly)} rows" if not yearly.empty
           else "per-year: none found (older run; rerun compare to get them)")
     print(f"per-unit: {len(byunit)} rows" if not byunit.empty
@@ -949,7 +997,12 @@ def main(argv=None):
     if a.out:
         out = Path(a.out)
     else:
-        out = d / ("dcpp_skill_report" + (f"_{'-'.join(aois)}" if aois else "") + ".html")
+        # The policy is in the name when it is not the default, so building both
+        # arms into one directory does not have the second overwrite the first.
+        out = d / ("dcpp_skill_report"
+                   + (f"_{'-'.join(aois)}" if aois else "")
+                   + ("" if policy == DEFAULT_SLICE_POLICY else f"_{policy}")
+                   + ".html")
 
     poly_dir = Path(a.polygons) if a.polygons else None
     if poly_dir is None and not a.no_maps:

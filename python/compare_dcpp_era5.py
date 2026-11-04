@@ -55,6 +55,9 @@ sys.path.insert(0, str(HERE))
 
 from era5_features import (  # noqa: E402
     DEFAULT_FEATURES,
+    DEFAULT_SLICE_POLICY,
+    SLICE_POLICIES,
+    lead_tag,
     parse_years,
     season_source_years,
 )
@@ -149,13 +152,16 @@ def discover_leads(dcpp_root: Path, aoi: str, members: list[str]) -> list[int]:
 
 
 def season_parquet(out_dir: Path, aoi: str, crop: str, forecast_year: int,
-                   harvest_year: int, reduce: str, fixed_season: bool) -> Path:
+                   harvest_year: int, reduce: str, fixed_season: bool,
+                   slice_policy: str = DEFAULT_SLICE_POLICY) -> Path:
     """Mirror of the filename stage_aggregate() builds in era5_features.py.
 
     Kept as one function so a change there is a single edit here, and verified
-    by _load_side() which lists the directory when a file is missing.
+    by _load_side() which lists the directory when a file is missing. The lead
+    token comes from era5_features.lead_tag() rather than being spelled again,
+    because it now carries the slice policy as well as the lead.
     """
-    fy_tag = f"fy{forecast_year}_" if forecast_year else ""
+    fy_tag = lead_tag(forecast_year, slice_policy)
     tag = "fixed" if fixed_season else crop
     kind = "blocks" if reduce == "blocks" else "season"
     name = f"features_{aoi}_{tag}_{fy_tag}{kind}_{harvest_year}.parquet"
@@ -175,23 +181,29 @@ DCPP_NOV1, DCPP_OCT31 = 305, 304
 
 
 def calendar_fit(root: Path, crop: str, cy_country: str, season: str | None,
-                 fy: int) -> tuple[str, str]:
-    """(verdict, detail) for this AOI's calendar at lead `fy`.
+                 fy: int, slice_policy: str = DEFAULT_SLICE_POLICY) -> tuple[str, str]:
+    """(verdict, detail) for this AOI's calendar at lead `fy` and this policy.
 
-    Stage 3 assembles a season from consecutive lead slices of ONE
-    initialisation, so a season running past 31 Oct is fine -- it picks up lead
-    fy+1. The one thing no lead can fix is a season that starts before its own
-    initialisation: at fy=1 that needs lead 0, which does not exist. Those AOIs
-    have no valid FY1 and must be run at a longer lead.
+    Under fixed-init, stage 3 assembles a season from consecutive lead slices
+    of ONE initialisation, so a season running past 31 Oct is fine -- it picks
+    up lead fy+1. The one thing no lead can fix is a season that starts before
+    its own initialisation: at fy=1 that needs lead 0, which does not exist, so
+    those AOIs have no valid FY1 and must be run at a longer lead.
+
+    Under newest-run that pre-initialisation window IS available -- as lead 1
+    of the previous run -- so the same calendars that are impossible at FY1
+    become fully coverable, which is the whole reason the policy exists.
 
     verdict is "ok", "needs-next-slice", or "impossible".
     """
+    newest = slice_policy == "newest-run"
     if season:
         sos, eos = (float(x) for x in season.split(":"))
-        if sos > eos and sos < DCPP_NOV1 and fy == 1:
+        if sos > eos and sos < DCPP_NOV1 and fy == 1 and not newest:
             return "impossible", (
                 f"--season {season} starts at DOY {sos:.0f}, before 1 Nov, so at "
-                f"FY1 it would need a lead-0 slice. Run this AOI at FY2 or later.")
+                f"FY1 it would need a lead-0 slice. Run this AOI at FY2 or later, "
+                f"or at FY1 with --slice-policy newest-run.")
         return ("needs-next-slice" if eos > DCPP_OCT31 else "ok"), ""
     path = (root / "cy-bench" / "cybench-data" / crop / cy_country
             / f"crop_calendar_{crop}_{cy_country}.csv")
@@ -205,18 +217,21 @@ def calendar_fit(root: Path, crop: str, cy_country: str, season: str | None,
     late = c.eos > DCPP_OCT31                 # ends after 31 Oct
     # Only refuse when a MAJORITY cannot be covered; stage 3 NaNs a minority of
     # outlier units and reports the count, which must not cost the whole AOI.
-    if fy == 1 and early.mean() > 0.5:
+    if fy == 1 and early.mean() > 0.5 and not newest:
         return "impossible", (
             f"{int(early.sum())} of {len(c)} unit(s) sow before 1 Nov "
             f"(median sos DOY {c.loc[early, 'sos'].median():.0f}), so at FY1 the "
             f"season starts before the initialisation. No lead-0 slice exists. "
-            f"Run this AOI at FY2+, or clamp with --season "
+            f"Run this AOI at FY2+, at FY1 with --slice-policy newest-run, or "
+            f"clamp with --season "
             f"{max(c.sos.quantile(0.10), DCPP_NOV1):.0f}:"
             f"{min(c.eos.quantile(0.90), DCPP_OCT31):.0f}.")
     need = []
     if fy == 1 and early.any():
-        need.append(f"{int(early.sum())}/{len(c)} unit(s) sow before 1 Nov -> "
-                    f"not coverable at FY1, will be NaN")
+        need.append(
+            f"{int(early.sum())}/{len(c)} unit(s) sow before 1 Nov -> "
+            + ("lead 1 of the previous initialisation, s{H-2}" if newest
+               else "not coverable at FY1, will be NaN"))
     if late.any():
         need.append(f"{int(late.sum())} unit(s) harvest after 31 Oct -> lead {fy + 1}")
     if fy > 1 and early.any():
@@ -287,6 +302,10 @@ def build_cmd(a, aoi: str, source: str, out_dir: Path, forecast_year: int,
     ]
     # cy-bench country code: defaults to the AOI tag, except CONUS which is US.
     cmd.append(f"--cy-country={a.cy_country or ('US' if aoi == 'CONUS' else aoi)}")
+    # Only for a hindcast: era5_features.py refuses the flag at forecast year 0,
+    # and the ERA5 side of every comparison is built at 0.
+    if forecast_year and a.slice_policy != DEFAULT_SLICE_POLICY:
+        cmd.append(f"--slice-policy={a.slice_policy}")
     if a.season:
         cmd.append(f"--season={a.season}")
     if a.reduce == "blocks":
@@ -341,10 +360,11 @@ def match_columns(df: pd.DataFrame, feats: list[str], reduce: str) -> list[str]:
 
 
 def _load_side(out_dir: Path, aoi: str, crop: str, fy: int, years: list[int],
-               reduce: str, fixed: bool, label: str) -> pd.DataFrame:
+               reduce: str, fixed: bool, label: str,
+               slice_policy: str = DEFAULT_SLICE_POLICY) -> pd.DataFrame:
     frames, missing = [], []
     for hy in years:
-        p = season_parquet(out_dir, aoi, crop, fy, hy, reduce, fixed)
+        p = season_parquet(out_dir, aoi, crop, fy, hy, reduce, fixed, slice_policy)
         if p.exists():
             frames.append(pd.read_parquet(p))
         else:
@@ -545,7 +565,8 @@ def ensemble_mean(pairs: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-LEAD_COLUMNS = ["aoi", "member", "feature", "forecast_year", "r_anom", "r_time",
+LEAD_COLUMNS = ["aoi", "member", "feature", "forecast_year", "slice_policy",
+                "r_anom", "r_time",
                 "r_acc", "r_space", "r_pooled", "bias", "rmse", "sd_ratio_anom",
                 "n_pairs", "n_units", "n_years"]
 
@@ -616,6 +637,15 @@ def main(argv=None):
                    help="deprecated single-lead alias for --forecast-years")
     p.add_argument("--harvest-years", default="2002-2022",
                    help="HARVEST years to compare (source years are derived)")
+    p.add_argument("--slice-policy", choices=list(SLICE_POLICIES),
+                   default=DEFAULT_SLICE_POLICY,
+                   help="how stage 3 assembles a season from the annual slices. "
+                        "fixed-init: one initialisation, varying lead. newest-run: "
+                        "each 12-month window from the newest run no newer than "
+                        "s = H - FY, so a season sowing before 1 Nov is covered by "
+                        "lead 1 of the previous initialisation instead of being NaN. "
+                        "Applies to the DCPP side only; stage-3 files and the output "
+                        "tables are tagged fy{FY}n_ so the policies never collide.")
     p.add_argument("--share", default=DEFAULT_SHARE,
                    help="base of the lab share; --era5-root/--dcpp-root/--root override")
     p.add_argument("--era5-root", help="default {share}/era5")
@@ -673,7 +703,8 @@ def main(argv=None):
     # derives the harvest years itself, so these only have to be a superset.
     era5_src = sorted({y for h in harvest_years for y in season_source_years(h, 0)})
     def src_for(fy):
-        return sorted({y for h in harvest_years for y in season_source_years(h, fy)})
+        return sorted({y for h in harvest_years
+                       for y in season_source_years(h, fy, a.slice_policy)})
 
     print("=" * 78)
     print("DCPP vs ERA5 -- cropland-weighted admin-2 features")
@@ -687,6 +718,10 @@ def main(argv=None):
     print(f"  DCPP leads  : "
           + (", ".join(f"FY{f}" for f in fy_list) if fy_list is not None
              else "discovered per AOI from the DCPP tree"))
+    print(f"  slice policy: {a.slice_policy}"
+          + ("   (stage 3 reads lead 1 of s{H-FY-1} for the pre-season window; "
+             "outputs tagged fy{FY}n_)" if a.slice_policy == "newest-run" else
+             "   (one initialisation per season)"))
     print(f"  features    : {','.join(feats)}   reduce={a.reduce} weight={a.weight}")
     print()
 
@@ -706,7 +741,8 @@ def main(argv=None):
         fys_all = fy_list if fy_list is not None else discover_leads(dcpp_root, aoi, mems)
         fys, notes = [], []
         for fy in fys_all:
-            verdict, detail = calendar_fit(Path(a.root), a.crop, cc, a.season, fy)
+            verdict, detail = calendar_fit(Path(a.root), a.crop, cc, a.season, fy,
+                                           a.slice_policy)
             if verdict == "impossible":
                 print(f"  {aoi} FY{fy}: SKIPPED -- {detail}")
                 failures.append((aoi, f"calendar FY{fy}", detail))
@@ -793,7 +829,8 @@ def main(argv=None):
         for fy in fys:
             a.forecast_year = fy          # build_cmd reads this
             dcpp_src = src_for(fy)
-            tag = a.tag or f"fy{fy}_{a.reduce}_{harvest_years[0]}-{harvest_years[-1]}"
+            tag = a.tag or (f"{lead_tag(fy, a.slice_policy)}{a.reduce}_"
+                            f"{harvest_years[0]}-{harvest_years[-1]}")
             print(f"  -- FY{fy}  (initialisations s{dcpp_src[0]}-{dcpp_src[-1]}) --")
 
             aoi_pairs = []
@@ -812,11 +849,13 @@ def main(argv=None):
                         failures.append((aoi, label, "no source years on disk"))
                         continue
                     cmd = build_cmd(a, aoi, source, d_dir, fy, have_d)
-                    if not run_build(cmd, aoi_out / "logs" / f"{aoi}_{source}_fy{fy}.log"):
+                    if not run_build(cmd, aoi_out / "logs" /
+                                     f"{aoi}_{source}_{lead_tag(fy, a.slice_policy).rstrip('_')}.log"):
                         failures.append((aoi, label, "build"))
                         continue
                 dcpp = _load_side(d_dir, aoi, a.crop, fy, harvest_years,
-                                  a.reduce, fixed, f"{aoi}/{source}/FY{fy}")
+                                  a.reduce, fixed, f"{aoi}/{source}/FY{fy}",
+                                  a.slice_policy)
                 if dcpp.empty:
                     failures.append((aoi, label, "no output"))
                     continue
@@ -851,7 +890,8 @@ def main(argv=None):
                 for feat, fdf in mdf.groupby("feature"):
                     key = {"aoi": aoi, "member": member, "feature": feat,
                            "forecast_year": fy}
-                    rec = dict(key, reduce=a.reduce, weight=a.weight, crop=a.crop)
+                    rec = dict(key, slice_policy=a.slice_policy, reduce=a.reduce,
+                               weight=a.weight, crop=a.crop)
                     if member == "ENSMEAN":
                         rec["n_members"] = int(fdf["n_members"].max())
                     rec.update(metrics(fdf))
@@ -871,6 +911,7 @@ def main(argv=None):
             meta = dict(
                 created=time.strftime("%Y-%m-%d %H:%M:%S %Z"), argv=sys.argv,
                 model=MODEL, aoi=aoi, members=mems, forecast_year=fy,
+                slice_policy=a.slice_policy,
                 harvest_years=[harvest_years[0], harvest_years[-1]],
                 era5_source_years=[era5_src[0], era5_src[-1]],
                 dcpp_source_years=[dcpp_src[0], dcpp_src[-1]],

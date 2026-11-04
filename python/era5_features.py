@@ -24,9 +24,16 @@ from degree_days import degree_days_sine  # noqa: E402
 DEFAULT_ROOT = "/Users/kdoerkse/Documents/UCT/AgImpacts" # This is local, need to update this to lab/set via export in lab PC
 # Lead time in years: how far ahead of its initialisation a run is being used.
 # An initialised (hindcast) source is labelled by the November it started from,
-# so s{Y} at fy=1 is its first full season and targets harvest year Y+1; the
-# same file kind at fy=2 would be a year-older initialisation aimed at the same
-# harvest, i.e. a harder forecast.
+# and the lead says which of that run's annual slices is meant. The
+# initialisation does NOT move with the lead:
+#
+#     fy1_s{Y}   1 Nov Y   -> 31 Oct Y+1    first forecast year,  targets Y+1
+#     fy2_s{Y}   1 Nov Y+1 -> 31 Oct Y+2    second forecast year, targets Y+2
+#
+# so the harvest year a slice verifies against is Y + fy. Read the other way --
+# harvest year H fixed, which is how an experiment is specified -- a longer lead
+# means an OLDER initialisation, s = H - fy, and a harder forecast: harvest 2003
+# is fy1_s2002 at lead 1 and fy2_s2001 at lead 2.
 #
 # An observed product has no initialisation and no lead time, so it gets the
 # degenerate fy=0: the file for 1983 IS 1983. It carries the column purely so an
@@ -42,6 +49,44 @@ DEFAULT_FORECAST_YEAR = 0
 def default_forecast_year(source: str) -> int:
     """0 for a reanalysis, 1 for an initialised forecast/hindcast run."""
     return 0 if source in OBSERVED_SOURCES else 1
+
+
+# How a season is assembled from the annual slices of a once-a-year run.
+#
+# fixed-init   every slice comes from ONE initialisation, s = H - F, and only
+#              the lead varies. One continuous model trajectory. A season
+#              starting before 1 Nov of the s-year would need a lead-0 slice,
+#              which cannot exist, so those units are NaN -- most of AR and ET,
+#              and 72 municipalities of Brazil's Rio Grande do Sul, at F = 1.
+# newest-run   each 12-month window is taken from the NEWEST run that is no
+#              newer than s = H - F. The window BEFORE the main season then
+#              comes from lead 1 of s = H - F - 1 rather than being
+#              uncoverable, so more of the season sits at the shortest lead
+#              available -- and lead 1 is the best DCPP data there is -- while
+#              the decision date stays 1 Nov (H - F), exactly as under
+#              fixed-init. At F = 1 it resolves to
+#              fy1_s{H-2} + fy1_s{H-1} + fy2_s{H-1}.
+#
+# The two differ only at F = 1: from F = 2 the pre-season window already maps
+# to s = H - F under both, so newest-run is a no-op there.
+SLICE_POLICIES = ("fixed-init", "newest-run")
+DEFAULT_SLICE_POLICY = "fixed-init"
+
+
+def lead_tag(forecast_year: int, slice_policy: str = DEFAULT_SLICE_POLICY) -> str:
+    """Stage-3 filename token for a lead: "", "fy1_", or "fy1n_".
+
+    The policy is in the name because two policies at the same lead are two
+    different predictions of the same harvest year, built from different files.
+    Sharing a filename would make the second look already-written and silently
+    keep the first one's numbers -- the same trap the lead token itself fixed.
+
+    Stage-1 and stage-2 filenames are deliberately NOT tagged: a slice is just
+    (initialisation, lead) and both policies read the very same files.
+    """
+    if not forecast_year:
+        return ""
+    return f"fy{forecast_year}{'n' if slice_policy == 'newest-run' else ''}_"
 
 # ============================== feature registry ==============================
 class Feature(NamedTuple):
@@ -256,11 +301,20 @@ class Layout:
     """
 
     def __init__(self, aoi: str, root: str | None = None, out: str | None = None,
-                 source: str = "ERA5", forecast_year: int | None = None):
+                 source: str = "ERA5", forecast_year: int | None = None,
+                 slice_policy: str = DEFAULT_SLICE_POLICY):
         self.aoi = aoi
         self.source = source
         self.forecast_year = (default_forecast_year(source)
                               if forecast_year is None else forecast_year)
+        if slice_policy not in SLICE_POLICIES:
+            raise SystemExit(f"unknown --slice-policy {slice_policy!r}; "
+                             f"choose from {', '.join(SLICE_POLICIES)}")
+        if slice_policy != DEFAULT_SLICE_POLICY and not self.forecast_year:
+            # An observed product has no initialisation to be newest OF.
+            raise SystemExit(f"--slice-policy {slice_policy} needs a hindcast "
+                             f"(--forecast-year >= 1); got {self.forecast_year}")
+        self.slice_policy = slice_policy
         self.root = Path(root or os.environ.get("AGIMPACTS_ROOT", DEFAULT_ROOT))
         # ERA5_OUT_DIR is honoured only for ERA5 -- it names one product, and
         # letting a hindcast run inherit it would drop EC-Earth3 cubes into the
@@ -707,8 +761,10 @@ def aggregate_blocks(lay: Layout, year, w, names, cal, fixed=None,
     # crosses 31 Oct need the next lead slice of the SAME initialisation.
     earliest = min(b[0][0] for b in windows.values())
     latest_w = max(b[-1][1] for b in windows.values())
-    wanted = season_slices(year, lay.forecast_year, earliest, latest_w)
+    wanted = season_slices(year, lay.forecast_year, earliest, latest_w,
+                           lay.slice_policy)
     have = [(sy, ld) for sy, ld in wanted if lay.features_slice(sy, ld).exists()]
+    report_slices(year, wanted, have)
     if not have:
         raise SeasonUnavailable(
             f"harvest year {year}: none of the needed slices exist "
@@ -778,6 +834,27 @@ def aggregate_blocks(lay: Layout, year, w, names, cal, fixed=None,
 MAX_LEAD = 10          # DCPP runs are published out to 10 lead years
 
 
+def slice_name(s_year: int, lead: int) -> str:
+    """How a slice is spelled in messages: fy2_s2001."""
+    return f"fy{lead}_s{s_year}" if lead else str(s_year)
+
+
+def report_slices(year: int, wanted, have) -> None:
+    """Say which files a harvest year was actually assembled from.
+
+    Worth a line per year: under newest-run the same --forecast-year reads a
+    different set of files than it did under fixed-init, and the run log is
+    where that is checkable after the fact.
+    """
+    if not wanted:
+        return                      # the caller is about to raise with the detail
+    shown = " + ".join(slice_name(sy, ld) for sy, ld in wanted)
+    missing = [sl for sl in wanted if sl not in have]
+    print(f"    {year}: slices {shown}"
+          + (f"   MISSING {', '.join(slice_name(sy, ld) for sy, ld in missing)}"
+             if missing else ""))
+
+
 class SeasonUnavailable(Exception):
     """This harvest year cannot be assembled from what is on disk.
 
@@ -794,63 +871,100 @@ def slice_span(s_year: int, lead: int) -> tuple[pd.Timestamp, pd.Timestamp]:
 
 
 def season_slices(harvest_year: int, forecast_year: int,
-                  lo: pd.Timestamp, hi: pd.Timestamp) -> list[tuple[int, int]]:
+                  lo: pd.Timestamp, hi: pd.Timestamp,
+                  slice_policy: str = DEFAULT_SLICE_POLICY) -> list[tuple[int, int]]:
     """(initialisation, lead) slices needed to cover the window [lo, hi].
 
     Observed (fy=0): calendar-year cubes, so every year the window touches.
 
-    Hindcast (fy>=1): the initialisation is FIXED at S = harvest_year - fy, and
-    only the lead varies. Every slice whose span overlaps the season is
-    returned, so a season reaching past 31 Oct picks up lead fy+1 and one
-    starting before 1 Nov picks up lead fy-1 -- both from the same run. A
-    season needing lead 0 cannot be built at all: that is asking a forecast to
-    cover days before its own initialisation.
+    Hindcast (fy>=1): the published slices tile the calendar into 12-month
+    windows W(k) = 1 Nov k .. 31 Oct k+1, and slice (s, lead) IS the window
+    k = s + lead - 1. So covering a season is a matter of choosing, for each
+    window it touches, which run to read that window from.
+
+    fixed-init pins the run at S = harvest_year - fy and lets the lead vary, so
+    a season reaching past 31 Oct picks up lead fy+1 and one starting before
+    1 Nov picks up lead fy-1, both from the same continuous trajectory. A
+    window needing lead 0 cannot be built at all -- that is asking a forecast
+    to cover days before its own initialisation -- and the units concerned are
+    left NaN by the caller rather than failing the whole year.
+
+    newest-run takes each window from the newest run that is still no newer
+    than S, i.e. s = min(k, S). Windows at or after S come out exactly as under
+    fixed-init; the pre-season window W(S-1), which fixed-init cannot reach,
+    comes from lead 1 of s = S-1. Nothing is ever read from a run started after
+    1 Nov S, so the decision date is identical under both policies while more
+    of the season -- all of it, for the AOIs that sow before 1 November -- is
+    served at lead 1.
+
+    Ordered by window, so the files concatenate in time order.
     """
     if forecast_year == 0:
         return [(y, 0) for y in range(lo.year, hi.year + 1)]
-    s = harvest_year - forecast_year
-    # Leads start at 1: a run cannot describe days before its own
-    # initialisation. A season reaching back past 1 Nov of the s-year is simply
-    # not coverable, and the units concerned are left NaN by the caller rather
-    # than failing the whole year -- a handful of outlier units must not cost
-    # the other few thousand.
-    return [(s, lead) for lead in range(1, MAX_LEAD + 1)
-            if slice_span(s, lead)[1] >= lo and slice_span(s, lead)[0] <= hi]
+    cap = harvest_year - forecast_year
+    out = []
+    # W(k) can only overlap [lo, hi] for k in [lo.year - 1, hi.year]; the span
+    # test below is what decides it, this is just the bound to scan.
+    for k in range(lo.year - 1, hi.year + 1):
+        s = min(k, cap) if slice_policy == "newest-run" else cap
+        lead = k - s + 1
+        if not 1 <= lead <= MAX_LEAD:
+            continue
+        span = slice_span(s, lead)
+        if span[1] >= lo and span[0] <= hi:
+            out.append((s, lead))
+    return out
 
 
-def season_source_years(harvest_year: int, forecast_year: int) -> list[int]:
+def season_source_years(harvest_year: int, forecast_year: int,
+                        slice_policy: str = DEFAULT_SLICE_POLICY) -> list[int]:
     """Source (cube) years a harvest season is drawn from.
 
     Observed (fy=0): the cubes are calendar years, so a season that crosses the
     new year straddles two of them and both are read -- they are two slices of
     one continuous reanalysis.
 
-    Hindcast (fy>=1): the s{Y} run spans Nov Y -> Oct Y+1 and so already holds
-    its target season end to end. Exactly ONE file is read. Reaching into
-    s{Y-1} for a few extra pre-season days would splice a different
-    initialisation's weather into the same feature row, which is not a lead time
-    the forecast ever had.
+    Hindcast (fy>=1), fixed-init: the s{Y} run spans Nov Y -> Oct Y+1 and so
+    already holds its target season end to end. Exactly ONE initialisation is
+    read -- reaching into s{Y-1} for a few extra pre-season days would splice a
+    different initialisation's weather into the same feature row.
+
+    Hindcast, newest-run: that splice is the point, and it is made where it is
+    harmless -- a whole 12-month window at a time, upstream of the main season,
+    taken at lead 1. At fy=1 the pre-season window comes from s{H-2}, so TWO
+    initialisations are read. From fy=2 the pre-season window already belongs
+    to s{H-fy}, so the answer is the same as fixed-init.
     """
     if forecast_year == 0:
         return [harvest_year - 1, harvest_year]
-    return [harvest_year - forecast_year]
+    s = harvest_year - forecast_year
+    if slice_policy == "newest-run" and forecast_year == 1:
+        return [s - 1, s]
+    return [s]
 
 
-def harvest_year_candidates(source_years, forecast_year: int) -> list[int]:
+def harvest_year_candidates(source_years, forecast_year: int,
+                            slice_policy: str = DEFAULT_SLICE_POLICY) -> list[int]:
     """Harvest years these source years could possibly speak to, covered or not.
 
     At fy=0 a calendar year can serve its own harvest and (for a cross-year
-    calendar) the next one. At fy>=1 an initialisation speaks to exactly one
-    harvest year, so a source year is never itself a candidate.
+    calendar) the next one. At fy>=1 under fixed-init an initialisation speaks
+    to exactly one harvest year, so a source year is never itself a candidate.
+    Under newest-run at fy=1 a run also supplies the pre-season window of the
+    harvest after that one, so it is a candidate for both.
     """
     have = set(source_years)
     if forecast_year == 0:
         return sorted(have | {y + 1 for y in have})
-    return sorted(y + forecast_year for y in have)
+    out = {y + forecast_year for y in have}
+    if slice_policy == "newest-run" and forecast_year == 1:
+        out |= {y + forecast_year + 1 for y in have}
+    return sorted(out)
 
 
 def harvest_years_from_sources(source_years, forecast_year: int,
-                               crosses_new_year: bool) -> list[int]:
+                               crosses_new_year: bool,
+                               slice_policy: str = DEFAULT_SLICE_POLICY) -> list[int]:
     """Harvest years fully covered by the source years on hand.
 
     `--years` always names SOURCE years -- calendar years for an observed
@@ -859,13 +973,13 @@ def harvest_years_from_sources(source_years, forecast_year: int,
     than letting one flag mean two different things in two stages.
     """
     have = set(source_years)
-    candidates = harvest_year_candidates(source_years, forecast_year)
+    candidates = harvest_year_candidates(source_years, forecast_year, slice_policy)
     out = []
     for y in candidates:
         if forecast_year == 0 and not crosses_new_year:
             need = {y}                      # a same-year season never reaches back
         else:
-            need = set(season_source_years(y, forecast_year))
+            need = set(season_source_years(y, forecast_year, slice_policy))
         if need <= have:
             out.append(y)
     return out
@@ -923,8 +1037,9 @@ def aggregate_season(lay: Layout, year, w, names, cal, fixed=None) -> pd.DataFra
     # pick up the next lead slice of the same initialisation (option B).
     lo = min(a for a, _ in windows.values())
     hi = max(b for _, b in windows.values())
-    wanted = season_slices(year, lay.forecast_year, lo, hi)
+    wanted = season_slices(year, lay.forecast_year, lo, hi, lay.slice_policy)
     have = [(sy, ld) for sy, ld in wanted if lay.features_slice(sy, ld).exists()]
+    report_slices(year, wanted, have)
     if not have:
         raise SeasonUnavailable(
             f"harvest year {year}: none of the needed slices exist "
@@ -1032,14 +1147,16 @@ def stage_aggregate(lay, years, names, reduce, weighting, crop, cy_country, seas
         # and which harvest years those sources can cover depends on the lead
         # time and on whether the crop calendar crosses the new year.
         crosses = bool(fixed[0] > fixed[1]) if fixed else bool((cal["sos"] > cal["eos"]).any())
-        harvest_years = harvest_years_from_sources(years, lay.forecast_year, crosses)
+        harvest_years = harvest_years_from_sources(years, lay.forecast_year, crosses,
+                                                   lay.slice_policy)
         if not harvest_years:
             raise SystemExit(
                 f"source years {years[0]}-{years[-1]} cover no complete season at "
                 f"forecast year {lay.forecast_year}"
                 + (" (the calendar crosses the new year, so harvest year Y needs "
                    "source years Y-1 and Y)" if crosses and not lay.forecast_year else ""))
-        dropped = [y for y in harvest_year_candidates(years, lay.forecast_year)
+        dropped = [y for y in harvest_year_candidates(years, lay.forecast_year,
+                                                     lay.slice_policy)
                    if y not in harvest_years]
         print(f"  harvest years {harvest_years[0]}-{harvest_years[-1]} "
               f"({len(harvest_years)}) from source years {years[0]}-{years[-1]}"
@@ -1062,8 +1179,9 @@ def stage_aggregate(lay, years, names, reduce, weighting, crop, cy_country, seas
 
     # Lead-time marker on the admin-2 outputs too: two leads verifying against
     # the same harvest year are two different predictions and must not share a
-    # filename. Empty for an observed run, so ERA5 filenames do not change.
-    fy_tag = f"fy{lay.forecast_year}_" if lay.forecast_year else ""
+    # filename. Empty for an observed run, so ERA5 filenames do not change, and
+    # carrying an "n" for newest-run, which is a third such prediction.
+    fy_tag = lead_tag(lay.forecast_year, lay.slice_policy)
     skipped: list[int] = []
     for year in years:
         if reduce == "daily":
@@ -1139,6 +1257,17 @@ def main(argv=None):
                         "first full season ahead and targets harvest 1983). Pass 2 "
                         "for a longer-lead DCPP arm: s1981 aimed at the same 1983 "
                         "harvest.")
+    p.add_argument("--slice-policy", choices=list(SLICE_POLICIES),
+                   default=DEFAULT_SLICE_POLICY,
+                   help="how a season spanning more than one 12-month slice is "
+                        "assembled. fixed-init (default): every slice from the one "
+                        "initialisation s = H - F, varying only the lead; a season "
+                        "starting before 1 Nov of the s-year is NaN. newest-run: "
+                        "each 12-month window from the newest run no newer than "
+                        "s = H - F, so the pre-season window comes from lead 1 of "
+                        "s = H - F - 1 instead of being uncoverable. Same decision "
+                        "date either way, more of the season at lead 1, and the "
+                        "stage-3 files are tagged fy{F}n_ so the two never collide.")
     p.add_argument("--years", help="SOURCE years -- calendar years when "
                         "--forecast-year=0, initialisation (s) years otherwise. "
                         "1980-2017, or 1991,1995. With --reduce=season the "
@@ -1187,7 +1316,7 @@ def main(argv=None):
         p.error(f"unknown feature(s): {unknown}. See --list-features")
 
     lay = Layout(a.aoi, a.root, a.out, source=a.source,
-                 forecast_year=a.forecast_year)
+                 forecast_year=a.forecast_year, slice_policy=a.slice_policy)
     years = parse_years(a.years)
     params = parse_params(a.param)
     cy_country = a.cy_country or ("US" if a.aoi == "CONUS" else a.aoi)
@@ -1198,6 +1327,20 @@ def main(argv=None):
                f"initialisation years; s{{Y}} targets harvest year Y+{fy}")
     print(f"{a.source} features - AOI {a.aoi}, features: {','.join(names)}")
     print(f"  forecast year {fy} ({reading})")
+    if fy:
+        if lay.slice_policy == "fixed-init":
+            how = (f"every slice from the one initialisation s{{H-{fy}}} -- lead {fy} "
+                   f"for the main season, {fy + 1} for one crossing 31 Oct"
+                   + (f", {fy - 1} for one starting before 1 Nov" if fy > 1 else
+                      "; a season starting before 1 Nov is NOT coverable"))
+        elif fy == 1:
+            how = "fy1_s{H-2} + fy1_s{H-1} + fy2_s{H-1} -- the whole season at lead 1 bar the harvest tail"
+        else:
+            how = (f"each window from the newest run no newer than s{{H-{fy}}}, "
+                   f"which at lead {fy} is the same set of files as fixed-init")
+        print(f"  slice policy {lay.slice_policy}: {how}")
+        print(f"  stage-3 tag  {lead_tag(fy, lay.slice_policy)}"
+              f"  (decision date 1 Nov {{H-{fy}}} under either policy)")
     print(f"  --years {years[0]}-{years[-1]} read as {reading.split(';')[0]}")
     print(f"  root: {lay.root}"
           + ("" if lay.root.exists() else "   <-- DOES NOT EXIST"))
