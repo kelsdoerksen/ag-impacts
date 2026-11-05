@@ -748,20 +748,26 @@ def main(argv=None):
                 failures.append((aoi, f"calendar FY{fy}", detail))
                 continue
             if verdict == "needs-next-slice":
-                notes.append(f"FY{fy} also reads lead slices of the same "
-                             f"initialisation ({detail})")
+                # `detail` names the run each extra slice comes from, which is
+                # the same initialisation under fixed-init but the PREVIOUS one
+                # for the pre-season window under newest-run at FY1. So the
+                # prefix must not claim either.
+                notes.append(f"FY{fy} season spans more than one 12-month "
+                             f"slice: {detail}")
             fys.append(fy)
-        for n in notes:
-            print(f"      note: {n}")
         if not fys:
             print(f"  {aoi}: no fy*_s* files under "
                   f"{dcpp_dir(dcpp_root, aoi, mems[0])} -- skipping "
                   f"(run run-dcpp.sh, or pass --forecast-years)")
-            continue
-        plan.append((aoi, mems, fys))
-        print(f"  {aoi}: {len(mems)} member(s): {', '.join(mems)}"
-              f"   leads: {', '.join(f'FY{f}' for f in fys)}"
-              + ("" if fy_list is not None else "  (discovered)"))
+        else:
+            plan.append((aoi, mems, fys))
+            print(f"  {aoi}: {len(mems)} member(s): {', '.join(mems)}"
+                  f"   leads: {', '.join(f'FY{f}' for f in fys)}"
+                  + ("" if fy_list is not None else "  (discovered)"))
+        # After the AOI's own line, and tagged with it: printed first, they
+        # read as belonging to the AOI ABOVE (BR's notes appeared under SN).
+        for n in notes:
+            print(f"      {aoi} note: {n}")
     if not plan:
         raise SystemExit("nothing to do")
 
