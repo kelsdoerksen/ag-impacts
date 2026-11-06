@@ -330,13 +330,15 @@ def ramp(v, lo=-1.0, hi=1.0):
 
 
 def _rings(geom):
+    """Rings as lists of (x, y). Z (or M) is dropped: some cy-bench shapefiles
+    are PolygonZ, and every consumer here unpacks exactly two values."""
     polys = list(geom.geoms) if geom.geom_type.startswith("Multi") else [geom]
     for poly in polys:
         if poly.is_empty:
             continue
-        yield list(poly.exterior.coords)
+        yield [c[:2] for c in poly.exterior.coords]
         for h in poly.interiors:
-            yield list(h.coords)
+            yield [c[:2] for c in h.coords]
 
 
 def _ring_centroid(ring):
