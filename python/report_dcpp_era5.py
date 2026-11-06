@@ -139,6 +139,14 @@ def load(d: Path, pattern: str, aois, required=True) -> pd.DataFrame:
         if "forecast_year" not in df.columns:
             m = re.search(r"_fy(\d+)_", os.path.basename(f))
             df["forecast_year"] = int(m.group(1)) if m else 0
+        if "slice_policy" not in df.columns:
+            # compare_dcpp_era5.py wrote the policy only into the corr table
+            # until 2026-11-06; the year/unit tables carried it in the filename
+            # alone (fy{F}n_). Without this, pick_policy() emptied both tables
+            # under newest-run and the per-year charts and maps vanished.
+            df["slice_policy"] = ("newest-run"
+                                  if re.search(r"_fy\d+n_", os.path.basename(f))
+                                  else DEFAULT_SLICE_POLICY)
         parent = os.path.basename(os.path.dirname(f))
         if parent != d.name:
             df["aoi"] = parent
@@ -836,8 +844,19 @@ def render_page(a, ens, mem, ey, eu, poly_dir, leads, order, css):
 
     if len(leads) > 1:
         B.append(f'<h2>5 &middot; Skill vs lead &mdash; <span class="mono">{a.metric}</span></h2>')
-        B.append('<p class="sub">FY1 is initialised in the November its own target season '
-                 'begins, so it carries almost no lead and should be read as an upper bound.</p>')
+        B.append('<p class="sub">FY<i>F</i> is initialised on 1 Nov of year '
+                 '<i>H</i>&minus;<i>F</i> for harvest year <i>H</i>: FY1 for a 2002 harvest is '
+                 'the 1 Nov 2001 initialisation, whose lead-1 slice covers 1 Nov 2001 &ndash; '
+                 '31 Oct 2002. FY1 is the shortest DCPP horizon, not a zero-lead one: '
+                 'initialisation precedes median sowing by 0.6&ndash;7.9 months depending on '
+                 'the AOI (<span class="mono">docs/dcpp-forecast-arms.md</span>), so part of '
+                 'any cross-AOI difference at FY1 is a difference in lead time. Harvest tails '
+                 'after 31 Oct are read from lead <i>F</i>+1 of the same run'
+                 + (', and under <span class="mono">newest-run</span> FY1 takes the window '
+                    'before 1 Nov <i>H</i>&minus;1 from lead 1 of the previous initialisation '
+                    '&mdash; nothing issued after 1 Nov <i>H</i>&minus;1 is used.'
+                    if getattr(a, "slice_policy", None) == "newest-run" else '.')
+                 + '</p>')
         B.append(lead_table(ens, a.metric))
 
     if not mem.empty:
@@ -986,6 +1005,7 @@ def main(argv=None):
     else:
         policy = pols[0] if pols else DEFAULT_SLICE_POLICY
     summ, yearly, byunit = (pick_policy(x, policy) for x in (summ, yearly, byunit))
+    a.slice_policy = policy          # render_page words the lead note by it
     print(f"summary: {len(summ)} rows, AOIs {sorted(summ.aoi.unique())}, "
           f"leads {sorted(summ.forecast_year.unique())}, "
           f"slice policy {policy}")

@@ -2,8 +2,8 @@
 """Compare EC-Earth3 DCPP hindcast features against ERA5 features, per AOI.
 
 Builds cropland-weighted admin-2 features for both sources through
-`era5_features.py` (so there is exactly one feature definition in the repo),
-joins them on (adm2_id, harvest_year), and reports how well each DCPP ensemble
+`era5_features.py`, joins them on (adm2_id, harvest_year),
+and reports how well each DCPP ensemble
 member -- and the ensemble mean -- reproduces the ERA5 value for the same
 region and season.
 
@@ -905,10 +905,16 @@ def main(argv=None):
                     ym = yearly_metrics(fdf)
                     for k, v in reversed(list(key.items())):
                         ym.insert(0, k, v)
+                    # The policy is in the filename too, but the report filters on
+                    # this column; without it these tables vanished under newest-run.
+                    ym.insert(len(key), "slice_policy", a.slice_policy)
                     yrows.append(ym)
                     um = unit_metrics(fdf)
                     for k, v in reversed(list(key.items())):
                         um.insert(0, k, v)
+                    # The policy is in the filename too, but the report filters on
+                    # this column; without it these tables vanished under newest-run.
+                    um.insert(len(key), "slice_policy", a.slice_policy)
                     urows.append(um)
             all_rows.extend(rows)
             yearly = pd.concat(yrows, ignore_index=True) if yrows else pd.DataFrame()
