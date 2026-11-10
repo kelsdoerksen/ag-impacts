@@ -574,6 +574,21 @@ def main(argv=None):
         raise SystemExit(f"unknown --add {bad}; choose from {COVARIATES}")
     years = parse_years(a.years)
 
+    # A lead-F forecast is issued on 1 Nov (H-F), when the latest complete
+    # season is H-F, so --phenology-lag below F hands the model NDVI that did
+    # not exist at the issue date. That is allowed on purpose: holding the
+    # phenology lag fixed across leads (e.g. lag 1 everywhere, "last season's
+    # NDVI is always in hand") keeps the covariates identical between runs, so
+    # the only thing that differs is the climate source. It is noted rather
+    # than refused, and recorded in run_meta.json.
+    phen = [c for c in covs if c != "yield_history"]
+    phen_note = ""
+    if phen and a.phenology_lag < max(1, a.forecast_year):
+        phen_note = (f"{', '.join(phen)} at lag {a.phenology_lag} postdates the "
+                     f"FY{a.forecast_year} issue date (latest observable season "
+                     f"H-{a.forecast_year}); covariates are held fixed across "
+                     f"leads, not issue-date-realistic")
+
     roots = Roots.resolve(a.share, a.era5_root, a.dcpp_root, a.targets_root)
     out_root = Path(a.out_dir) if a.out_dir else roots.share / "experiments"
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -600,6 +615,10 @@ def main(argv=None):
           + (f"   slice policy {a.slice_policy}" if kind == "dcpp" else ""))
     print(f"  features      : {a.reduce}"
           f"{'  + ' + ', '.join(covs) if covs else ''}")
+    if phen:
+        print(f"  phenology lag : {a.phenology_lag} season(s)")
+    if phen_note:
+        print(f"  note          : {phen_note}")
     print(f"  harvest years : {years[0]}-{years[-1]}")
     print(f"  split         : {'leave-one-year-out' if a.loo else f'hold out {a.test_year}'}")
     if a.target == "direction":
@@ -700,7 +719,9 @@ def main(argv=None):
             "aois": aois, "combine": bool(a.combine), "source": a.source,
             "forecast_year": a.forecast_year, "slice_policy": a.slice_policy,
             "crop": a.crop, "reduce": a.reduce,
-            "covariates": covs, "model": a.model, "target": a.target,
+            "covariates": covs, "phenology_lag": a.phenology_lag if phen else None,
+            "yield_min_lag": max(1, a.forecast_year) if "yield_history" in covs else None,
+            "model": a.model, "target": a.target,
             "detrend": bool(a.detrend), "seed": a.seed,
             "target_lags": tlags, "flat_band": a.flat_band,
             "years": [years[0], years[-1]], "n_features": len(feats),
