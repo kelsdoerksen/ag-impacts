@@ -316,9 +316,18 @@ _RAMP = [(-1.0, (178, 24, 43)), (-0.5, (214, 96, 77)), (0.0, (240, 240, 240)),
 
 
 def ramp(v, lo=-1.0, hi=1.0):
+    """Colour for v on a scale running lo (red end) to hi (blue end).
+
+    v is rescaled onto the ramp's own [-1, 1] before lookup. Clamping v to
+    [lo, hi] and looking it up directly only worked while lo, hi = -1, 1: any
+    other range (kg/ha, % error) fell outside the ramp and drew grey. lo > hi
+    is allowed and reverses the ramp, which is how a lower-is-better metric
+    gets blue for small values.
+    """
     if v is None or pd.isna(v):
         return "#d9d9d9"
-    v = max(min(float(v), hi), lo)
+    v = -1.0 + 2.0 * (float(v) - lo) / (hi - lo) if hi != lo else 0.0
+    v = max(min(v, 1.0), -1.0)
     for i in range(len(_RAMP) - 1):
         a, ca = _RAMP[i]
         b, cb = _RAMP[i + 1]
@@ -501,7 +510,8 @@ def svg_map(ids: dict, values: dict, title: str, box,
         if aid not in values:
             continue
         v = values[aid]
-        lab = "n/a" if v is None or pd.isna(v) else f"{v:+.2f}"
+        lab = ("n/a" if v is None or pd.isna(v)
+               else f"{v:,.0f}" if abs(v) >= 100 else f"{v:+.2f}")
         parts.append(
             f'<g class="u"><title>{html.escape(str(aid))}: {lab}</title>'
             f'<use href="#{pid}" fill="{ramp(v, lo, hi)}"/>'
@@ -517,7 +527,7 @@ def _tick(v: float) -> str:
         return "0"
     if abs(v) >= 100:
         return f"{v:,.0f}"
-    return f"{v:+g}" if abs(v) <= 1.0 else f"{v:g}"
+    return f"{v:+.2g}" if abs(v) <= 1.0 else f"{v:.3g}"
 
 
 def map_legend(lo: float = -1.0, hi: float = 1.0, label: str | None = None,
@@ -530,9 +540,9 @@ def map_legend(lo: float = -1.0, hi: float = 1.0, label: str | None = None,
             f'<defs><linearGradient id="{gid}">{stops}</linearGradient></defs>'
             f'<rect x="10" y="2" width="200" height="9" fill="url(#{gid})" '
             f'stroke="var(--line)"/>'
-            f'<text x="10" y="22" class="tick">{lo:+g}</text>'
-            f'<text x="110" y="22" class="tick ta-mid">0</text>'
-            f'<text x="210" y="22" class="tick ta-end">{hi:+g}</text>'
+            f'<text x="10" y="22" class="tick">{_tick(lo)}</text>'
+            f'<text x="110" y="22" class="tick ta-mid">{_tick((lo + hi) / 2)}</text>'
+            f'<text x="210" y="22" class="tick ta-end">{_tick(hi)}</text>'
             f'</svg><span class="sm">{html.escape(txt)}</span></div>')
 
 

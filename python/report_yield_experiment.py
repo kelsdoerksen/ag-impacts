@@ -51,6 +51,7 @@ import json
 import re
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from report_dcpp_era5 import (CSS, line_chart, load_polygons, map_legend,
@@ -99,12 +100,13 @@ def load_runs(root: Path, patterns=None) -> list[dict]:
         fold = _read(d / "metrics_by_fold.csv")
         unit = _read(d / "metrics_by_unit.csv")
         imp = _read(d / "importances.csv")
+        pred = _read(d / "predictions.csv")
         if fold.empty:
             print(f"  skipping {d.name}: no metrics_by_fold.csv")
             continue
         runs.append({"dir": d, "name": d.name, "meta": meta,
                      "label": label_for(meta), "fold": fold, "unit": unit,
-                     "imp": imp,
+                     "imp": imp, "pred": pred,
                      "target": meta.get("target", "yield")})
     runs.sort(key=lambda r: r["meta"].get("created", ""))
     return runs
@@ -397,6 +399,132 @@ def map_section(runs, poly_dir: Path, metrics, ref: str | None,
     return "".join(blocks) or '<p class="na">nothing mappable</p>'
 
 
+def _r(a, b) -> float:
+    """Pearson r, NaN when undefined."""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    if len(a) < 3 or np.std(a) == 0 or np.std(b) == 0:
+        return float("nan")
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def _year_frame(run, aoi: str, year: int) -> pd.DataFrame:
+    """One run's held-out predictions for one AOI and harvest year, indexed by
+    adm2_id. Empty for a direction run or a year the run never held out."""
+    p = run.get("pred")
+    if p is None or p.empty or not {"y_pred", "y_clim", "harvest_year"} <= set(p.columns):
+        return pd.DataFrame()
+    g = p[(p.aoi == aoi) & (p.harvest_year == year)]
+    if g.empty:
+        return pd.DataFrame()
+    # A pooled run has one scope per row already; mean is a no-op guard.
+    return g.groupby("adm2_id")[["y_true", "y_pred", "y_clim"]].mean()
+
+
+def year_section(runs, poly_dir: Path, years, ref: str, trim: bool, k: float,
+                 crs: str | None = None) -> str:
+    """Observed and predicted yield in chosen harvest years, side by side.
+
+    Two rows per (AOI, year), each on one colour scale shared by every map in
+    the row so the panels can be compared by eye:
+
+      yield     kg/ha. Observed first, then each run's prediction. This is
+                mostly the map of which districts are productive -- every run
+                gets that right, because the between-district level is in the
+                training data -- so read it for the large-scale picture only.
+      anomaly   departure from the district's own training-only climatology,
+                in % of that climatology: 100 (y - y_clim) / y_clim. This is
+                the row that shows whether a run caught THIS season. Percent
+                rather than kg/ha so a 2 t/ha and a 10 t/ha district are on the
+                same footing.
+
+    The observed anomaly uses the reference run's y_clim. Every run's
+    climatology is fit on the same training years when the runs share --years,
+    so the choice only matters if they do not.
+    """
+    runs = [r for r in runs if r["target"] != "direction"]
+    aois = sorted({a for r in runs if r.get("pred") is not None
+                   and not r["pred"].empty and "aoi" in r["pred"].columns
+                   for a in r["pred"].aoi.unique()})
+    if not runs or not aois:
+        return '<p class="na">no regression predictions in these runs</p>'
+    refrun = next((r for r in runs if r["label"] == ref), runs[0])
+
+    blocks = []
+    for aoi in aois:
+        frames = {yr: [(r, _year_frame(r, aoi, yr)) for r in runs] for yr in years}
+        drawn_ids = {a for fr in frames.values() for _, f in fr for a in f.index}
+        if not drawn_ids:
+            blocks.append(f'<h3>{html.escape(aoi)}</h3><p class="na">none of '
+                          f'{", ".join(map(str, years))} was held out in these runs</p>')
+            continue
+        polys, err = load_polygons(poly_dir, aoi, crs=crs, keep=drawn_ids)
+        if polys is None:
+            blocks.append(f'<h3>{html.escape(aoi)}</h3><p class="na">{html.escape(err)}</p>')
+            continue
+        drawn = polys[polys.adm_id.isin(drawn_ids)]
+        if drawn.empty:
+            blocks.append(f'<h3>{html.escape(aoi)}</h3><p class="na">no district id '
+                          f'matched {aoi}.shp</p>')
+            continue
+        defs, ids, box, _ = path_defs(drawn, aoi, trim=trim, k=k)
+        body = [defs]
+
+        for yr in years:
+            have = [(r, f) for r, f in frames[yr] if not f.empty]
+            back = f"yr-{_slug(aoi, yr)}"
+            body.append(f'<h3 id="{back}">{html.escape(aoi)} &middot; harvest {yr}</h3>')
+            if not have:
+                body.append(f'<p class="na">{yr} was not held out by any run</p>')
+                continue
+            obs_src = next((f for r, f in have if r is refrun), have[0][1])
+            obs = obs_src["y_true"]
+            clim = obs_src["y_clim"]
+
+            # ---- absolute yield ----
+            allv = pd.concat([obs] + [f["y_pred"] for _, f in have]).dropna()
+            lo, hi = float(allv.quantile(0.05)), float(allv.quantile(0.95))
+            if hi <= lo:
+                hi = lo + 1.0
+            body.append('<h4 class="tight">yield (kg/ha)</h4>')
+            body.append(map_legend(lo, hi, "kg/ha · same scale in every panel",
+                                   _slug("lgy", aoi, yr)))
+            figs = [fig(ids, box, obs.to_dict(), f"observed {yr}",
+                        f"median {_fmt(obs.median())} · {obs.notna().sum()} districts",
+                        _slug("yo", aoi, yr), back, lo, hi)]
+            for r, f in have:
+                ape = (100 * (f.y_pred - f.y_true).abs() / f.y_true).median()
+                figs.append(fig(ids, box, f["y_pred"].to_dict(), r["label"],
+                                f"median {_fmt(f.y_pred.median())} · "
+                                f"median |error| {ape:.1f}%",
+                                _slug("yp", aoi, yr, r["name"]), back, lo, hi))
+            body.append(f'<div class="grid maps">{"".join(x for x in figs if x)}</div>')
+
+            # ---- anomaly vs climatology ----
+            oa = (100 * (obs - clim) / clim).dropna()
+            pa = {r["name"]: (r, (100 * (f.y_pred - f.y_clim) / f.y_clim).dropna())
+                  for r, f in have}
+            m = float(pd.concat([oa] + [v for _, v in pa.values()]).abs().quantile(0.95)) or 1.0
+            body.append('<h4 class="tight">anomaly vs district climatology '
+                        '(% of climatology)</h4>')
+            body.append(map_legend(-m, m, "% · red below the district's normal, "
+                                   "blue above", _slug("lga", aoi, yr)))
+            figs = [fig(ids, box, oa.to_dict(), f"observed {yr}",
+                        f"median {_fmt(oa.median(), signed=True)}% · "
+                        f"{100 * (oa < 0).mean():.0f}% of districts below normal",
+                        _slug("ao", aoi, yr), back, -m, m)]
+            for name, (r, v) in pa.items():
+                both = pd.concat([oa.rename("o"), v.rename("p")], axis=1).dropna()
+                rs = _r(both.o, both.p) if len(both) >= 3 else float("nan")
+                sign = 100 * (np.sign(both.o) == np.sign(both.p)).mean() if len(both) else float("nan")
+                figs.append(fig(ids, box, v.to_dict(), r["label"],
+                                f"r vs observed {_fmt(rs, signed=True)} · "
+                                f"sign right in {sign:.0f}%",
+                                _slug("ap", aoi, yr, name), back, -m, m))
+            body.append(f'<div class="grid maps">{"".join(x for x in figs if x)}</div>')
+        blocks.append("".join(body))
+    return "".join(blocks)
+
+
 def importance_table(runs, top: int = 12) -> str:
     figs = []
     for r in runs:
@@ -434,13 +562,18 @@ def main(argv=None):
     p.add_argument("--metric", default=None,
                    help="single-metric alias for --metrics")
     p.add_argument("--reference", default=None,
-                   help="run label or directory name to difference against; "
+                   help="run label, directory name, or a glob matching exactly "
+                        "one directory (e.g. 'era5_*') to difference against; "
                         "default: the oldest run")
     p.add_argument("--scale", type=float, default=1.0,
                    help="colour range for the absolute maps (default +/-1)")
     p.add_argument("--diff-scale", type=float, default=0.3,
                    help="colour range for the difference maps (default +/-0.3)")
     p.add_argument("--polygons", default=None, help="cy-bench polygons dir")
+    p.add_argument("--year", default=None,
+                   help="harvest year(s) to map observed vs predicted yield for, "
+                        "e.g. 2022 or 2012,2022. Each must be a held-out year of "
+                        "the runs: any year under --loo, only Y under --test-year Y")
     p.add_argument("--no-maps", action="store_true")
     p.add_argument("--map-full-extent", action="store_true")
     p.add_argument("--map-trim-k", type=float, default=6.0)
@@ -484,7 +617,11 @@ def main(argv=None):
 
     ref = a.reference
     if ref is not None:
-        match = [r for r in runs if ref in (r["label"], r["name"])]
+        match = [r for r in runs if ref in (r["label"], r["name"])] or \
+                [r for r in runs if fnmatch.fnmatch(r["name"], ref)]
+        if len(match) > 1 and ref not in (match[0]["label"], match[0]["name"]):
+            raise SystemExit(f"--reference {ref!r} matched {len(match)} runs: "
+                             + ", ".join(r["name"] for r in match))
         if not match:
             raise SystemExit(f"--reference {ref!r} matched no run")
         ref = match[0]["label"]
@@ -598,6 +735,22 @@ def main(argv=None):
                              not a.map_full_extent, a.map_trim_k, a.map_crs,
                              a.scale if a.scale != 1.0 else None,
                              a.diff_scale if a.diff_scale != 0.3 else None))
+
+    if a.year and poly_dir is not None and not a.no_maps:
+        yrs = [int(x) for x in a.year.split(",") if x.strip()]
+        B.append(f'<h2>5b &middot; Observed vs predicted yield in '
+                 f'{", ".join(map(str, yrs))}</h2>')
+        B.append('<p class="sub">Each run\'s held-out prediction for the year, '
+                 'beside what was observed. The <b>yield</b> row is dominated by '
+                 'which districts are productive, which every run learns from the '
+                 'training years, so it looks alike across runs by construction. '
+                 'The <b>anomaly</b> row removes each district\'s training-only '
+                 'climatology and is the one that shows whether a run caught this '
+                 'season: compare its pattern with the observed panel. '
+                 '<span class="mono">r vs observed</span> is the spatial '
+                 'correlation of the two anomaly fields this year.</p>')
+        B.append(year_section(runs, poly_dir, yrs, ref,
+                              not a.map_full_extent, a.map_trim_k, a.map_crs))
 
     B.append('<h2>6 &middot; What the models used</h2>')
     B.append('<p class="sub">Mean over folds. Tree importance is impurity '
