@@ -98,9 +98,9 @@ def residual(df: pd.DataFrame, col: str, min_years: int = 8) -> pd.Series:
     return out
 
 
-def load_yields(path: Path) -> pd.DataFrame:
+def load_yields(path: Path, shift: int = 0) -> pd.DataFrame:
     d = pd.read_parquet(path)
-    d["harvest_year"] = d["hindcast_start"].astype(int) + 1
+    d["harvest_year"] = d["hindcast_start"].astype(int) + 1 + shift
     d = d[np.isfinite(d["yield"]) & (d["yield"] > 0)].copy()
     d["adm1"] = adm1_of(d["adm2_id"])
     d["y_anom"] = detrended_anomaly(d, "yield")
@@ -160,6 +160,9 @@ def main(argv=None):
     p.add_argument("--min-units", type=int, default=10,
                    help="skip states with fewer units in the lag test")
     p.add_argument("--no-climate", action="store_true", help="events test only")
+    p.add_argument("--shift", type=int, default=0,
+                   help="apply this harvest_year correction first, to verify it "
+                        "(same as run_yield_experiment.py --yield-shift)")
     a = p.parse_args(argv)
 
     from yield_features import DEFAULT_SHARE, Roots, load_climate
@@ -171,7 +174,7 @@ def main(argv=None):
     else:
         roots = Roots.resolve(a.share or DEFAULT_SHARE)
         ypath = roots.aoi_targets(a.aoi) / f"crop_{a.crop}_{a.aoi}.parquet"
-    y = load_yields(ypath)
+    y = load_yields(ypath, a.shift)
     print(f"{ypath}\n  {len(y):,} rows, {y.adm2_id.nunique():,} units, "
           f"harvest years {y.harvest_year.min()}-{y.harvest_year.max()}\n")
 

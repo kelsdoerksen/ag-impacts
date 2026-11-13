@@ -294,13 +294,19 @@ def load_climate(roots: Roots, aoi: str, source: str, crop: str,
 
 # ============================== targets and covariates ==============================
 
-def load_yield(roots: Roots, aoi: str, crop: str) -> pd.DataFrame:
+def load_yield(roots: Roots, aoi: str, crop: str, shift: int = 0) -> pd.DataFrame:
     """The cy-bench yield table, re-keyed onto harvest_year.
 
     The parquet is keyed on hindcast_start under an FY1 convention -- the yield
     is for calendar year hindcast_start + 1 -- so that column is converted and
     dropped here. Leaving both in the frame is how a lead-time off-by-one gets
     made downstream.
+
+    `shift` is added to harvest_year to correct a source whose labels are off.
+    Brazil needs -1: python/check_harvest_offset.py puts documented drought
+    losses at label H+1, and ERA5 season features of year Y-1 correlate with
+    the yield labelled Y far more strongly than those of Y, in most states.
+    Phenology needs no matching shift; its seasons come from observation dates.
     """
     path = roots.aoi_targets(aoi) / f"crop_{crop}_{aoi}.parquet"
     if not path.exists():
@@ -311,8 +317,10 @@ def load_yield(roots: Roots, aoi: str, crop: str) -> pd.DataFrame:
             f"  present here  : {', '.join(have) or '(nothing)'}\n"
             f"  build it with : Rscript R/crop-data-gen-cybench.R  (country = {aoi})")
     df = pd.read_parquet(path)
-    df["harvest_year"] = df["hindcast_start"].astype(int) + 1
+    df["harvest_year"] = df["hindcast_start"].astype(int) + 1 + int(shift)
     df = df.drop(columns=[c for c in ("hindcast_start", "forecast_year") if c in df])
+    if shift:
+        print(f"  [{aoi}] yield harvest_year shifted by {int(shift):+d}")
 
     # Structural zeros are missing data, not a failed harvest, and they drag a
     # unit's climatology down far enough to distort its anomalies.
@@ -428,8 +436,8 @@ def build_aoi(roots: Roots, aoi: str, source: str, crop: str, forecast_year: int
               reduce: str = "season", years=None, covariates=(),
               phenology_lag: int = 1, n_yield_lags: int = 3,
               phenology_suffix: str | None = None, ref_lags=(),
-              verbose: bool = True, slice_policy: str = DEFAULT_SLICE_POLICY
-              ) -> tuple[pd.DataFrame, list[str], dict]:
+              verbose: bool = True, slice_policy: str = DEFAULT_SLICE_POLICY,
+              yield_shift: int = 0) -> tuple[pd.DataFrame, list[str], dict]:
     """One AOI's design matrix: climate + yield + requested covariates.
 
     `ref_lags` additionally attaches yref{k} columns for the direction target.
@@ -437,7 +445,7 @@ def build_aoi(roots: Roots, aoi: str, source: str, crop: str, forecast_year: int
     """
     clim, feats, info = load_climate(roots, aoi, source, crop, forecast_year,
                                      reduce, years, verbose, slice_policy)
-    y = load_yield(roots, aoi, crop)
+    y = load_yield(roots, aoi, crop, yield_shift)
 
     keep = ["adm2_id", "harvest_year"] + \
         [c for c in ("adm2", "adm1") if c in clim.columns] + feats
@@ -501,7 +509,8 @@ def build(roots: Roots, aois, source: str, crop: str, forecast_year: int,
           reduce: str = "season", years=None, covariates=(),
           phenology_lag: int = 1, n_yield_lags: int = 3,
           phenology_suffix: str | None = None, ref_lags=(),
-          verbose: bool = True, slice_policy: str = DEFAULT_SLICE_POLICY
+          verbose: bool = True, slice_policy: str = DEFAULT_SLICE_POLICY,
+          yield_shift: dict | None = None
           ) -> tuple[pd.DataFrame, list[str], list[dict]]:
     """Several AOIs stacked into one frame with an `aoi` column.
 
@@ -513,7 +522,8 @@ def build(roots: Roots, aois, source: str, crop: str, forecast_year: int,
     for aoi in aois:
         df, cols, info = build_aoi(roots, aoi, source, crop, forecast_year, reduce,
                                    years, covariates, phenology_lag, n_yield_lags,
-                                   phenology_suffix, ref_lags, verbose, slice_policy)
+                                   phenology_suffix, ref_lags, verbose, slice_policy,
+                                   (yield_shift or {}).get(aoi, 0))
         frames.append(df)
         colsets.append(cols)
         infos.append(info)

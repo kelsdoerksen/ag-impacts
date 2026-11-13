@@ -65,6 +65,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -141,6 +142,110 @@ def score(df: pd.DataFrame) -> dict:
         "sd_ratio_anom": (float(np.std(p - c) / np.std(y - c))
                           if np.std(y - c) else float("nan")),
     }
+
+
+# ================= reference-relative targets: delta, zscore =================
+
+class RefTarget:
+    """A target expressed against a reference the forecaster already holds.
+
+        T = (y[u,t] - R[u,t]) / S[u,t]
+
+    delta    R = y[u,t-k]                      S = 1, or R/100 with pct
+             "how much will yield change from year t-k", kg/ha or %
+    zscore   R = mean of y[u, t-k-w+1 .. t-k]  S = sd of the same years
+             "how many of its recent standard deviations will yield move"
+
+    `end` (k) is the most recent year in the reference. It has to be at least
+    the lead time: a lead-F forecast is issued before harvest t-F+1 exists, so
+    a reference that includes it is a number nobody has yet. --target-lags
+    sets it; the default is max(1, F).
+
+    R and S come from the full yield table (yref{k} columns, attached by
+    yield_features.reference_yields), not from the rows that survived the
+    feature join, so a missing climate year does not erase a reference year.
+    Nothing is fit here: R and S are fixed functions of past yields, so there
+    is no training-only fitting to get wrong.
+
+    THE NULL. Year-to-year changes revert: after a drought the next change is
+    almost certainly up. A model scored against T = 0 (no change / same as the
+    recent mean) collects that reversion for free, with or without weather.
+    The honest null is the one every other target is scored against -- the
+    unit's training-only climatology c (its trend, with --detrend) -- written
+    in target units as T_clim = (c - R) / S. It already contains the
+    reversion. `skill` (kg/ha) and `t_skill` (target units) are both taken
+    against it; `t_skill_zero` against T = 0 is reported only to show how
+    much of a naive score is reversion.
+
+    THE ref_clim FEATURE. Weather features cannot see last year's yield, so
+    without help the model cannot learn reversion and loses to the null by
+    construction. T_clim is therefore added as a feature (disable with
+    --no-ref-feature): the model then has the null in hand and can only gain
+    on it through the weather.
+    """
+
+    def __init__(self, kind: str, end: int, window: int = 5, pct: bool = False,
+                 floor: float = 0.05, min_obs: int = 3):
+        if kind not in ("delta", "zscore"):
+            raise ValueError(kind)
+        self.kind, self.end = kind, int(end)
+        self.window = int(window) if kind == "zscore" else 1
+        self.pct, self.floor = bool(pct), float(floor)
+        self.min_obs = min(int(min_obs), self.window)
+
+    @property
+    def lags(self) -> list[int]:
+        return list(range(self.end, self.end + self.window))
+
+    @property
+    def tag(self) -> str:
+        if self.kind == "delta":
+            return f"delta-lag{self.end}{'-pct' if self.pct else ''}"
+        return f"z{self.window}-lag{self.end}"
+
+    def describe(self) -> str:
+        if self.kind == "delta":
+            unit = "% of" if self.pct else "kg/ha vs"
+            return f"change from year t-{self.end} ({unit} y[t-{self.end}])"
+        last = self.end + self.window - 1
+        return (f"z-score vs years t-{last}..t-{self.end} (mean, sd; sd floored "
+                f"at {self.floor:g} x mean; >= {self.min_obs} of {self.window} years)")
+
+    def ref_scale(self, df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+        """(R, S) per row; NaN where the reference is unavailable."""
+        if self.kind == "delta":
+            R = df[f"yref{self.end}"].to_numpy(float)
+            if self.pct:
+                S = np.where(R > 0, R / 100.0, np.nan)
+            else:
+                S = np.where(np.isfinite(R), 1.0, np.nan)
+            return R, S
+        v = df[[f"yref{k}" for k in self.lags]].to_numpy(float)
+        n = np.isfinite(v).sum(axis=1)
+        # Rows with < 2 reference years warn here and are masked just below.
+        with np.errstate(invalid="ignore", divide="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            R = np.nanmean(np.where(n[:, None] > 0, v, 0.0), axis=1)
+            sd = np.nanstd(v, axis=1, ddof=1)
+        # Five values give a noisy sd, and repeated yields (common in
+        # municipal statistics) give exactly zero. Floor it so a flat history
+        # cannot turn an ordinary year into a 20-sigma event.
+        S = np.fmax(np.nan_to_num(sd, nan=0.0), self.floor * R)
+        bad = (n < self.min_obs) | ~(R > 0)
+        R, S = np.where(bad, np.nan, R), np.where(bad, np.nan, S)
+        return R, S
+
+
+def score_target(df: pd.DataFrame) -> dict:
+    """Native-unit metrics for a RefTarget run (columns t_true/t_pred/t_clim)."""
+    t, p, c = (df[k].to_numpy(float) for k in ("t_true", "t_pred", "t_clim"))
+    rm, rc, r0 = _rmse(t, p), _rmse(t, c), _rmse(t, np.zeros_like(t))
+    return {"t_rmse": rm, "t_rmse_clim": rc,
+            "t_skill": 1.0 - rm / rc if rc else float("nan"),
+            "t_rmse_zero": r0,
+            "t_skill_zero": 1.0 - rm / r0 if r0 else float("nan"),
+            "t_skill_clim_vs_zero": 1.0 - rc / r0 if r0 else float("nan"),
+            "t_r": _r(t, p), "t_r_clim": _r(t, c)}
 
 
 # ======================== the direction target ========================
@@ -318,18 +423,26 @@ def fit_fold_direction(train, test, feats, lab: DirectionLabeller,
     vals, counts = np.unique(y_tr, return_counts=True)
     imp = model.feature_importances_
     out.attrs["alpha"] = model.alpha_
+    out.attrs["n_trees"] = getattr(model, "n_trees_", None)
     return out, (np.asarray(imp, float) if imp is not None else None), str(vals[counts.argmax()])
 
 
 def fit_fold(train: pd.DataFrame, test: pd.DataFrame, feats: list[str],
              model_type: str, target: str, seed: int, detrend: bool,
-             mlp_hidden=None, mlp_alpha=None):
+             mlp_hidden=None, mlp_alpha=None, ref: "RefTarget | None" = None,
+             ref_feature: bool = True):
     """Fit on `train`, predict `test`, return predictions in kg/ha.
 
     The per-unit baseline is fit here, on training rows only, and is used for
     two separate purposes: as the reference every anomaly metric is taken
     against, and -- when --target anomaly -- as the offset the model actually
     learns on. Both have to come from the same training-only fit.
+
+    With `ref` (--target delta | zscore) the model learns T = (y - R) / S
+    instead, and the prediction is mapped back to kg/ha as R + S T_hat, so
+    every kg/ha metric stays comparable with the other targets. The baseline
+    is expressed in target units as T_clim = (c - R) / S: the null, and (with
+    ref_feature) an extra input. See RefTarget.
     """
     base = CountyBaseline(detrend=detrend).fit(
         train["unit"].to_numpy(), train["yield"].to_numpy(),
@@ -340,40 +453,72 @@ def fit_fold(train: pd.DataFrame, test: pd.DataFrame, feats: list[str],
     clim_te = base.inverse(test["unit"].to_numpy(), np.zeros(len(test)),
                            standardize=False, years=yr_te)
 
+    X_tr, X_te = train[feats], test[feats]
     y_tr = train["yield"].to_numpy(float)
     if target == "anomaly":
         y_tr = base.transform(train["unit"].to_numpy(), y_tr,
                               standardize=False, years=yr_tr)
+    elif ref is not None:
+        R_tr, S_tr = ref.ref_scale(train)
+        R_te, S_te = ref.ref_scale(test)
+        clim_tr = base.inverse(train["unit"].to_numpy(), np.zeros(len(train)),
+                               standardize=False, years=yr_tr)
+        tclim_tr = (clim_tr - R_tr) / S_tr
+        tclim_te = (clim_te - R_te) / S_te
+        y_tr = (y_tr - R_tr) / S_tr
+        if ref_feature:
+            X_tr = X_tr.assign(ref_clim=tclim_tr)
+            X_te = X_te.assign(ref_clim=tclim_te)
 
     model = YieldModel(model_type, random_state=seed, mlp_hidden=mlp_hidden,
                        mlp_alpha=mlp_alpha)
     # groups = the training rows' years, so a CV-tuned linear model picks its
     # penalty by holding out whole years too.
-    model.fit(train[feats], y_tr, groups=train["harvest_year"].to_numpy())
+    model.fit(X_tr, y_tr, groups=train["harvest_year"].to_numpy())
 
-    pred = np.asarray(model.predict(test[feats]), float)
+    pred = np.asarray(model.predict(X_te), float)
     if target == "anomaly":
         pred = base.inverse(test["unit"].to_numpy(), pred,
                             standardize=False, years=yr_te)
+    elif ref is not None:
+        t_pred = pred
+        pred = R_te + S_te * t_pred
 
     out = test[["aoi", "unit", "adm2_id", "harvest_year", "yield"]].copy()
     out = out.rename(columns={"yield": "y_true"})
     out["y_pred"] = pred
     out["y_clim"] = clim_te
     out["residual"] = out["y_pred"] - out["y_true"]
+    if ref is not None:
+        out["y_ref"], out["s_ref"] = R_te, S_te
+        out["t_true"] = (out["y_true"].to_numpy(float) - R_te) / S_te
+        out["t_pred"], out["t_clim"] = t_pred, tclim_te
     imp = model.feature_importances_
     out.attrs["alpha"] = model.alpha_
+    out.attrs["n_trees"] = getattr(model, "n_trees_", None)
     return out, (np.asarray(imp, float) if imp is not None else None)
 
 
 def run_scope(df: pd.DataFrame, feats: list[str], folds: list[int], label: str,
-              a, lab: "DirectionLabeller | None" = None):
+              a, lab: "DirectionLabeller | None" = None,
+              ref: "RefTarget | None" = None):
     """Every fold for one model scope (one AOI, or the pooled set).
 
     `lab` present means the direction task: the labeller carries the lag and
     the band, and the metrics are categorical rather than squared-error.
+    `ref` present means a delta / zscore target: rows without a usable
+    reference are dropped up front, and native-unit metrics are added.
     """
     preds, per_fold, imps = [], [], []
+    ref_feature = ref is not None and not getattr(a, "no_ref_feature", False)
+    names = feats + (["ref_clim"] if ref_feature else [])
+    if ref is not None:
+        R, S = ref.ref_scale(df)
+        ok = np.isfinite(R) & np.isfinite(S) & (S > 0)
+        print(f"  reference available for {int(ok.sum()):,}/{len(df):,} rows "
+              f"({ref.describe()})")
+        df = df[ok].reset_index(drop=True)
+        folds = [y for y in folds if y in set(df["harvest_year"])]
     classes = lab.classes() if lab else None
     hidden = ([int(x) for x in a.mlp_hidden.split(",") if x.strip()]
               if getattr(a, "mlp_hidden", None) else None)
@@ -404,13 +549,19 @@ def run_scope(df: pd.DataFrame, feats: list[str], folds: list[int], label: str,
                   f"(null {m['acc_major']:.3f})")
         else:
             p, imp = fit_fold(train, test, feats, a.model, a.target, a.seed,
-                              a.detrend, hidden, a.mlp_alpha)
+                              a.detrend, hidden, a.mlp_alpha, ref, ref_feature)
             m = score(p)
+            if ref is not None:
+                m.update(score_target(p))
             # The selected penalty is a diagnostic in its own right: pinned at
             # the top of the grid means that fold's CV found no signal and the
             # model was shrunk to the mean on purpose.
             if p.attrs.get("alpha") is not None:
                 m["alpha"] = float(p.attrs["alpha"])
+            # Trees kept by early stopping (xgb). Very few in most folds means
+            # the held-out years found little to learn beyond the null.
+            if p.attrs.get("n_trees") is not None:
+                m["n_trees"] = int(p.attrs["n_trees"])
             # Within this one year, across units: did the model place the
             # anomaly correctly in space.
             m["r_space"] = _r(p["y_true"] - p["y_clim"], p["y_pred"] - p["y_clim"])
@@ -418,9 +569,11 @@ def run_scope(df: pd.DataFrame, feats: list[str], folds: list[int], label: str,
                              "n_train": int(len(train)), **m})
             preds.append(p.assign(scope=label, test_year=yr))
             print(f"    {yr}: n={m['n']:>5}  rmse={m['rmse']:>8,.0f}  "
-                  f"skill={m['skill']:+.3f}  r_space={m['r_space']:+.3f}")
+                  f"skill={m['skill']:+.3f}  r_space={m['r_space']:+.3f}"
+                  + (f"  t_skill={m['t_skill']:+.3f}" if ref is not None else "")
+                  + (f"  trees={m['n_trees']}" if "n_trees" in m else ""))
 
-        if imp is not None and len(imp) == len(feats):
+        if imp is not None and len(imp) == len(names):
             imps.append(imp)
 
     if not preds:
@@ -438,8 +591,12 @@ def run_scope(df: pd.DataFrame, feats: list[str], folds: list[int], label: str,
     else:
         overall = {"scope": label, "test_year": "ALL",
                    "n_folds": len(per_fold), **score(allp)}
+        if ref is not None:
+            overall.update(score_target(allp))
         if "alpha" in per_fold[0]:
             overall["alpha"] = float(np.median([f["alpha"] for f in per_fold]))
+        if "n_trees" in per_fold[0]:
+            overall["n_trees"] = float(np.median([f["n_trees"] for f in per_fold]))
         # Mean of the per-fold spatial correlations: the pooled r_anom above
         # mixes the spatial and interannual parts, this one is purely spatial.
         overall["r_space_mean"] = float(np.nanmean([f["r_space"] for f in per_fold]))
@@ -447,7 +604,7 @@ def run_scope(df: pd.DataFrame, feats: list[str], folds: list[int], label: str,
     imp_df = pd.DataFrame(columns=["scope", "feature", "importance"])
     if imps:
         mean_imp = np.mean(np.vstack(imps), axis=0)
-        imp_df = (pd.DataFrame({"scope": label, "feature": feats,
+        imp_df = (pd.DataFrame({"scope": label, "feature": names,
                                 "importance": mean_imp})
                   .sort_values("importance", ascending=False))
     return allp, pd.DataFrame(per_fold + [overall]), imp_df
@@ -478,6 +635,9 @@ def main(argv=None):
                    help="seasons back for ndvi/fpar/soil_moisture (>=1)")
     g.add_argument("--phenology-suffix", default=None)
     g.add_argument("--yield-lags", type=int, default=3)
+    g.add_argument("--yield-shift", default="",
+                   help="per-AOI correction to the yield harvest_year label, "
+                        "e.g. BR=-1 (see python/check_harvest_offset.py)")
     g.add_argument("--share", default=DEFAULT_SHARE)
     g.add_argument("--era5-root"), g.add_argument("--dcpp-root")
     g.add_argument("--targets-root", help="holds {AOI}_processed_data")
@@ -491,17 +651,33 @@ def main(argv=None):
     g.add_argument("--model", choices=SUPPORTED_MODELS, default="rf",
                    help=f"regression: {', '.join(REGRESSORS)}; "
                         f"direction: {', '.join(CLASSIFIERS)}")
-    g.add_argument("--target", choices=["yield", "anomaly", "direction"],
+    g.add_argument("--target",
+                   choices=["yield", "anomaly", "direction", "delta", "zscore"],
                    default="yield",
                    help="'yield' predicts kg/ha. 'anomaly' subtracts each "
                         "unit's training-only baseline first, so the model "
                         "spends its capacity on interannual variation instead "
                         "of the map. 'direction' classifies this year against "
-                        "a prior year as up / flat / down")
-    g.add_argument("--target-lags", default="1",
-                   help="direction only: how many years back the reference "
-                        "year is. Comma-separated fits one model per lag, e.g. "
-                        "1,2,3,5. Each must be >= --forecast-year")
+                        "a prior year as up / flat / down. 'delta' predicts "
+                        "the change from year t-k (kg/ha, or %% with --pct). "
+                        "'zscore' predicts (y - mean)/sd of the --z-window "
+                        "years ending at t-k. See docs/yield-targets.md")
+    g.add_argument("--target-lags", default=None,
+                   help="direction: how many years back the reference year "
+                        "is; comma-separated fits one model per lag, e.g. "
+                        "1,2,3,5 (default 1). delta / zscore: one value, the "
+                        "most recent reference year (default max(1, "
+                        "--forecast-year)). Each must be >= --forecast-year")
+    g.add_argument("--pct", action="store_true",
+                   help="delta only: change in %% of y[t-k] instead of kg/ha")
+    g.add_argument("--z-window", type=int, default=5,
+                   help="zscore only: number of past years in the reference")
+    g.add_argument("--z-floor", type=float, default=0.05,
+                   help="zscore only: floor on the reference sd, as a fraction "
+                        "of the reference mean")
+    g.add_argument("--no-ref-feature", action="store_true",
+                   help="delta / zscore: do not give the model the baseline "
+                        "in target units (ref_clim) as an input")
     g.add_argument("--flat-band", type=float, default=0.5,
                    help="direction only: half-width of the 'about the same' "
                         "class, in units of each unit's own standard deviation "
@@ -548,9 +724,25 @@ def main(argv=None):
             f"--model {a.model} cannot do --target {a.target}; "
             f"choose from {', '.join(allowed)}")
 
-    tlags = []
-    if a.target == "direction":
-        tlags = parse_years(a.target_lags)
+    tlags, ref = [], None
+    if a.target in ("delta", "zscore"):
+        ends = parse_years(a.target_lags) if a.target_lags else [max(1, a.forecast_year)]
+        if len(ends) != 1:
+            raise SystemExit(f"--target {a.target} takes one --target-lags value, "
+                             f"got {a.target_lags!r}; run once per lag")
+        if ends[0] < max(1, a.forecast_year):
+            raise SystemExit(
+                f"--target-lags {ends[0]} is shorter than the lead time "
+                f"({a.forecast_year}): the reference would include a harvest "
+                f"that has not happened when the forecast is issued.")
+        if a.target == "zscore" and a.z_window < 2:
+            raise SystemExit("--z-window must be >= 2 (an sd needs two years)")
+        if a.pct and a.target != "delta":
+            raise SystemExit("--pct applies to --target delta only")
+        ref = RefTarget(a.target, ends[0], a.z_window, a.pct, a.z_floor)
+        tlags = ref.lags
+    elif a.target == "direction":
+        tlags = parse_years(a.target_lags or "1")
         if not tlags or min(tlags) < 1:
             raise SystemExit(f"--target-lags must be >= 1, got {a.target_lags!r}")
         # The reference year has to be observable when the forecast is issued.
@@ -573,6 +765,16 @@ def main(argv=None):
     if bad:
         raise SystemExit(f"unknown --add {bad}; choose from {COVARIATES}")
     years = parse_years(a.years)
+    yshift = {}
+    for tok in filter(None, (x.strip() for x in a.yield_shift.split(","))):
+        k, _, v = tok.partition("=")
+        try:
+            yshift[k.strip()] = int(v)
+        except ValueError:
+            raise SystemExit(f"--yield-shift wants AOI=int, got {tok!r}")
+    stray = sorted(set(yshift) - set(aois))
+    if stray:
+        raise SystemExit(f"--yield-shift names AOI(s) not in --aois: {stray}")
 
     # A lead-F forecast is issued on 1 Nov (H-F), when the latest complete
     # season is H-F, so --phenology-lag below F hands the model NDVI that did
@@ -594,7 +796,7 @@ def main(argv=None):
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     split = f"test{a.test_year}" if a.test_year else "loo"
     scope_tag = "pooled" if a.combine else "peraoi"
-    tgt = a.target
+    tgt = ref.tag if ref is not None else a.target
     if a.target == "direction":
         tgt = (f"dir-lag{'-'.join(str(k) for k in tlags)}"
                f"-b{a.flat_band:g}".replace(".", "p"))
@@ -620,6 +822,8 @@ def main(argv=None):
     if phen_note:
         print(f"  note          : {phen_note}")
     print(f"  harvest years : {years[0]}-{years[-1]}")
+    if yshift:
+        print(f"  yield shift   : " + ", ".join(f"{k} {v:+d}" for k, v in yshift.items()))
     print(f"  split         : {'leave-one-year-out' if a.loo else f'hold out {a.test_year}'}")
     if a.target == "direction":
         band = ("binary up/down" if a.flat_band == 0
@@ -631,6 +835,10 @@ def main(argv=None):
     else:
         print(f"  model         : {a.model}   target {a.target}"
               f"{'   detrended baseline' if a.detrend else ''}")
+    if ref is not None:
+        print(f"  target        : {ref.describe()}")
+        print(f"  null          : per-unit {'trend' if a.detrend else 'mean'} "
+              f"in target units{'' if a.no_ref_feature else ', also given to the model as ref_clim'}")
     print(f"  out           : {run_dir}")
     if not a.go:
         print("\nPlan only. Re-run with --go.")
@@ -641,7 +849,8 @@ def main(argv=None):
         df, feats, infos = build(roots, aois, a.source, a.crop, a.forecast_year,
                                  a.reduce, years, covs, a.phenology_lag,
                                  a.yield_lags, a.phenology_suffix,
-                                 ref_lags=tlags, slice_policy=a.slice_policy)
+                                 ref_lags=tlags, slice_policy=a.slice_policy,
+                                 yield_shift=yshift)
     except (FileNotFoundError, ValueError) as exc:
         raise SystemExit(f"\ncannot assemble the design matrix:\n{exc}")
 
@@ -686,7 +895,7 @@ def main(argv=None):
                   f"{len(feats)} features")
         pr, ft, im = run_scope(sub, feats,
                                [y for y in folds if y in set(sub.harvest_year)],
-                               label, a, lab)
+                               label, a, lab, ref)
         preds.append(pr), folds_tbl.append(ft), imps.append(im)
 
     pred_df = pd.concat(preds, ignore_index=True)
@@ -721,9 +930,15 @@ def main(argv=None):
             "crop": a.crop, "reduce": a.reduce,
             "covariates": covs, "phenology_lag": a.phenology_lag if phen else None,
             "yield_min_lag": max(1, a.forecast_year) if "yield_history" in covs else None,
+            "yield_shift": yshift,
             "model": a.model, "target": a.target,
             "detrend": bool(a.detrend), "seed": a.seed,
             "target_lags": tlags, "flat_band": a.flat_band,
+            "ref_target": ({"kind": ref.kind, "end": ref.end,
+                            "window": ref.window, "pct": ref.pct,
+                            "floor": ref.floor, "min_obs": ref.min_obs,
+                            "ref_feature": not a.no_ref_feature,
+                            "describe": ref.describe()} if ref else None),
             "years": [years[0], years[-1]], "n_features": len(feats),
             "features": feats, "sources": infos,
             "overall": fold_df[fold_df.test_year == "ALL"].to_dict("records")}
@@ -738,7 +953,10 @@ def main(argv=None):
     else:
         cols = ["scope", "n", "n_units", "n_folds", "rmse", "rmse_pct", "rmse_clim",
                 "skill", "r2", "r_anom", "r_space_mean", "bias", "sd_ratio_anom",
-                "alpha"]
+                "alpha", "n_trees"]
+        if ref is not None:
+            cols += ["t_rmse", "t_rmse_clim", "t_skill", "t_skill_zero",
+                     "t_skill_clim_vs_zero", "t_r"]
     cols = [c for c in cols if c in fold_df.columns]
     summary = fold_df[fold_df.test_year == "ALL"][cols].copy()
     for c in ("n", "n_units", "n_folds"):
@@ -756,6 +974,13 @@ def main(argv=None):
               "rare class cannot hide in it.")
     else:
         print("\n  skill > 0 means the features beat the per-unit climatology null.")
+        if ref is not None:
+            print(f"  t_* are in target units ({ref.describe()}).")
+            print("  t_skill is against the same climatology null; t_skill_zero is "
+                  "against T = 0 and")
+            print("  includes free credit for reversion -- t_skill_clim_vs_zero "
+                  "is how much of it")
+            print("  the null alone collects.")
     print(f"\nwrote {len(list(run_dir.glob('*')))} file(s) to {run_dir}")
     return 0
 

@@ -30,14 +30,36 @@ statistics are learned on training rows only.
 """
 
 import numpy as np
-from sklearn.base import BaseEstimator, RegressorMixin
+from sklearn.base import BaseEstimator, RegressorMixin, clone
 from sklearn.ensemble import (GradientBoostingClassifier,
                               GradientBoostingRegressor,
                               RandomForestClassifier,
                               RandomForestRegressor)
 from sklearn.linear_model import ElasticNetCV, LogisticRegressionCV, RidgeCV
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+
+# XGBoost, set up against overfitting. The effective sample size for weather
+# is the number of years, not rows, so the trees are kept shallow and leaves
+# large, rows and columns are subsampled, leaf weights are shrunk, and the
+# number of trees is not fixed but chosen per fold on held-out training years
+# (YieldModel._fit_xgb_early_stopped). n_estimators is only the ceiling.
+#   max_depth 3        interactions of at most three features
+#   min_child_weight   >= this many rows per leaf (squared error: hessian 1/row)
+#   reg_lambda 10      L2 shrinkage of leaf weights; unit-free, so it acts the
+#                      same on kg/ha, % and z-score targets
+#   learning_rate .03  small steps, so early stopping has a fine grid
+XGB_REG_PARAMS = dict(n_estimators=1000, max_depth=3, learning_rate=0.03,
+                      min_child_weight=50, subsample=0.7, colsample_bytree=0.7,
+                      reg_lambda=10.0, tree_method="hist")
+# Log-loss hessians are p(1-p) <= 0.25 per row, so a smaller min_child_weight
+# still means >= ~40 rows per leaf.
+XGB_CLF_PARAMS = dict(n_estimators=1000, max_depth=3, learning_rate=0.03,
+                      min_child_weight=10, subsample=0.7, colsample_bytree=0.7,
+                      reg_lambda=10.0, tree_method="hist")
+XGB_ES_FRAC = 0.2        # share of training years held out to stop on
+XGB_ES_ROUNDS = 50       # stop after this many rounds without improvement
+XGB_ES_MIN_YEARS = 6     # below this, no early stopping (fit the cap)
 
 SUPPORTED_MODELS = ["rf", "gbm", "xgb", "ridge", "enet", "mlp", "logreg"]
 
@@ -287,16 +309,8 @@ class YieldModel:
                 raise ImportError(
                     "xgboost is not installed. Run: pip install xgboost"
                 ) from exc
-            return XGBRegressor(
-                n_estimators=200,
-                max_depth=6,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                random_state=random_state,
-                n_jobs=-1,
-                verbosity=0,
-            )
+            return XGBRegressor(**XGB_REG_PARAMS, random_state=random_state,
+                                n_jobs=-1, verbosity=0)
         if model_type == "ridge":
             # Leave-one-out generalised CV over RIDGE_ALPHAS, refit on the whole
             # training fold. The alpha is chosen inside each outer LOO fold, so
@@ -352,10 +366,8 @@ class YieldModel:
             except ImportError as exc:
                 raise ImportError(
                     "xgboost is not installed. Run: pip install xgboost") from exc
-            return XGBClassifier(
-                n_estimators=300, max_depth=4, learning_rate=0.05,
-                subsample=0.8, colsample_bytree=0.8, random_state=random_state,
-                n_jobs=-1, verbosity=0, eval_metric="mlogloss")
+            return XGBClassifier(**XGB_CLF_PARAMS, random_state=random_state,
+                                 n_jobs=-1, verbosity=0, eval_metric="mlogloss")
         if model_type == "mlp":
             return Pipeline([
                 ("scale", StandardScaler()),
@@ -377,15 +389,60 @@ class YieldModel:
     def fit(self, X, y, groups=None):
         """Fit, passing `groups` to estimators that select hyperparameters by CV.
 
-        `groups` should be the training rows' years. Only the linear CV models
-        use it -- for the ensembles it is silently ignored, since their capacity
-        is set by hyperparameters rather than chosen on the data.
+        `groups` should be the training rows' years. The linear CV models use
+        it to pick their penalty; xgb uses it to pick its number of trees (see
+        _fit_xgb_early_stopped). rf and gbm ignore it.
         """
+        self.n_trees_ = None
+        # XGBClassifier only accepts integer labels 0..K-1; the direction
+        # task passes strings ("down", "flat", "up"). Encode here, decode in
+        # predict / classes_, so callers never see the difference.
+        self._le = None
+        if self.task == "classify" and self.model_type == "xgb":
+            self._le = LabelEncoder().fit(np.asarray(y))
+            y = self._le.transform(np.asarray(y))
         if groups is not None and self._uses_groups():
             self._model.fit(X, y, model__groups=np.asarray(groups))
+        elif groups is not None and self.model_type == "xgb":
+            self._fit_xgb_early_stopped(X, y, np.asarray(groups))
         else:
             self._model.fit(X, y)
         return self
+
+    def _fit_xgb_early_stopped(self, X, y, groups):
+        """Choose the tree count on held-out YEARS, then refit on all of them.
+
+        Boosting keeps adding trees until it fits noise, and with seasonal
+        features the noise that matters is the year effect: rows within a year
+        share their weather, so ~90k rows carry roughly as many independent
+        weather realisations as there are years. A random-row validation split
+        would share those years with training and never stop. So
+        XGB_ES_FRAC of the training years (at least 2) are held out, trees are
+        added until their error has not improved for XGB_ES_ROUNDS rounds, and
+        the model is refit on every training year with that many trees. The
+        outer test year is never involved.
+        """
+        years = np.unique(groups)
+        if len(years) < XGB_ES_MIN_YEARS:
+            self._model.fit(X, y)
+            self.n_trees_ = int(self._model.get_params()["n_estimators"])
+            return
+        rng = np.random.default_rng(self._model.get_params()["random_state"])
+        n_val = max(2, int(round(XGB_ES_FRAC * len(years))))
+        val = np.isin(groups, rng.choice(years, n_val, replace=False))
+        Xa, ya = (X.to_numpy() if hasattr(X, "to_numpy") else np.asarray(X)), np.asarray(y)
+        probe = clone(self._model).set_params(early_stopping_rounds=XGB_ES_ROUNDS)
+        try:
+            probe.fit(Xa[~val], ya[~val], eval_set=[(Xa[val], ya[val])],
+                      verbose=False)
+            best = int(probe.best_iteration) + 1
+        except ValueError:
+            # A classifier whose validation years hold a class the training
+            # years lack cannot be scored; fall back to the configured cap.
+            best = int(self._model.get_params()["n_estimators"])
+        self._model.set_params(n_estimators=max(best, 1))
+        self._model.fit(X, y)
+        self.n_trees_ = best
 
     def _uses_groups(self) -> bool:
         if not isinstance(self._model, Pipeline):
@@ -394,7 +451,10 @@ class YieldModel:
                           (GroupedRidgeCV, GroupedMLP))
 
     def predict(self, X):
-        return self._model.predict(X)
+        p = self._model.predict(X)
+        if getattr(self, "_le", None) is not None:
+            p = self._le.inverse_transform(np.asarray(p).astype(int))
+        return p
 
     def predict_proba(self, X):
         """Class probabilities, or None for a regressor / a model without them."""
@@ -403,6 +463,8 @@ class YieldModel:
 
     @property
     def classes_(self):
+        if getattr(self, "_le", None) is not None:
+            return self._le.classes_
         est = self._model
         if isinstance(est, Pipeline):
             est = est.named_steps.get("model")

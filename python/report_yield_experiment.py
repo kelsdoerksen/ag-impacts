@@ -61,6 +61,9 @@ from report_dcpp_era5 import (CSS, line_chart, load_polygons, map_legend,
 # only one that is zero when the model has learned nothing useful.
 REG_COLS = ["n", "n_units", "n_folds", "skill", "rmse", "rmse_pct", "rmse_clim",
             "r2", "r_anom", "r_space_mean", "sd_ratio_anom", "bias", "alpha"]
+# delta / zscore runs add their native-unit metrics (see RefTarget in
+# run_yield_experiment.py); the kg/ha columns stay comparable across targets.
+REF_COLS = REG_COLS + ["t_skill", "t_r", "t_skill_zero", "t_skill_clim_vs_zero"]
 DIR_COLS = ["n", "n_units", "n_folds", "acc", "acc_major", "skill", "bacc",
             "hss", "f1_macro", "alpha"]
 
@@ -77,6 +80,11 @@ def label_for(meta: dict) -> str:
         tgt = f"dir t-{','.join(str(k) for k in lags)}"
         if meta.get("flat_band") == 0:
             tgt += " binary"
+    elif tgt in ("delta", "zscore"):
+        rt = meta.get("ref_target") or {}
+        k = rt.get("end", "?")
+        tgt = (f"Δ vs t-{k}{' %' if rt.get('pct') else ''}" if tgt == "delta"
+               else f"z{rt.get('window', '?')} to t-{k}")
     bits.append(tgt)
     if meta.get("detrend"):
         bits.append("detrended")
@@ -664,7 +672,9 @@ def main(argv=None):
             continue
         if len(targets) > 1:
             B.append(f'<h3>target: <span class="mono">{html.escape(tgt)}</span></h3>')
-        B.append(table(sub, DIR_COLS if tgt == "direction" else REG_COLS, ref))
+        cols = (DIR_COLS if tgt == "direction"
+                else REF_COLS if tgt in ("delta", "zscore") else REG_COLS)
+        B.append(table(sub, [c for c in cols if c in sub.columns], ref))
 
     B.append('<h2>3 &middot; Skill year by year</h2>')
     B.append('<p class="sub">One held-out year per point, one line per run. A run '
